@@ -491,8 +491,14 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 // Diff returns the unified diff and changed file paths between ws and the
 // current workspace, using the in-container git repository.
 //
-// Non-mutating: the index is staged to make untracked files visible and reset
-// before returning, matching the git backend's contract.
+// Known gap: this stages with `git add -A` and then runs `git reset`, which
+// restores the index to HEAD rather than to the state it was found in. A caller
+// that had staged changes before Diff therefore loses them, which violates the
+// Sandbox non-mutating contract (sandbox.go). The git backend avoids this by
+// staging into a scratch GIT_INDEX_FILE (sandbox_git.go stagedIndex); the
+// containerd backend needs the same treatment, tracked as a follow-up because
+// the in-container path cannot be verified without a live daemon
+// (plans/05-persistence-hygiene-release.md section 3).
 func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState, maxLines int) (string, []string, error) {
 	if _, err := stateSnapshotKey(ws); err != nil {
 		return "", nil, err
@@ -512,7 +518,8 @@ func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState
 	if _, err := s.run(ctx, id, "git", "add", "-A"); err != nil {
 		return "", nil, fmt.Errorf("containerd sandbox: diff: git add -A: %w", err)
 	}
-	// Restore the caller's index even if a later step fails.
+	// Returns the index to HEAD, not to its prior state: a caller's pre-staged
+	// changes are dropped. See the known-gap note on Diff.
 	defer func() { _, _ = s.run(context.WithoutCancel(ctx), id, "git", "reset") }()
 
 	namesOut, err := s.run(ctx, id, "git", "diff", "--cached", "--name-only", head)
