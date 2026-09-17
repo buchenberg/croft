@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
 	containerd "github.com/containerd/containerd/v2/client"
@@ -273,6 +274,7 @@ func (t *containerdTasks) Running(ctx context.Context, id string) (bool, error) 
 // Exec runs a command in the sandbox's current container generation.
 func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.ExecRequest) (shepherd.ExecResult, error) {
 	ctx = t.ctx(ctx)
+	start := time.Now()
 
 	task, err := t.currentTask(ctx, id)
 	if err != nil {
@@ -320,6 +322,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 		ExitCode: int(status.ExitCode()),
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
+		Duration: time.Since(start),
 	}, nil
 }
 
