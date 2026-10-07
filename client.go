@@ -13,11 +13,13 @@ import (
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -47,6 +49,14 @@ var ErrStdinUnsupported = errors.New("containerd sandbox: exec stdin is unsuppor
 // execSeq numbers exec IDs within the process.
 var execSeq atomic.Uint64
 
+// namespaceOrDefault resolves the namespace this backend operates in.
+func namespaceOrDefault(cfg Config) string {
+	if cfg.Namespace == "" {
+		return "default"
+	}
+	return cfg.Namespace
+}
+
 // connect establishes a containerd client and wires the real backend.
 //
 // containerd resolves the namespace from the context, not from the constructor,
@@ -54,20 +64,15 @@ var execSeq atomic.Uint64
 // Config.Namespace. That wrapping is what keeps the lifecycle in sandbox.go
 // namespace-agnostic.
 //
-// NOTE: this adapter is compiled but has never been executed. It requires a Linux
-// host with a running containerd daemon and root or user namespaces. Verify the
-// container/spec construction and the exec round-trip against a live daemon
-// before relying on it.
+// The same wrapper injects the sandbox's lease, which is what stops the daemon's
+// garbage collector reclaiming a snapshot mid-lifecycle. See ensureLease.
 func (s *ContainerdSandbox) connect(ctx context.Context) error {
 	c, err := containerd.New(s.cfg.Address)
 	if err != nil {
 		return fmt.Errorf("containerd sandbox: connect to daemon: %w", err)
 	}
 
-	ns := s.cfg.Namespace
-	if ns == "" {
-		ns = "default"
-	}
+	ns := namespaceOrDefault(s.cfg)
 	snapshotterName := s.cfg.Snapshotter
 	if snapshotterName == "" {
 		snapshotterName = defaultSnapshotter
@@ -76,23 +81,95 @@ func (s *ContainerdSandbox) connect(ctx context.Context) error {
 	images := &containerdImages{client: c, ns: ns, snapshotter: snapshotterName}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.snap = namespaceSnapshotter{Snapshotter: c.SnapshotService(snapshotterName), ns: ns}
+	s.snap = namespaceSnapshotter{
+		Snapshotter: c.SnapshotService(snapshotterName),
+		ns:          ns,
+		lease:       &s.lease,
+	}
+	s.leases = c.LeasesService()
 	s.images = images
 	s.tasks = &containerdTasks{client: c, ns: ns, cfg: s.cfg, images: images}
 	_ = ctx
 	return nil
 }
 
-// namespaceSnapshotter injects the containerd namespace into every call the
-// sandbox makes. Only the methods sandbox.go uses are overridden; the rest are
-// inherited from the embedded interface.
+// ensureLease creates the sandbox's containerd lease if it does not hold one.
+//
+// A lease is what keeps this sandbox's snapshots alive. Without one, a snapshot
+// is referenced only by the container currently rooted at it — and Capture stops
+// that container before preparing its successor, so in that window the
+// just-committed layer is unreferenced and containerd's GC may reclaim it:
+//
+//	prepare successor snapshot: parent snapshot shepherd/<id>/committed/1 does
+//	not exist
+//
+// That was observed on 3 of 5 consecutive live runs, a different test failing
+// each time. Registering the sandbox's snapshots under a lease makes them GC
+// roots for as long as the lease exists, which is the sandbox's own lifetime.
+//
+// containerd associates a snapshot with a lease only when the lease id is in the
+// context of the call that creates it, which is why the id lives behind a
+// pointer the snapshotter wrapper reads (see namespaceSnapshotter.ctx) rather
+// than being captured once here.
+//
+// A nil manager means the collaborators were substituted (tests). There is no
+// daemon and no GC, so there is nothing to lease and no error.
+func (s *ContainerdSandbox) ensureLease(ctx context.Context) error {
+	if s.leases == nil || s.lease.get() != "" {
+		return nil
+	}
+	lctx := namespaces.WithNamespace(ctx, namespaceOrDefault(s.cfg))
+	l, err := s.leases.Create(lctx,
+		leases.WithID("shepherd-"+newSandboxID()),
+		leases.WithLabels(map[string]string{sandboxLeaseLabel: "sandbox"}),
+	)
+	if err != nil {
+		return fmt.Errorf("containerd sandbox: create lease: %w", err)
+	}
+	s.lease.set(l.ID)
+	return nil
+}
+
+// releaseLease deletes the sandbox's lease, letting containerd reclaim whatever
+// it was holding.
+//
+// Idempotent: an already-deleted lease is not an error, so Destroy stays safe to
+// retry. The id is cleared before the delete so no snapshot call in flight
+// re-registers under a lease that is going away — addSnapshotLease fails the
+// whole Prepare/Commit if the lease named in the context does not exist.
+func (s *ContainerdSandbox) releaseLease(ctx context.Context) error {
+	id := s.lease.get()
+	s.lease.set("")
+	if id == "" || s.leases == nil {
+		return nil
+	}
+	lctx := namespaces.WithNamespace(ctx, namespaceOrDefault(s.cfg))
+	if err := s.leases.Delete(lctx, leases.Lease{ID: id}); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("containerd sandbox: delete lease %s: %w", id, err)
+	}
+	return nil
+}
+
+// namespaceSnapshotter injects the containerd namespace — and the sandbox's
+// lease, when it holds one — into every call the sandbox makes. Only the methods
+// sandbox.go uses are overridden; the rest are inherited from the embedded
+// interface.
 type namespaceSnapshotter struct {
 	snapshots.Snapshotter
 	ns string
+	// lease is read per call rather than captured, because the sandbox acquires
+	// its lease after this wrapper is built and drops it on Destroy.
+	lease *leaseRef
 }
 
 func (n namespaceSnapshotter) ctx(ctx context.Context) context.Context {
-	return namespaces.WithNamespace(ctx, n.ns)
+	ctx = namespaces.WithNamespace(ctx, n.ns)
+	if n.lease != nil {
+		if id := n.lease.get(); id != "" {
+			ctx = leases.WithLease(ctx, id)
+		}
+	}
+	return ctx
 }
 
 func (n namespaceSnapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {

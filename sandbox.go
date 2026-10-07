@@ -81,14 +81,24 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
 
 // BackendName is the identifier reported by Backend and stored in
 // WorkspaceState.Backend.
 const BackendName = "containerd"
+
+// sandboxLeaseLabel marks leases this adapter owns.
+//
+// A lease is the only thing keeping a sandbox's snapshots alive between
+// generations, so an orphaned one — left by a process that died before Destroy —
+// has to be findable without in-process bookkeeping. `ctr leases ls` filters on
+// labels, and the snapshot keys the lease holds carry the sandbox id.
+const sandboxLeaseLabel = "shepherd.lease"
 
 const (
 	// maxArgPayload is the largest base64 piece WriteFile puts in a single
@@ -213,11 +223,39 @@ type imageService interface {
 //
 // One instance corresponds to one sandbox, mirroring the kernel's
 // one-Sandbox-per-scope model. Safe for concurrent use.
+// leaseRef carries the sandbox's current containerd lease id.
+//
+// It is written by Create and Destroy and read on every snapshotter call, so it
+// is atomic rather than mutex-guarded: the snapshotter wrapper must not contend
+// on the sandbox lock for each Prepare, Commit, and Remove.
+type leaseRef struct{ v atomic.Pointer[string] }
+
+// get returns the current lease id, or "" when the sandbox holds none.
+func (r *leaseRef) get() string {
+	if p := r.v.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// set replaces the current lease id; "" clears it.
+func (r *leaseRef) set(id string) {
+	if id == "" {
+		r.v.Store(nil)
+		return
+	}
+	r.v.Store(&id)
+}
+
 type ContainerdSandbox struct {
 	cfg    Config
 	snap   snapshots.Snapshotter
 	tasks  taskService
 	images imageService
+	// leases is the daemon's lease manager. Nil when the collaborators were
+	// substituted (tests): a fake snapshotter has no garbage collector to hold
+	// anything back from, so there is nothing to lease.
+	leases leases.Manager
 
 	// connectOnce guards lazy connection to the containerd daemon so New does
 	// no I/O and no error is silently dropped.
@@ -225,6 +263,9 @@ type ContainerdSandbox struct {
 	connectErr  error
 
 	mu sync.Mutex
+	// lease is the id of the containerd lease holding this sandbox's snapshots.
+	// Atomic because snapshotter calls read it without mu.
+	lease leaseRef
 	// id is the container/task identity. Apply rebinds it, so it is not stable
 	// for the instance's lifetime.
 	id string
@@ -289,6 +330,11 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
 	}
 	if err := s.requireBackend(ctx); err != nil {
+		return err
+	}
+	// Before the first snapshot call: containerd only associates a snapshot with
+	// a lease if one is already in the context of the call that creates it.
+	if err := s.ensureLease(ctx); err != nil {
 		return err
 	}
 	if spec.Timeout > 0 {
@@ -390,6 +436,12 @@ func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("remove snapshot %s: %w", key, err))
 		}
 	}
+
+	// Last, so the removals above still run under the lease's protection and a
+	// concurrent GC cannot race them.
+	if err := s.releaseLease(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -468,6 +520,12 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 		return err
 	}
 	if err := s.requireBackend(ctx); err != nil {
+		return err
+	}
+	// Apply prepares snapshots and prunes the chain, so it needs the lease as
+	// much as Create does. Reaching here without Create is normal: a resumed
+	// sandbox acquires its lease lazily on first use.
+	if err := s.ensureLease(ctx); err != nil {
 		return err
 	}
 

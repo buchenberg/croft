@@ -701,3 +701,111 @@ func TestLive_ExecRejectsStdin(t *testing.T) {
 		t.Errorf("Exec with stdin took %s, want an immediate refusal", elapsed)
 	}
 }
+
+// TestLive_LeaseHoldsSnapshots pins the fix for the GC race that made this suite
+// flaky, asserting the mechanism rather than inferring it from a green run.
+//
+// Without a lease a snapshot is referenced only by the container rooted at it.
+// Capture stops that container before preparing its successor, so in that window
+// the just-committed layer is unreferenced and containerd's GC may reclaim it —
+// seen as "prepare successor snapshot: parent snapshot .../committed/1 does not
+// exist" on 3 of 5 consecutive runs, a different test failing each time.
+//
+// The sandbox must therefore hold a lease, and that lease must list the
+// sandbox's own snapshot keys as its resources. If the lease stops being created,
+// or stops reaching the snapshotter's context, this fails here rather than
+// reappearing later as a rare and inexplicable snapshot-not-found.
+func TestLive_LeaseHoldsSnapshots(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	sb := newLiveSandbox(t, ctx, cfg)
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	id := sb.ID()
+
+	c := dial(t, cfg.Addr)
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close client: %v", err)
+		}
+	}()
+	lctx := nsCtx(ctx, cfg.Namespace)
+	svc := c.LeasesService()
+
+	// Finding the lease by label is also how an orphan from a crashed process
+	// would be found. Strict: more than one would mean Destroy leaks leases.
+	found, err := svc.List(lctx, fmt.Sprintf("labels.%q==%q", sandboxLeaseLabel, "sandbox"))
+	if err != nil {
+		t.Fatalf("list leases: %v", err)
+	}
+	if len(found) != 1 {
+		t.Fatalf("found %d lease(s) labelled %s, want exactly 1 for sandbox %s: without "+
+			"a lease the daemon's GC may reclaim this sandbox's snapshots mid-lifecycle",
+			len(found), sandboxLeaseLabel, id)
+	}
+
+	res, err := svc.ListResources(lctx, found[0])
+	if err != nil {
+		t.Fatalf("list resources of lease %s: %v", found[0].ID, err)
+	}
+	prefix := "shepherd/" + id + "/"
+	var held []string
+	for _, r := range res {
+		if strings.HasPrefix(r.Type, "snapshots/") && strings.HasPrefix(r.ID, prefix) {
+			held = append(held, r.ID)
+		}
+	}
+	if len(held) == 0 {
+		t.Fatalf("lease %s holds none of sandbox %s's snapshots (resources: %+v): the lease "+
+			"is not reaching the snapshotter context, so it protects nothing",
+			found[0].ID, id, res)
+	}
+	t.Logf("lease %s holds %d sandbox snapshot(s): %v", found[0].ID, len(held), held)
+}
+
+// TestLive_DestroyReleasesTheLease is the other half: a lease that outlives its
+// sandbox pins snapshots against the GC forever, so Destroy must drop it.
+func TestLive_DestroyReleasesTheLease(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	sb := newLiveSandbox(t, ctx, cfg)
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	c := dial(t, cfg.Addr)
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close client: %v", err)
+		}
+	}()
+	lctx := nsCtx(ctx, cfg.Namespace)
+	svc := c.LeasesService()
+	filter := fmt.Sprintf("labels.%q==%q", sandboxLeaseLabel, "sandbox")
+
+	before, err := svc.List(lctx, filter)
+	if err != nil {
+		t.Fatalf("list leases before Destroy: %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("leases before Destroy = %d, want 1", len(before))
+	}
+
+	if err := sb.Destroy(ctx); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	after, err := svc.List(lctx, filter)
+	if err != nil {
+		t.Fatalf("list leases after Destroy: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("leases after Destroy = %d (%v), want 0: a lease outliving its sandbox "+
+			"pins snapshots against the GC indefinitely", len(after), after)
+	}
+}
