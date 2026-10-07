@@ -3,7 +3,7 @@ module github.com/buchenberg/shepherd-kernel-go/sandbox/containerd
 go 1.26.3
 
 require (
-	github.com/buchenberg/shepherd-kernel-go v0.4.0
+	github.com/buchenberg/shepherd-kernel-go v0.4.1
 	github.com/containerd/containerd/v2 v2.3.5
 	github.com/containerd/errdefs v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
