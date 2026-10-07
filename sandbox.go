@@ -73,6 +73,7 @@ package containerd
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -88,6 +89,20 @@ import (
 // BackendName is the identifier reported by Backend and stored in
 // WorkspaceState.Backend.
 const BackendName = "containerd"
+
+const (
+	// maxArgPayload is the largest base64 piece WriteFile puts in a single
+	// execve argument. Linux caps one argument at MAX_ARG_STRLEN (32 pages,
+	// 128 KiB) independently of ARG_MAX, so the payload is kept clear of it.
+	// This is a kernel limit, not a tunable, hence a constant.
+	maxArgPayload = 96 * 1024
+
+	// defaultWriteChunkBytes is the raw payload per WriteFile exec when
+	// Config.WriteChunkBytes is unset. It expands to roughly 700 KiB of base64,
+	// i.e. about eight maxArgPayload arguments — comfortably inside the ~2 MiB
+	// ARG_MAX while keeping the exec count low for typical source files.
+	defaultWriteChunkBytes = 512 * 1024
+)
 
 // WorkspaceState.Data keys. Pinning the encoding here means a git backend's
 // states can never be mistaken for these, and vice versa: Apply rejects a state
@@ -142,6 +157,22 @@ type Config struct {
 	// Workdir is the workspace path inside the container. Relative file paths
 	// and commands resolve here. Empty defaults to "/workspace".
 	Workdir string
+
+	// WriteChunkBytes bounds how much file content a single WriteFile exec
+	// carries, in raw bytes before base64 expansion. Empty uses
+	// defaultWriteChunkBytes. Larger values mean fewer container execs per file
+	// and a larger argv; each exec's payload is split into arguments under the
+	// kernel's per-argument ceiling regardless, so this only controls how much
+	// travels per exec.
+	WriteChunkBytes int
+
+	// FIFODir is where the containerd *client* creates the FIFOs that carry an
+	// exec's stdio. Empty uses containerd's default (/run/containerd/fifo),
+	// which is root-owned — and because the client creates these itself, an
+	// unprivileged caller fails locally with EACCES before any RPC reaches the
+	// daemon. Set this to a directory the calling user can write to in order to
+	// drive the backend without root.
+	FIFODir string
 }
 
 // workdir returns the effective in-container workspace path.
@@ -286,6 +317,26 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 		// Do not leak the snapshot if the task could not start.
 		_ = s.snap.Remove(ctx, active)
 		return fmt.Errorf("containerd sandbox: start task: %w", err)
+	}
+
+	// Provision the workdir. Every exec and file operation resolves against it,
+	// but no image is obliged to contain it — the default /workspace exists in
+	// almost nothing. Without this, Create succeeds on a stock image and then
+	// every later operation fails with a chdir error, which reads as a broken
+	// sandbox rather than a missing directory.
+	wd := s.cfg.workdir()
+	res, err := s.tasks.Exec(ctx, id, shepherd.ExecRequest{
+		Command: "mkdir",
+		Args:    []string{"-p", wd},
+		Cwd:     "/",
+	})
+	if err == nil && res.ExitCode != 0 {
+		err = fmt.Errorf("exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	if err != nil {
+		_ = s.tasks.StopTask(context.WithoutCancel(ctx), id)
+		_ = s.snap.Remove(context.WithoutCancel(ctx), active)
+		return fmt.Errorf("containerd sandbox: provision workdir %s: %w", wd, err)
 	}
 
 	s.mu.Lock()
@@ -488,17 +539,42 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 	return nil, chain
 }
 
+// diffScript stages the working tree into a throwaway index and diffs that
+// against the captured baseline. $1 is the baseline commit; any further
+// arguments are extra git-diff flags (Diff passes --name-only for the file
+// list).
+//
+// This mirrors sandbox_git.go's stagedIndex: seed the scratch from the real
+// index when one exists, so git's stat cache survives and `git add -A` only
+// hashes what changed; otherwise fall back to read-tree, because an empty index
+// would report every tracked file as newly added. The real index is only ever
+// read, never written, which is what makes Diff non-mutating.
+//
+// mktemp -d gives the scratch a 0700 directory rather than a bare file in a
+// shared temp dir, and the trap removes it even when a command fails.
+const diffScript = `set -e
+head=$1
+shift
+dir=$(mktemp -d)
+trap 'rm -rf -- "$dir"' EXIT
+export GIT_INDEX_FILE="$dir/index"
+if [ -f .git/index ]; then
+  cp -- .git/index "$GIT_INDEX_FILE"
+elif git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+  git read-tree HEAD
+fi
+git add -A
+git diff --cached "$@" "$head"`
+
 // Diff returns the unified diff and changed file paths between ws and the
 // current workspace, using the in-container git repository.
 //
-// Known gap: this stages with `git add -A` and then runs `git reset`, which
-// restores the index to HEAD rather than to the state it was found in. A caller
-// that had staged changes before Diff therefore loses them, which violates the
-// Sandbox non-mutating contract (sandbox.go). The git backend avoids this by
-// staging into a scratch GIT_INDEX_FILE (sandbox_git.go stagedIndex); the
-// containerd backend needs the same treatment, tracked as a follow-up because
-// the in-container path cannot be verified without a live daemon
-// (plans/05-persistence-hygiene-release.md section 3).
+// Non-mutating: staging happens in a scratch GIT_INDEX_FILE (diffScript), so a
+// caller's pre-staged changes survive the call, as the Sandbox contract in
+// sandbox.go requires. This used to stage with `git add -A` and unwind with
+// `git reset`, which restored the index to HEAD rather than to the state it was
+// found in and silently dropped the caller's staged work. Fixed 2026-10-05 and
+// pinned by TestLive_DiffPreservesPreStagedChanges.
 func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState, maxLines int) (string, []string, error) {
 	if _, err := stateSnapshotKey(ws); err != nil {
 		return "", nil, err
@@ -515,26 +591,20 @@ func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState
 		return "", nil, fmt.Errorf("containerd sandbox: Diff before Create")
 	}
 
-	if _, err := s.run(ctx, id, "git", "add", "-A"); err != nil {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: git add -A: %w", err)
-	}
-	// Returns the index to HEAD, not to its prior state: a caller's pre-staged
-	// changes are dropped. See the known-gap note on Diff.
-	defer func() { _, _ = s.run(context.WithoutCancel(ctx), id, "git", "reset") }()
-
-	namesOut, err := s.run(ctx, id, "git", "diff", "--cached", "--name-only", head)
+	namesRes, err := s.shell(ctx, diffScript, head, "--name-only")
 	if err != nil {
 		return "", nil, fmt.Errorf("containerd sandbox: diff: git diff --name-only: %w", err)
 	}
 	var files []string
-	if trimmed := strings.TrimSpace(namesOut); trimmed != "" {
+	if trimmed := strings.TrimSpace(namesRes.Stdout); trimmed != "" {
 		files = strings.Split(trimmed, "\n")
 	}
 
-	full, err := s.run(ctx, id, "git", "diff", "--cached", head)
+	fullRes, err := s.shell(ctx, diffScript, head)
 	if err != nil {
 		return "", nil, fmt.Errorf("containerd sandbox: diff: git diff: %w", err)
 	}
+	full := fullRes.Stdout
 	if maxLines > 0 {
 		lines := strings.Split(full, "\n")
 		if len(lines) > maxLines {
@@ -580,19 +650,84 @@ func (s *ContainerdSandbox) ReadFile(ctx context.Context, path string) ([]byte, 
 
 // WriteFile writes a file inside the sandbox, creating parent directories.
 //
-// Like ReadFile this runs in-container; the content is piped on stdin so it is
-// never embedded in the command line. perm is applied as an octal mode.
+// Like ReadFile this runs in-container. perm is applied as an octal mode.
+//
+// The content travels as base64 in positional arguments rather than on stdin.
+// That is forced, not preferred: the runc-v2 shim holds its own O_WRONLY handle
+// on an exec's stdin FIFO for the process's whole lifetime
+// (cmd/containerd-shim-runc-v2/process/exec.go, execProcess.openStdin), so a
+// reader such as `cat` never observes EOF and a stdin-based write blocks until
+// the context expires. Verified live against containerd 2.3.5 on 2026-10-05; see
+// the KNOWN CONSTRAINT note on containerdTasks.Exec.
+//
+// base64 preserves the injection safety the stdin version had: its alphabet
+// carries no shell metacharacters, and every chunk is a quoted positional
+// argument rather than text spliced into the script. It does not preserve
+// confidentiality — argv is world-readable through /proc/<pid>/cmdline, so the
+// content is exposed to other processes on the host for the life of the exec.
+// Callers writing secrets should not rely on this backend.
+//
+// Payloads larger than Config.WriteChunkBytes are split across several execs,
+// and each exec's payload across several arguments under maxArgPayload. The
+// first exec truncates, so retrying after a partial failure cannot append to
+// stale content.
 func (s *ContainerdSandbox) WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error {
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
 	path = s.resolve(path)
-	script := `mkdir -p -- "$(dirname -- "$1")" && cat > "$1" && chmod "$2" "$1"`
-	_, err := s.execShell(ctx, data, script, path, strconv.FormatUint(uint64(perm.Perm()), 8))
-	if err != nil {
-		return fmt.Errorf("containerd sandbox: write %s: %w", path, err)
+	mode := strconv.FormatUint(uint64(perm.Perm()), 8)
+
+	chunk := s.cfg.WriteChunkBytes
+	if chunk <= 0 {
+		chunk = defaultWriteChunkBytes
 	}
-	return nil
+
+	// Chunks arrive as positional arguments after $3 and are concatenated by
+	// printf before a single decode, so a chunk may be split at any byte
+	// boundary. `set -e` makes a failed mkdir, decode, or chmod fail the exec
+	// instead of leaving a half-written file behind an exit 0.
+	const script = `set -e
+p=$1; perm=$2; first=$3
+shift 3
+if [ "$first" = 1 ]; then
+  mkdir -p -- "$(dirname -- "$p")"
+  : > "$p"
+fi
+printf '%s' "$@" | base64 -d >> "$p"
+chmod "$perm" "$p"`
+
+	for off := 0; ; off += chunk {
+		end := min(off+chunk, len(data))
+		args := []string{path, mode, "0"}
+		if off == 0 {
+			args[2] = "1"
+		}
+		args = append(args, base64Args(data[off:end])...)
+		if _, err := s.execShell(ctx, nil, script, args...); err != nil {
+			return fmt.Errorf("containerd sandbox: write %s: %w", path, err)
+		}
+		if end == len(data) {
+			return nil
+		}
+	}
+}
+
+// base64Args encodes data and splits the result into argv-sized pieces. The
+// receiver concatenates the pieces before decoding, so split points need not
+// respect base64 alignment. An empty payload yields no arguments, and the script
+// then appends nothing.
+func base64Args(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	enc := base64.StdEncoding.EncodeToString(data)
+	var args []string
+	for len(enc) > maxArgPayload {
+		args = append(args, enc[:maxArgPayload])
+		enc = enc[maxArgPayload:]
+	}
+	return append(args, enc)
 }
 
 // ForkState commits this sandbox's active layer and prepares a successor, so the

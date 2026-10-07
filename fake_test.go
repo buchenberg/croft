@@ -238,6 +238,10 @@ type fakeTasks struct {
 	runErr    map[string]error // command -> error
 	lastReq   shepherd.ExecRequest
 	lastStdin []byte
+	// allReqs records every Exec in order, so a multi-exec operation such as a
+	// chunked WriteFile can be asserted on as a sequence rather than only by its
+	// last call.
+	allReqs []shepherd.ExecRequest
 	// current is the layer the running task is rooted at, "" when stopped.
 	current string
 	started int
@@ -290,6 +294,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 	}
 	f.lastReq = req
 	f.lastStdin = req.Stdin
+	f.allReqs = append(f.allReqs, req)
 
 	if err, ok := f.runErr[req.Command]; ok {
 		return shepherd.ExecResult{ExitCode: 1, Stderr: err.Error()}, nil
@@ -308,6 +313,21 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 		}
 		return shepherd.ExecResult{ExitCode: 0}, nil
 	case "sh":
+		// Dispatch on the script rather than answering every shell call with one
+		// canned string: Diff's scratch-index script and the ReadFile/WriteFile
+		// file scripts need different output. The flags Diff passed arrive as
+		// trailing positional arguments (Args is ["-c", script, placeholder,
+		// head, flags...]), which is how the two Diff calls are told apart.
+		script := ""
+		if len(req.Args) >= 2 {
+			script = req.Args[1]
+		}
+		if strings.Contains(script, "git diff --cached") {
+			if strings.Contains(strings.Join(req.Args[3:], " "), "--name-only") {
+				return shepherd.ExecResult{ExitCode: 0, Stdout: "f\n"}, nil
+			}
+			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+change\n"}, nil
+		}
 		return shepherd.ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
 	default:
 		return shepherd.ExecResult{ExitCode: 0}, nil

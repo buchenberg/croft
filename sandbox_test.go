@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"encoding/base64"
 	"io/fs"
 	"strings"
 	"testing"
@@ -75,6 +76,36 @@ func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 	}
 	if len(snap.keys()) != 2 {
 		t.Errorf("layers = %v, want the rootfs plus one active layer", snap.keys())
+	}
+}
+
+// TestCreate_ProvisionsWorkdir pins that Create makes the configured workdir
+// exist. No image is obliged to ship /workspace, and without this every later
+// operation fails with a chdir error that reads as a broken sandbox rather than
+// a missing directory.
+func TestCreate_ProvisionsWorkdir(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t, "")
+	ctx := context.Background()
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var found bool
+	for _, req := range tasks.allReqs {
+		if req.Command != "mkdir" {
+			continue
+		}
+		// Cwd must be "/" — the workdir is the thing being created, so the
+		// command cannot run inside it.
+		if req.Cwd != "/" {
+			t.Errorf("mkdir cwd = %q, want / so it works before the workdir exists", req.Cwd)
+		}
+		if len(req.Args) == 2 && req.Args[0] == "-p" && req.Args[1] == "/workspace" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Create did not mkdir -p the default workdir; execs = %+v", tasks.allReqs)
 	}
 }
 
@@ -407,9 +438,17 @@ func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 	}
 }
 
-// TestWriteFile_PipesContentOnStdin pins that file content never reaches the
-// command line.
-func TestWriteFile_PipesContentOnStdin(t *testing.T) {
+// TestWriteFile_EncodesContentInArgs pins the argv transport that replaced
+// piping content on stdin. Two properties matter. The raw content must not
+// appear anywhere in the command: base64 cannot carry shell metacharacters, and
+// chunks are positional arguments rather than text spliced into the script, so
+// the injection safety the stdin version had is preserved. And decoding the
+// payload arguments must reconstruct the content exactly.
+//
+// Stdin must be empty. It is not merely unused: the runc-v2 shim holds a write
+// end on an exec's stdin FIFO for the process's lifetime, so a stdin reader
+// never sees EOF and depending on one hangs until the context expires.
+func TestWriteFile_EncodesContentInArgs(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "")
 	ctx := context.Background()
 	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
@@ -420,18 +459,137 @@ func TestWriteFile_PipesContentOnStdin(t *testing.T) {
 	if err := sb.WriteFile(ctx, "bin/x.sh", content, fs.FileMode(0o755)); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if string(tasks.lastStdin) != string(content) {
-		t.Errorf("stdin = %q, want the file content", tasks.lastStdin)
+	if len(tasks.lastStdin) != 0 {
+		t.Errorf("stdin = %q, want empty: WriteFile must not depend on stdin EOF", tasks.lastStdin)
 	}
-	for _, a := range tasks.lastReq.Args {
-		if strings.Contains(a, "rm -rf") {
-			t.Error("file content must not appear in the command arguments")
+
+	// execShell builds ["-c", script, placeholder, path, mode, first, chunks...].
+	args := tasks.lastReq.Args
+	if len(args) < 7 {
+		t.Fatalf("args = %v, want script, placeholder, path, mode, first flag, and a payload", args)
+	}
+	script := args[1]
+	if strings.Contains(script, "rm -rf") {
+		t.Error("file content must not appear in the script text")
+	}
+	// The script must reach path and payload through positional parameters, never
+	// through values spliced into its own text.
+	for _, want := range []string{`p=$1`, `"$@"`, "base64 -d"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script should contain %s, got %q", want, script)
 		}
 	}
-	// The mode is passed positionally as octal.
-	args := tasks.lastReq.Args
-	if args[len(args)-1] != "755" || args[len(args)-2] != "/workspace/bin/x.sh" {
-		t.Errorf("args tail = %v, want the path and octal mode", args[len(args)-2:])
+	if args[3] != "/workspace/bin/x.sh" {
+		t.Errorf("arg[3] = %q, want the resolved path", args[3])
+	}
+	if args[4] != "755" {
+		t.Errorf("arg[4] = %q, want the octal mode", args[4])
+	}
+	if args[5] != "1" {
+		t.Errorf("arg[5] = %q, want the first-batch flag so the file is truncated", args[5])
+	}
+
+	var payload strings.Builder
+	for _, a := range args[6:] {
+		if strings.Contains(a, "rm -rf") {
+			t.Error("raw file content must not appear in the command arguments")
+		}
+		if len(a) > maxArgPayload {
+			t.Errorf("payload argument is %d bytes, over the %d ceiling", len(a), maxArgPayload)
+		}
+		payload.WriteString(a)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(payload.String())
+	if err != nil {
+		t.Fatalf("payload is not valid base64: %v", err)
+	}
+	if string(decoded) != string(content) {
+		t.Errorf("decoded payload = %q, want %q", decoded, content)
+	}
+}
+
+// TestWriteFile_SplitsAcrossExecs pins the chunking: a payload larger than
+// Config.WriteChunkBytes travels as several execs, and only the first carries
+// the truncating flag — so a retry after a partial failure cannot append to
+// stale content, and batches after the first cannot wipe what preceded them.
+func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	tasks := newFakeTasks(log, snap)
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	sb := NewWithBackend(Config{Image: "example/dev:latest", WriteChunkBytes: 4}, snap, tasks, images)
+
+	ctx := context.Background()
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	content := []byte("abcdefghij") // 10 bytes at 4 per batch is 3 execs
+	// Create provisions the workdir with its own exec, so count only what
+	// WriteFile adds rather than everything the sandbox has issued.
+	before := len(tasks.allReqs)
+	if err := sb.WriteFile(ctx, "f.txt", content, fs.FileMode(0o600)); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	writes := tasks.allReqs[before:]
+	if len(writes) != 3 {
+		t.Fatalf("WriteFile issued %d execs, want 3 (one per 4-byte batch)", len(writes))
+	}
+
+	// Decoded per exec, not concatenated first: each exec decodes its own batch
+	// and appends the bytes, so every batch carries its own '=' padding.
+	// Concatenating the encoded batches would put padding mid-stream and fail to
+	// decode — the same mistake the in-container script must not make.
+	var reassembled []byte
+	for i, req := range writes {
+		if len(req.Args) < 7 {
+			t.Fatalf("exec %d: args = %v, want a payload argument", i, req.Args)
+		}
+		wantFirst := "0"
+		if i == 0 {
+			wantFirst = "1"
+		}
+		if req.Args[5] != wantFirst {
+			t.Errorf("exec %d: first flag = %q, want %q", i, req.Args[5], wantFirst)
+		}
+		if len(req.Stdin) != 0 {
+			t.Errorf("exec %d: stdin = %q, want empty", i, req.Stdin)
+		}
+		dec, err := base64.StdEncoding.DecodeString(strings.Join(req.Args[6:], ""))
+		if err != nil {
+			t.Fatalf("exec %d: payload is not valid base64: %v", i, err)
+		}
+		reassembled = append(reassembled, dec...)
+	}
+	if string(reassembled) != string(content) {
+		t.Errorf("reassembled payload = %q, want %q", reassembled, content)
+	}
+}
+
+// TestWriteFile_EmptyContentStillTruncates pins the degenerate case: writing
+// zero bytes must still create the file rather than being a no-op, so a caller
+// clearing a file gets the same result as writing content.
+func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t, "")
+	ctx := context.Background()
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	before := len(tasks.allReqs)
+	if err := sb.WriteFile(ctx, "empty.txt", nil, fs.FileMode(0o644)); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	writes := tasks.allReqs[before:]
+	if len(writes) != 1 {
+		t.Fatalf("WriteFile issued %d execs, want exactly 1", len(writes))
+	}
+	args := writes[0].Args
+	if args[5] != "1" {
+		t.Errorf("first flag = %q, want 1 so the file is created and truncated", args[5])
+	}
+	if len(args) != 6 {
+		t.Errorf("args = %v, want no payload arguments for empty content", args)
 	}
 }
 
@@ -478,6 +636,52 @@ func TestDiff_TruncatesAndReportsFiles(t *testing.T) {
 	}
 	if strings.Contains(full, "[diff truncated]") {
 		t.Errorf("unbounded diff should not be truncated: %q", full)
+	}
+}
+
+// TestDiff_StagesIntoScratchIndex pins the non-mutating mechanism at the script
+// level, so the invariant is visible without a live daemon. The live suite
+// proves the end-to-end behaviour; this keeps a regression from landing in the
+// first place.
+func TestDiff_StagesIntoScratchIndex(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
+	ctx := context.Background()
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if _, _, err := sb.Diff(ctx, state, 0); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	var sawDiff bool
+	for _, req := range tasks.allReqs {
+		if req.Command != "sh" || len(req.Args) < 2 {
+			continue
+		}
+		script := req.Args[1]
+		if !strings.Contains(script, "git diff --cached") {
+			continue
+		}
+		sawDiff = true
+		if !strings.Contains(script, "GIT_INDEX_FILE") {
+			t.Error("Diff must stage into a scratch GIT_INDEX_FILE")
+		}
+		// The real index is the seed, and seeding is a read: cp from it, never
+		// into it.
+		if !strings.Contains(script, "cp -- .git/index") {
+			t.Error("Diff should seed the scratch index from the real one")
+		}
+		if strings.Contains(script, "git reset") {
+			t.Error("Diff must not unwind with git reset: that restores the index " +
+				"to HEAD, not to the state it was found in")
+		}
+	}
+	if !sawDiff {
+		t.Fatal("Diff issued no scratch-index script")
 	}
 }
 
