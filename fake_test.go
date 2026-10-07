@@ -246,6 +246,9 @@ type fakeTasks struct {
 	current string
 	started int
 	stopped int
+	// diffStdout, when set, overrides the canned response for the diff script so
+	// a test can exercise malformed staging output.
+	diffStdout string
 }
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
@@ -315,18 +318,19 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 	case "sh":
 		// Dispatch on the script rather than answering every shell call with one
 		// canned string: Diff's scratch-index script and the ReadFile/WriteFile
-		// file scripts need different output. The flags Diff passed arrive as
-		// trailing positional arguments (Args is ["-c", script, placeholder,
-		// head, flags...]), which is how the two Diff calls are told apart.
+		// file scripts need different output.
 		script := ""
 		if len(req.Args) >= 2 {
 			script = req.Args[1]
 		}
 		if strings.Contains(script, "git diff --cached") {
-			if strings.Contains(strings.Join(req.Args[3:], " "), "--name-only") {
-				return shepherd.ExecResult{ExitCode: 0, Stdout: "f\n"}, nil
+			if f.diffStdout != "" {
+				return shepherd.ExecResult{ExitCode: 0, Stdout: f.diffStdout}, nil
 			}
-			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+change\n"}, nil
+			// Diff stages once and gets both sections back from that one exec, so
+			// the fake answers in the same shape: names, the marker, then the diff.
+			return shepherd.ExecResult{ExitCode: 0,
+				Stdout: "f\n\n" + diffNamesMarker + "\ndiff --git a/f b/f\n+change\n"}, nil
 		}
 		return shepherd.ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
 	default:

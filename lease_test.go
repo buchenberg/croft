@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
 	"github.com/containerd/containerd/v2/core/leases"
@@ -18,35 +20,67 @@ import (
 // TestLive_LeaseHoldsSnapshots); this exists so the sandbox's own bookkeeping —
 // create once, label, delete once, tolerate a vanished lease — is testable
 // without a daemon.
+//
+// Mutex-guarded because the concurrency test calls into it from many goroutines.
 type fakeLeases struct {
-	created   []leases.Lease
-	deleted   []string
-	lastLabel map[string]string
-	createErr error
-	deleteErr error
+	mu            sync.Mutex
+	created       []leases.Lease
+	deleted       []string
+	lastLabel     map[string]string
+	createErr     error
+	deleteErr     error
+	createBlocks  bool // Create waits for the context instead of returning
+	createStarted chan struct{}
 }
 
-func (f *fakeLeases) Create(_ context.Context, opts ...leases.Opt) (leases.Lease, error) {
-	if f.createErr != nil {
-		return leases.Lease{}, f.createErr
+func (f *fakeLeases) Create(ctx context.Context, opts ...leases.Opt) (leases.Lease, error) {
+	f.mu.Lock()
+	block := f.createBlocks
+	if f.createStarted != nil {
+		select {
+		case f.createStarted <- struct{}{}:
+		default:
+		}
 	}
+	err := f.createErr
+	f.mu.Unlock()
+
+	if block {
+		<-ctx.Done()
+		return leases.Lease{}, ctx.Err()
+	}
+	if err != nil {
+		return leases.Lease{}, err
+	}
+
 	l := leases.Lease{}
 	for _, o := range opts {
 		if err := o(&l); err != nil {
 			return leases.Lease{}, err
 		}
 	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastLabel = l.Labels
 	f.created = append(f.created, l)
 	return l, nil
 }
 
 func (f *fakeLeases) Delete(_ context.Context, l leases.Lease, _ ...leases.DeleteOpt) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
 	f.deleted = append(f.deleted, l.ID)
 	return nil
+}
+
+func (f *fakeLeases) counts() (created, deleted int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.created), len(f.deleted)
 }
 
 func (f *fakeLeases) List(context.Context, ...string) ([]leases.Lease, error) { return nil, nil }
@@ -256,5 +290,182 @@ func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
 	}
 	if got := sb.lease.get(); got != fl.created[1].ID {
 		t.Fatalf("lease = %q, want the second generation's %q", got, fl.created[1].ID)
+	}
+}
+
+// TestEnsureLease_ConcurrentCallsCreateOneLease pins the check-then-create
+// critical section. ContainerdSandbox is documented safe for concurrent use, and
+// without the lock two concurrent Create/Apply calls both observe an empty
+// reference, both create a lease, and the overwritten one is never released —
+// pinning this sandbox's snapshots against the GC for good, which is the failure
+// the lease exists to prevent.
+func TestEnsureLease_ConcurrentCallsCreateOneLease(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t, "")
+	fl := &fakeLeases{}
+	sb.leases = fl
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+	start := make(chan struct{})
+
+	for i := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = sb.ensureLease(context.Background())
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("ensureLease from goroutine %d: %v", i, err)
+		}
+	}
+	created, _ := fl.counts()
+	if created != 1 {
+		t.Fatalf("created %d leases across %d concurrent calls, want 1: an overwritten "+
+			"lease is never released and pins this sandbox's snapshots forever",
+			created, goroutines)
+	}
+	if got := sb.lease.get(); got == "" {
+		t.Fatal("lease is empty after concurrent acquisition succeeded")
+	}
+}
+
+// TestReleaseLease_FailedDeleteKeepsTheIDForRetry pins that a transient delete
+// failure leaves the id in place. Discarding it would make a later Destroy
+// report success while the orphaned lease keeps snapshots pinned forever.
+func TestReleaseLease_FailedDeleteKeepsTheIDForRetry(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t, "")
+	fl := &fakeLeases{deleteErr: errors.New("daemon unavailable")}
+	sb.leases = fl
+	sb.lease.set("lease-1")
+
+	if err := sb.releaseLease(context.Background()); err == nil {
+		t.Fatal("releaseLease reported success despite a failing Delete")
+	}
+	if got := sb.lease.get(); got != "lease-1" {
+		t.Fatalf("lease = %q after a failed delete, want lease-1 so a retry can reach it", got)
+	}
+	if _, deleted := fl.counts(); deleted != 0 {
+		t.Fatalf("deleted %d leases on a failing Delete, want 0", deleted)
+	}
+
+	// The retry must actually delete, and only then clear the id.
+	fl.deleteErr = nil
+	if err := sb.releaseLease(context.Background()); err != nil {
+		t.Fatalf("releaseLease after the daemon recovered: %v", err)
+	}
+	if _, deleted := fl.counts(); deleted != 1 {
+		t.Fatalf("deleted %d leases after recovery, want 1", deleted)
+	}
+	if got := sb.lease.get(); got != "" {
+		t.Fatalf("lease = %q after a successful retry, want empty", got)
+	}
+}
+
+// TestCreate_TimeoutCoversLeaseAcquisition pins that SandboxSpec.Timeout bounds
+// the whole Create, including the lease RPC. Deriving the timeout after the
+// lease call would let a blocked lease service hang past the caller's limit.
+//
+// Create runs in a goroutine so a regression fails on the deadline instead of
+// hanging the suite.
+func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t, "")
+	sb.leases = &fakeLeases{createBlocks: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sb.Create(context.Background(), shepherd.SandboxSpec{Timeout: 200 * time.Millisecond})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Create succeeded although the lease RPC never returned")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "create lease") {
+			t.Fatalf("err = %v, want the deadline to surface through the lease failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Create did not return within 5s despite a 200ms Timeout: the timeout " +
+			"does not cover backend connection and lease acquisition")
+	}
+}
+
+// TestDiff_StagesOncePerCall pins that Diff produces the file list and the
+// unified diff from a single staging pass. Two passes would each create their own
+// scratch index, so a write to the workspace between them would make the returned
+// list and diff describe different states.
+func TestDiff_StagesOncePerCall(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
+	ctx := context.Background()
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	stagingRuns := func() int {
+		n := 0
+		for _, req := range tasks.allReqs {
+			if req.Command == "sh" && len(req.Args) >= 2 &&
+				strings.Contains(req.Args[1], "git add -A") {
+				n++
+			}
+		}
+		return n
+	}
+
+	before := stagingRuns()
+	diff, files, err := sb.Diff(ctx, state, 0)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if got := stagingRuns() - before; got != 1 {
+		t.Errorf("Diff staged %d times, want 1: a second staging can describe a different "+
+			"workspace state than the first", got)
+	}
+
+	// Drift guard: the parser and the script must agree on the separator.
+	if !strings.Contains(diffScript, diffNamesMarker) {
+		t.Fatalf("diffScript does not emit %q, so Diff cannot separate its two outputs",
+			diffNamesMarker)
+	}
+
+	// Both outputs must come back populated from that one pass.
+	if len(files) != 1 || files[0] != "f" {
+		t.Errorf("files = %v, want [f] from the staging pass", files)
+	}
+	if !strings.Contains(diff, "+change") {
+		t.Errorf("diff = %q, want the unified-diff section", diff)
+	}
+}
+
+// TestDiff_MissingSeparatorIsAnError pins that a malformed staging output is
+// reported rather than silently returning an empty file list with a diff.
+func TestDiff_MissingSeparatorIsAnError(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
+	ctx := context.Background()
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	tasks.diffStdout = "no separator here\n"
+
+	if _, _, err := sb.Diff(ctx, state, 0); err == nil {
+		t.Fatal("Diff accepted output with no separator, so the file list and diff " +
+			"cannot be told apart")
+	} else if !strings.Contains(err.Error(), diffNamesMarker) {
+		t.Fatalf("err = %v, want it to name the missing separator", err)
 	}
 }

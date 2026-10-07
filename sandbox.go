@@ -263,6 +263,10 @@ type ContainerdSandbox struct {
 	connectErr  error
 
 	mu sync.Mutex
+	// leaseMu serializes lease acquisition and release. It is deliberately not
+	// mu: holding a lock across the lease RPC must not block Exec or Diff, which
+	// take mu briefly to read the sandbox id.
+	leaseMu sync.Mutex
 	// lease is the id of the containerd lease holding this sandbox's snapshots.
 	// Atomic because snapshotter calls read it without mu.
 	lease leaseRef
@@ -329,6 +333,14 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 	if s.cfg.Image == "" {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
 	}
+	// SandboxSpec.Timeout documents that it bounds the whole Create, so it has to
+	// be in force before the daemon connection and the lease RPC — not after
+	// them. A blocked lease service would otherwise hang past the caller's limit.
+	if spec.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
+		defer cancel()
+	}
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
@@ -336,11 +348,6 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 	// a lease if one is already in the context of the call that creates it.
 	if err := s.ensureLease(ctx); err != nil {
 		return err
-	}
-	if spec.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
-		defer cancel()
 	}
 
 	rootfsKey, err := s.images.RootfsSnapshot(ctx, s.cfg.Image)
@@ -597,10 +604,21 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 	return nil, chain
 }
 
-// diffScript stages the working tree into a throwaway index and diffs that
-// against the captured baseline. $1 is the baseline commit; any further
-// arguments are extra git-diff flags (Diff passes --name-only for the file
-// list).
+// diffNamesMarker separates Diff's two outputs inside one staging pass, so the
+// changed-file list and the unified diff always describe the same workspace
+// state. It is safe as a delimiter because git quotes paths containing control
+// characters, so no filename can produce a bare newline-wrapped marker line.
+const diffNamesMarker = "__shepherd_diff_names__"
+
+// diffScript stages the working tree into a throwaway index once, then prints
+// the changed file list followed by the unified diff, separated by
+// diffNamesMarker. $1 is the baseline commit.
+//
+// One exec rather than two. Calling this twice would stage twice, and a write to
+// the workspace between the two calls would make the returned file list and diff
+// describe different states — a race the earlier mutating implementation did not
+// have, because it staged once into the real index. This keeps both the
+// single-staging consistency and the non-mutation.
 //
 // This mirrors sandbox_git.go's stagedIndex: seed the scratch from the real
 // index when one exists, so git's stat cache survives and `git add -A` only
@@ -610,9 +628,8 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 //
 // mktemp -d gives the scratch a 0700 directory rather than a bare file in a
 // shared temp dir, and the trap removes it even when a command fails.
-const diffScript = `set -e
+var diffScript = `set -e
 head=$1
-shift
 dir=$(mktemp -d)
 trap 'rm -rf -- "$dir"' EXIT
 export GIT_INDEX_FILE="$dir/index"
@@ -622,7 +639,9 @@ elif git rev-parse --verify -q HEAD >/dev/null 2>&1; then
   git read-tree HEAD
 fi
 git add -A
-git diff --cached "$@" "$head"`
+git diff --cached --name-only "$head"
+printf '\n` + diffNamesMarker + `\n'
+git diff --cached "$head"`
 
 // Diff returns the unified diff and changed file paths between ws and the
 // current workspace, using the in-container git repository.
@@ -633,6 +652,9 @@ git diff --cached "$@" "$head"`
 // `git reset`, which restored the index to HEAD rather than to the state it was
 // found in and silently dropped the caller's staged work. Fixed 2026-10-05 and
 // pinned by TestLive_DiffPreservesPreStagedChanges.
+//
+// Both outputs come from one staging pass, so they cannot describe different
+// workspace states. See diffScript; pinned by TestDiff_StagesOncePerCall.
 func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState, maxLines int) (string, []string, error) {
 	if _, err := stateSnapshotKey(ws); err != nil {
 		return "", nil, err
@@ -649,20 +671,19 @@ func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState
 		return "", nil, fmt.Errorf("containerd sandbox: Diff before Create")
 	}
 
-	namesRes, err := s.shell(ctx, diffScript, head, "--name-only")
+	res, err := s.shell(ctx, diffScript, head)
 	if err != nil {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: git diff --name-only: %w", err)
+		return "", nil, fmt.Errorf("containerd sandbox: diff: %w", err)
+	}
+	namesPart, full, ok := strings.Cut(res.Stdout, "\n"+diffNamesMarker+"\n")
+	if !ok {
+		return "", nil, fmt.Errorf("containerd sandbox: diff: output has no %q separator, so the "+
+			"file list and the diff cannot be told apart", diffNamesMarker)
 	}
 	var files []string
-	if trimmed := strings.TrimSpace(namesRes.Stdout); trimmed != "" {
+	if trimmed := strings.TrimSpace(namesPart); trimmed != "" {
 		files = strings.Split(trimmed, "\n")
 	}
-
-	fullRes, err := s.shell(ctx, diffScript, head)
-	if err != nil {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: git diff: %w", err)
-	}
-	full := fullRes.Stdout
 	if maxLines > 0 {
 		lines := strings.Split(full, "\n")
 		if len(lines) > maxLines {

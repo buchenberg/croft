@@ -93,6 +93,17 @@ func (s *ContainerdSandbox) connect(ctx context.Context) error {
 	return nil
 }
 
+// leaseManager returns the daemon's lease manager, or nil when the collaborators
+// were substituted (tests).
+//
+// Lock ordering, where both are held: leaseMu then mu. Nothing takes mu and then
+// calls into the lease lifecycle, so the two cannot deadlock.
+func (s *ContainerdSandbox) leaseManager() leases.Manager {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leases
+}
+
 // ensureLease creates the sandbox's containerd lease if it does not hold one.
 //
 // A lease is what keeps this sandbox's snapshots alive. Without one, a snapshot
@@ -115,11 +126,24 @@ func (s *ContainerdSandbox) connect(ctx context.Context) error {
 // A nil manager means the collaborators were substituted (tests). There is no
 // daemon and no GC, so there is nothing to lease and no error.
 func (s *ContainerdSandbox) ensureLease(ctx context.Context) error {
-	if s.leases == nil || s.lease.get() != "" {
+	mgr := s.leaseManager()
+	if mgr == nil {
 		return nil
 	}
+	// The check and the create are one critical section. ContainerdSandbox is
+	// documented safe for concurrent use, and without this two concurrent
+	// Create/Apply calls both observe an empty reference, both create a lease,
+	// and the overwritten one is never released — pinning this sandbox's
+	// snapshots against the GC for good, which is the failure the lease exists to
+	// prevent.
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if s.lease.get() != "" {
+		return nil
+	}
+
 	lctx := namespaces.WithNamespace(ctx, namespaceOrDefault(s.cfg))
-	l, err := s.leases.Create(lctx,
+	l, err := mgr.Create(lctx,
 		leases.WithID("shepherd-"+newSandboxID()),
 		leases.WithLabels(map[string]string{sandboxLeaseLabel: "sandbox"}),
 	)
@@ -134,17 +158,33 @@ func (s *ContainerdSandbox) ensureLease(ctx context.Context) error {
 // it was holding.
 //
 // Idempotent: an already-deleted lease is not an error, so Destroy stays safe to
-// retry. The id is cleared before the delete so no snapshot call in flight
-// re-registers under a lease that is going away — addSnapshotLease fails the
-// whole Prepare/Commit if the lease named in the context does not exist.
+// retry.
 func (s *ContainerdSandbox) releaseLease(ctx context.Context) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
 	id := s.lease.get()
-	s.lease.set("")
-	if id == "" || s.leases == nil {
+	mgr := s.leaseManager()
+	if id == "" || mgr == nil {
 		return nil
 	}
+
+	// Clear before the delete so no snapshot call in flight re-registers under a
+	// lease that is going away: addSnapshotLease fails the whole Prepare/Commit
+	// when the lease named in the context does not exist.
+	s.lease.set("")
+
 	lctx := namespaces.WithNamespace(ctx, namespaceOrDefault(s.cfg))
-	if err := s.leases.Delete(lctx, leases.Lease{ID: id}); err != nil && !errdefs.IsNotFound(err) {
+	if err := mgr.Delete(lctx, leases.Lease{ID: id}); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		// Put the id back so a later Destroy retries the delete rather than
+		// reporting success while the orphaned lease keeps this sandbox's
+		// snapshots pinned forever. The outcome is genuinely ambiguous — the RPC
+		// may have applied with the response lost — but retrying is harmless
+		// either way, because a Delete that finds nothing is success above.
+		s.lease.set(id)
 		return fmt.Errorf("containerd sandbox: delete lease %s: %w", id, err)
 	}
 	return nil
