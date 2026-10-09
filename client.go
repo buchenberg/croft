@@ -73,10 +73,7 @@ func (s *ContainerdSandbox) connect(ctx context.Context) error {
 	}
 
 	ns := namespaceOrDefault(s.cfg)
-	snapshotterName := s.cfg.Snapshotter
-	if snapshotterName == "" {
-		snapshotterName = defaultSnapshotter
-	}
+	snapshotterName := s.snapshotterName()
 
 	images := &containerdImages{client: c, ns: ns, snapshotter: snapshotterName}
 	s.mu.Lock()
@@ -190,6 +187,84 @@ func (s *ContainerdSandbox) releaseLease(ctx context.Context) error {
 	return nil
 }
 
+// statesLeaseID is the deterministic id of the namespace-scoped lease that pins
+// captured states. Leases live inside a containerd namespace, so one id per
+// namespace is enough; being deterministic means a restarted process, or a
+// different one entirely, finds the same lease without bookkeeping.
+//
+// The sandbox's own lease (ensureLease) dies with Destroy and would take every
+// captured state with it, so states need a pin with a different lifetime. A
+// resource on this lease is exactly that: the daemon's GC treats a leased
+// snapshot as a root, the same mechanism the sandbox lease already relies on.
+const statesLeaseID = "shepherd-states"
+
+// snapshotterName resolves the configured snapshotter plugin name, matching
+// connect's resolution so lease resources name the same plugin the sandbox
+// actually uses.
+func (s *ContainerdSandbox) snapshotterName() string {
+	if s.cfg.Snapshotter != "" {
+		return s.cfg.Snapshotter
+	}
+	return defaultSnapshotter
+}
+
+// stateLeaseCtx and stateResource are the one definition of how a state's pin
+// is addressed: the states lease, scoped to the backend's namespace, and the
+// snapshotter resource naming the layer. pinState and unpinState share them so
+// the two can never drift — an unpin that constructed a slightly different
+// resource would target one that does not exist, read as NotFound, and be
+// treated as success while the real pin held disk forever.
+func (s *ContainerdSandbox) stateLeaseCtx(ctx context.Context) context.Context {
+	return namespaces.WithNamespace(ctx, namespaceOrDefault(s.cfg))
+}
+
+func (s *ContainerdSandbox) stateResource(key string) leases.Resource {
+	return leases.Resource{ID: key, Type: "snapshots/" + s.snapshotterName()}
+}
+
+// pinState registers a committed snapshot under the states lease, making it a
+// GC root independent of any sandbox's lifetime.
+//
+// containerd's resource type for snapshotter content is "snapshots/<plugin>"
+// (core/metadata registers ctx-lease snapshots under exactly this type), so the
+// daemon sees an explicit pin and an automatic one as the same kind of edge.
+//
+// A nil manager means the collaborators were substituted (tests): no daemon, no
+// GC, nothing to pin.
+func (s *ContainerdSandbox) pinState(ctx context.Context, key string) error {
+	mgr := s.leaseManager()
+	if mgr == nil {
+		return nil
+	}
+	lctx := s.stateLeaseCtx(ctx)
+	if _, err := mgr.Create(lctx,
+		leases.WithID(statesLeaseID),
+		leases.WithLabels(map[string]string{sandboxLeaseLabel: "states"}),
+	); err != nil && !errdefs.IsAlreadyExists(err) {
+		return fmt.Errorf("containerd sandbox: ensure states lease: %w", err)
+	}
+	if err := mgr.AddResource(lctx, leases.Lease{ID: statesLeaseID}, s.stateResource(key)); err != nil {
+		return fmt.Errorf("containerd sandbox: pin %s: %w", key, err)
+	}
+	return nil
+}
+
+// unpinState drops a state's pin, letting the daemon's garbage collector
+// reclaim the layer once no other snapshot, container, or lease references it.
+//
+// A missing resource or lease is success, not an error: ReleaseState is
+// documented idempotent, and a double release must not surface as a failure.
+func (s *ContainerdSandbox) unpinState(ctx context.Context, key string) error {
+	mgr := s.leaseManager()
+	if mgr == nil {
+		return nil
+	}
+	if err := mgr.DeleteResource(s.stateLeaseCtx(ctx), leases.Lease{ID: statesLeaseID}, s.stateResource(key)); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("containerd sandbox: unpin %s: %w", key, err)
+	}
+	return nil
+}
+
 // namespaceSnapshotter injects the containerd namespace — and the sandbox's
 // lease, when it holds one — into every call the sandbox makes. Only the methods
 // sandbox.go uses are overridden; the rest are inherited from the embedded
@@ -259,7 +334,14 @@ func (i *containerdImages) RootfsSnapshot(ctx context.Context, ref string) (stri
 	if err != nil {
 		return "", err
 	}
-	diffIDs, err := img.RootFS(ctx)
+	// i.ctx, not the raw ctx: RootFS reads the config blob through the
+	// daemon's content store, which is namespace-scoped. On a cold daemon the
+	// image object comes from Pull with an empty diffIDs cache, so this call
+	// reaches the daemon — and without the namespace header it is rejected
+	// with "namespace is required". On a warm daemon GetImage's IsUnpacked
+	// probe (namespaced) has already populated the cache, which is why the
+	// missing wrapper survived green live runs.
+	diffIDs, err := img.RootFS(i.ctx(ctx))
 	if err != nil {
 		return "", fmt.Errorf("containerd sandbox: image %s: read rootfs diff ids: %w", ref, err)
 	}

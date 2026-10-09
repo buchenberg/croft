@@ -63,6 +63,7 @@ import (
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -277,6 +278,29 @@ func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, com
 	return res.Stdout
 }
 
+// captureLive captures and registers the state's release with the test.
+//
+// States outlive sandboxes by design now, and the live suite runs against a
+// persistent namespace: without this, every run would leave another pinned
+// snapshot behind. States captured *inside* Materialize (the substrate's own
+// captures) have no test-side handle and intentionally keep their pins —
+// releasing them is the kernel's state-expiry business, not the test's.
+func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) shepherd.WorkspaceState {
+	t.Helper()
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	t.Cleanup(func() {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancel()
+		if err := sb.ReleaseState(rctx, state); err != nil {
+			t.Logf("release state %s during cleanup: %v", state.Revision, err)
+		}
+	})
+	return state
+}
+
 // bootstrapGit seeds a committed git repository in the workdir.
 //
 // Capture records StateKeyGitHead only when the workdir is a repository, and
@@ -344,10 +368,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 		t.Errorf("WriteFile perm = %s, want 644", mode)
 	}
 
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
+	state := captureLive(t, ctx, sb)
 	if state.Backend != BackendName {
 		t.Errorf("state.Backend = %q, want %q", state.Backend, BackendName)
 	}
@@ -513,15 +534,18 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	}
 }
 
-// TestLive_DestroyRemovesLayersKeepsImageRootfs verifies teardown against the
-// real snapshotter: every layer this sandbox created is gone, and the image
-// rootfs — which belongs to the image, not the sandbox — survives.
+// TestLive_DestroyRemovesActiveLayerKeepsStates verifies teardown against the
+// real snapshotter under the state-durability contract: the active layer is the
+// sandbox's private writable layer and must be gone after Destroy, while the
+// committed layer backing a captured state must survive — a caller may Apply it
+// long after this sandbox is gone. Survival is asserted twice, structurally
+// (the snapshot still exists) and mechanically (the states lease still holds
+// its pin), and ReleaseState is exercised as the reclaim path.
 //
-// Removal must run children-before-parents, because a snapshot with children
-// cannot be removed. The fakes enforce that rule, but only a real snapshotter
-// proves the committedChain bookkeeping and the reverse iteration in Destroy
-// agree with actual overlayfs parent links.
-func TestLive_DestroyRemovesLayersKeepsImageRootfs(t *testing.T) {
+// Layer-removal ordering is no longer Destroy's concern: committed layers can
+// have children (later captures, sibling forks), so reaping them children-first
+// is the daemon GC's job once ReleaseState drops the pins.
+func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
@@ -531,26 +555,23 @@ func TestLive_DestroyRemovesLayersKeepsImageRootfs(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
-	if err := sb.WriteFile(ctx, "layer.txt", []byte("forces a second generation\n"), 0o644); err != nil {
+	if err := sb.WriteFile(ctx, "layer.txt", []byte("forces a committed layer\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	// Capture commits the active layer and prepares a successor, so the sandbox
-	// owns at least one committed layer plus one active layer: enough chain to
-	// exercise the ordering.
-	if _, err := sb.Capture(ctx); err != nil {
+	state, err := sb.Capture(ctx)
+	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-
+	committed, err := stateSnapshotKey(state)
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
 	sb.mu.Lock()
-	owned := append([]string{sb.activeKey}, sb.committedChain...)
+	active := sb.activeKey
 	rootfs := sb.rootfsKey
 	sb.mu.Unlock()
-
-	if rootfs == "" {
-		t.Fatal("rootfsKey is empty after Create")
-	}
-	if len(owned) < 2 {
-		t.Fatalf("expected an active layer plus at least one committed layer, got %v", owned)
+	if active == "" || rootfs == "" {
+		t.Fatal("active or rootfs key is empty after Create")
 	}
 
 	c := dial(t, cfg.Addr)
@@ -559,30 +580,50 @@ func TestLive_DestroyRemovesLayersKeepsImageRootfs(t *testing.T) {
 			t.Logf("close client: %v", err)
 		}
 	}()
+	lctx := nsCtx(ctx, cfg.Namespace)
+	svc := c.LeasesService()
 
-	before := liveSnapshotKeys(t, nsCtx(ctx, cfg.Namespace), c, cfg.Snapshotter)
-	for _, key := range owned {
+	before := liveSnapshotKeys(t, lctx, c, cfg.Snapshotter)
+	for _, key := range []string{active, committed, rootfs} {
 		if !before[key] {
-			t.Errorf("snapshot %q is owned by the sandbox but absent before Destroy", key)
+			t.Fatalf("snapshot %q absent before Destroy", key)
 		}
 	}
-	if !before[rootfs] {
-		t.Errorf("image rootfs %q absent before Destroy", rootfs)
+	// The pin exists before Destroy is asked to respect it.
+	if !leaseHoldsSnapshot(t, svc, lctx, committed) {
+		t.Fatalf("states lease does not hold %q before Destroy", committed)
 	}
 
 	if err := sb.Destroy(ctx); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	after := liveSnapshotKeys(t, nsCtx(ctx, cfg.Namespace), c, cfg.Snapshotter)
-	for _, key := range owned {
-		if after[key] {
-			t.Errorf("snapshot %q survived Destroy: teardown leaked a layer", key)
-		}
+	after := liveSnapshotKeys(t, lctx, c, cfg.Snapshotter)
+	if after[active] {
+		t.Errorf("active layer %q survived Destroy: it is the sandbox's private layer", active)
+	}
+	if !after[committed] {
+		t.Errorf("committed layer %q was removed by Destroy: it backs a captured "+
+			"state, and states outlive the sandbox that captured them", committed)
 	}
 	if !after[rootfs] {
 		t.Errorf("image rootfs %q was removed by Destroy: it belongs to the image, "+
 			"not the sandbox, and removing it breaks every other sandbox using that image", rootfs)
+	}
+	if !leaseHoldsSnapshot(t, svc, lctx, committed) {
+		t.Errorf("states lease no longer holds %q after Destroy: the state lost its "+
+			"GC protection with the sandbox", committed)
+	}
+
+	// ReleaseState is the reclaim path: the pin goes, and with it the daemon
+	// GC's license to reap the layer (once no child references it). The
+	// snapshot itself may linger until the next GC pass — only the pin is
+	// synchronous, so only the pin is asserted.
+	if err := sb.ReleaseState(ctx, state); err != nil {
+		t.Fatalf("ReleaseState: %v", err)
+	}
+	if leaseHoldsSnapshot(t, svc, lctx, committed) {
+		t.Errorf("states lease still holds %q after ReleaseState: the pin was not dropped", committed)
 	}
 
 	// Idempotency: Destroy clears its own bookkeeping, so a second call is a
@@ -590,6 +631,23 @@ func TestLive_DestroyRemovesLayersKeepsImageRootfs(t *testing.T) {
 	if err := sb.Destroy(ctx); err != nil {
 		t.Errorf("second Destroy must be a no-op, got: %v", err)
 	}
+}
+
+// leaseHoldsSnapshot reports whether the namespace's states lease lists key as
+// a snapshotter resource. This is the mechanism behind state durability, so the
+// tests assert it directly rather than inferring it from a snapshot's survival.
+func leaseHoldsSnapshot(t *testing.T, svc leases.Manager, ctx context.Context, key string) bool {
+	t.Helper()
+	res, err := svc.ListResources(ctx, leases.Lease{ID: statesLeaseID})
+	if err != nil {
+		t.Fatalf("list resources of lease %s: %v", statesLeaseID, err)
+	}
+	for _, r := range res {
+		if r.ID == key && strings.HasPrefix(r.Type, "snapshots/") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestLive_DiffPreservesPreStagedChanges is the regression test for the Sandbox
@@ -612,10 +670,7 @@ func TestLive_DiffPreservesPreStagedChanges(t *testing.T) {
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
+	state := captureLive(t, ctx, sb)
 
 	// Stage a change without committing, as a caller legitimately might.
 	mustExec(t, ctx, sb, cfg.Workdir, "sh", "-c", "printf 'staged by caller\\n' > staged.txt")

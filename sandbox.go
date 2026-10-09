@@ -58,16 +58,26 @@
 //
 //	Create   resolve the image rootfs, Prepare the base active snapshot, start
 //	         the task on its mounts
-//	Capture  stop the task, Commit the active snapshot, Prepare a fresh active
-//	         snapshot on top of it, restart the task
+//	Capture  stop the task, Commit the active snapshot, pin it as a state under
+//	         the namespace's states lease, Prepare a fresh active snapshot on
+//	         top of it, restart the task
 //	Apply    Prepare a new active snapshot from a committed key, rebind, restart
 //	Fork     Commit the parent's active snapshot, then Prepare the child with
 //	         that committed snapshot as its parent (see ForkState)
-//	Destroy  stop the task, then Remove the layers this sandbox created
+//	Destroy  stop the task, Remove the active layer, release the sandbox lease.
+//	         Committed layers survive: they are states, and states outlive the
+//	         sandbox that captured them
+//	ReleaseState  drop a state's pin; the daemon's GC reclaims the layer once
+//	         nothing references it
 //
 // Apply is single-use per state: unlike the git backend, resuming from a
 // committed snapshot rebinds this sandbox's identity rather than replaying into
 // an existing tree. Callers must not assume the git backend's reusability.
+//
+// Disk comes back through ReleaseState, Destroy's active-layer removal, or
+// namespace teardown — in that order of specificity. Destroy deliberately does
+// not remove committed layers: every one was returned to a caller as a state,
+// and a sibling sandbox may be running on a child of the same layer.
 package containerd
 
 import (
@@ -278,9 +288,10 @@ type ContainerdSandbox struct {
 	rootfsKey string
 	// activeKey is the writable snapshot the running task is rooted at.
 	activeKey string
-	// committedChain lists the committed layers this sandbox created, oldest
-	// first. Teardown must run in reverse: a layer with children cannot be
-	// removed until they are gone.
+	// committedChain lists the committed layers this sandbox's active layer
+	// descends from, oldest first. It records fork lineage — the next Capture's
+	// parent key — not teardown: committed layers are states, outlive the
+	// sandbox, and are never removed by Destroy or Apply.
 	committedChain []string
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
@@ -289,6 +300,28 @@ type ContainerdSandbox struct {
 // The compile-time assertion is load-bearing: if shepherd.Sandbox gains or
 // changes a method, this package stops building until the adapter matches.
 var _ shepherd.Sandbox = (*ContainerdSandbox)(nil)
+
+// StateReleaser is the optional state-discard surface this backend adds beyond
+// shepherd.Sandbox. The kernel's WorkspaceState has no lifecycle — a state
+// outlives the sandbox that captured it — and the lease pin that makes that
+// true holds daemon disk. This is how a caller gives it back deliberately.
+//
+// Callers type-assert to it:
+//
+//	if r, ok := sb.(StateReleaser); ok { _ = r.ReleaseState(ctx, state) }
+//
+// Promoting it into core's Sandbox interface is a separate, deliberate
+// kernel-API decision (every backend would have to answer what discarding a
+// state means); the assertion above is the tripwire that forces that
+// conversation.
+type StateReleaser interface {
+	// ReleaseState drops the pin holding ws's snapshot. The daemon's garbage
+	// collector reclaims the layer once no other snapshot, container, or lease
+	// references it; until then the state stays valid.
+	ReleaseState(ctx context.Context, ws shepherd.WorkspaceState) error
+}
+
+var _ StateReleaser = (*ContainerdSandbox)(nil)
 
 // New returns a sandbox bound to cfg, backed by a real containerd client. The
 // client is connected lazily on first use.
@@ -403,7 +436,15 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 	return nil
 }
 
-// Destroy stops the task and removes the layers this sandbox created.
+// Destroy stops the task, removes the sandbox's active layer, and releases the
+// sandbox lease.
+//
+// Committed layers survive. Every one was returned by Capture or ForkState as a
+// WorkspaceState, and states have no lifecycle: a caller may Apply one long
+// after this sandbox is gone, and sibling sandboxes may be running on children
+// of the same layers right now. They stay pinned by the namespace's states
+// lease (see pinState) and are reclaimed through ReleaseState or namespace
+// teardown, never here.
 //
 // Idempotent: it clears its own bookkeeping, so a second call is a no-op rather
 // than a wave of not-found errors. The image rootfs snapshot is never removed —
@@ -416,7 +457,6 @@ func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
 	s.mu.Lock()
 	id := s.id
 	active := s.activeKey
-	chain := s.committedChain
 	rootfs := s.rootfsKey
 	s.id, s.activeKey, s.committedChain, s.rootfsKey = "", "", nil, ""
 	s.mu.Unlock()
@@ -428,19 +468,11 @@ func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
 		}
 	}
 
-	// Children before parents: the active layer depends on the newest committed
-	// layer, which depends on the next oldest, and so on.
-	removals := make([]string, 0, len(chain)+1)
-	removals = append(removals, active)
-	for i := len(chain) - 1; i >= 0; i-- {
-		removals = append(removals, chain[i])
-	}
-	for _, key := range removals {
-		if key == "" || key == rootfs {
-			continue
-		}
-		if err := s.snap.Remove(ctx, key); err != nil {
-			errs = append(errs, fmt.Errorf("remove snapshot %s: %w", key, err))
+	// The active layer is the only one the sandbox owns outright: it is the
+	// private writable layer of the running task and backs no state.
+	if active != "" && active != rootfs {
+		if err := s.snap.Remove(ctx, active); err != nil {
+			errs = append(errs, fmt.Errorf("remove snapshot %s: %w", active, err))
 		}
 	}
 
@@ -471,7 +503,10 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 
 	s.mu.Lock()
 	id, active, parent := s.id, s.activeKey, s.parentKeyLocked()
-	if id == "" {
+	// active empty with an id set is the cleanly-stopped state advance leaves
+	// behind when a successor could not be started: there is no running layer
+	// to commit, so this is the same "not created (anymore)" case.
+	if id == "" || active == "" {
 		s.mu.Unlock()
 		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: Capture before Create")
 	}
@@ -492,18 +527,21 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: commit snapshot: %w", err)
 	}
 
-	next := s.key(id, "active", n)
-	if _, err := s.snap.Prepare(ctx, next, committed); err != nil {
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: prepare successor snapshot: %w", err)
-	}
-	if err := s.tasks.StartTask(ctx, id, next); err != nil {
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: restart task after capture: %w", err)
+	// The kernel's contract is that a WorkspaceState outlives the sandbox that
+	// captured it, so the pin cannot be this sandbox's lease: Destroy releases
+	// that one. Register the layer under the namespace's states lease instead.
+	// Failure fails the Capture — the caller must not be handed a state the
+	// daemon's GC may reclaim. Recovery shares the successor path with the
+	// success case below (advance), on a cancel-free context since the failure
+	// may itself be a cancellation.
+	if err := s.pinState(ctx, committed); err != nil {
+		_ = s.advance(context.WithoutCancel(ctx), id, committed, n)
+		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: pin captured state: %w", err)
 	}
 
-	s.mu.Lock()
-	s.activeKey = next
-	s.committedChain = append(s.committedChain, committed)
-	s.mu.Unlock()
+	if err := s.advance(ctx, id, committed, n); err != nil {
+		return shepherd.WorkspaceState{}, err
+	}
 
 	state := snapshotState(s.cfg.Image, committed, parent)
 	// Record the in-container git HEAD so Diff has a baseline. Absence is not an
@@ -514,13 +552,51 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 	return state, nil
 }
 
+// advance is Capture's successor path, shared by the success case and the
+// pin-failure recovery: it prepares a fresh active snapshot on top of the
+// committed layer, starts the task on it, and records the lineage.
+//
+// The caller has already stopped the task and committed the active layer, so
+// the old activeKey is gone — Commit renamed it. On any failure here there is
+// therefore nothing to restart on, and bookkeeping must not keep pointing at
+// a key the snapshotter no longer has: activeKey is cleared and the committed
+// layer is recorded, leaving the sandbox cleanly stopped (Destroy or an Apply
+// of an existing state recovers it) rather than wedged mid-lifecycle.
+func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n uint64) error {
+	stopped := func(err error) error {
+		s.mu.Lock()
+		s.activeKey = ""
+		s.committedChain = append(s.committedChain, committed)
+		s.mu.Unlock()
+		return err
+	}
+
+	next := s.key(id, "active", n)
+	if _, err := s.snap.Prepare(ctx, next, committed); err != nil {
+		return stopped(fmt.Errorf("containerd sandbox: prepare successor snapshot: %w", err))
+	}
+	if err := s.tasks.StartTask(ctx, id, next); err != nil {
+		_ = s.snap.Remove(context.WithoutCancel(ctx), next)
+		return stopped(fmt.Errorf("containerd sandbox: restart task after capture: %w", err))
+	}
+
+	s.mu.Lock()
+	s.activeKey = next
+	s.committedChain = append(s.committedChain, committed)
+	s.mu.Unlock()
+	return nil
+}
+
 // Apply resumes the workspace from a previously captured state by preparing a new
 // active snapshot from the committed key and rebinding this sandbox.
 //
-// Layers created after the applied state are orphaned and removed, so repeated
-// fork/apply cycles do not accumulate disk. Single-use per state: the sandbox now
-// runs on the given committed layer, so applying a different state moves it
-// again. This differs from the git backend, whose states are freely reusable.
+// Layers created after the applied state are no longer ancestors of this
+// sandbox's active layer, but they survive: each was handed to a caller as a
+// WorkspaceState, and states outlive sandboxes. Reclaim them with ReleaseState
+// when the caller is done with them. Only the abandoned active layer is
+// removed. Single-use per state: the sandbox now runs on the given committed
+// layer, so applying a different state moves it again. This differs from the
+// git backend, whose states are freely reusable.
 func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceState) error {
 	committed, err := stateSnapshotKey(ws)
 	if err != nil {
@@ -529,9 +605,9 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
-	// Apply prepares snapshots and prunes the chain, so it needs the lease as
-	// much as Create does. Reaching here without Create is normal: a resumed
-	// sandbox acquires its lease lazily on first use.
+	// Apply prepares snapshots under the lease, so it needs it as much as Create
+	// does. Reaching here without Create is normal: a resumed sandbox acquires
+	// its lease lazily on first use.
 	if err := s.ensureLease(ctx); err != nil {
 		return err
 	}
@@ -545,8 +621,7 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 		id = newSandboxID()
 	}
 	active := s.activeKey
-	rootfs := s.rootfsKey
-	kept, orphaned := splitChain(s.committedChain, committed)
+	kept, _ := splitChain(s.committedChain, committed)
 	s.seq++
 	next := s.key(id, "active", s.seq)
 	s.mu.Unlock()
@@ -577,24 +652,43 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 	s.committedChain = kept
 	s.mu.Unlock()
 
-	// Best effort: a failure to clean up leaks disk, it does not invalidate the
-	// state just resumed. Children before parents.
+	// Best effort: the abandoned active layer is this sandbox's private
+	// writable layer and backs no state, so its leak is the only one Apply
+	// cleans up itself.
 	if active != "" && active != next {
 		_ = s.snap.Remove(ctx, active)
-	}
-	for i := len(orphaned) - 1; i >= 0; i-- {
-		if orphaned[i] != rootfs {
-			_ = s.snap.Remove(ctx, orphaned[i])
-		}
 	}
 	return nil
 }
 
+// ReleaseState drops the pin holding a captured state's snapshot, letting the
+// daemon's garbage collector reclaim the layer once no other snapshot,
+// container, or lease references it.
+//
+// This is the state-discard half of the kernel's "a WorkspaceState has no
+// lifecycle" contract: the state stays valid for exactly as long as the caller
+// wants it, and disk comes back when the caller says so. It is deliberately not
+// part of shepherd.Sandbox — see StateReleaser — because promoting a discard
+// operation into the core interface is a kernel-level API decision.
+//
+// Idempotent: releasing an already-released state is a no-op.
+func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws shepherd.WorkspaceState) error {
+	key, err := stateSnapshotKey(ws)
+	if err != nil {
+		return err
+	}
+	if err := s.requireBackend(ctx); err != nil {
+		return err
+	}
+	return s.unpinState(ctx, key)
+}
+
 // splitChain partitions a committed-layer chain at key: layers up to and
 // including key are retained (they remain ancestors of a layer prepared from
-// key), and the rest are orphaned. A key that is not in the chain — an image
-// rootfs, or a state from another lineage — retains nothing and orphans the
-// whole chain, because none of it is an ancestor of the new active layer.
+// key), and the rest are no longer ancestors of anything this sandbox runs on.
+// They are still states the caller may hold and are not removed — the partition
+// only rebinds lineage. A key that is not in the chain — an image rootfs, or a
+// state from another lineage — retains nothing.
 func splitChain(chain []string, key string) (kept, orphaned []string) {
 	for i, k := range chain {
 		if k == key {

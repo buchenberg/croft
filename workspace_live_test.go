@@ -125,10 +125,9 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	}
 
 	// Capture the world the substrate wrote into, then recycle the sandbox.
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
+	// captureLive also registers the state's release for cleanup: the recycle
+	// assertion needs the pin to OUTLIVE Destroy, not the test.
+	state := captureLive(t, ctx, sb)
 	if err := sb.Destroy(ctx); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	"github.com/containerd/containerd/v2/core/leases"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -253,20 +254,32 @@ func TestCapture_BeforeCreateFails(t *testing.T) {
 	}
 }
 
-// TestDestroy_RemovesOwnedLayersInChildFirstOrder checks teardown removes every
-// layer this sandbox created but never the image rootfs, and does so children
-// before parents (the fake refuses to remove a layer with children).
-func TestDestroy_RemovesOwnedLayersInChildFirstOrder(t *testing.T) {
+// TestDestroy_RemovesActiveLayerKeepsStates pins the state-durability half of
+// the teardown contract: the active layer is the sandbox's private writable
+// layer and dies with it, while committed layers are states handed to callers
+// and must survive — a caller may Apply one long after Destroy, and the kernel
+// contract says states have no lifecycle.
+func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t, "abc")
 	ctx := context.Background()
 	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := sb.Capture(ctx); err != nil {
+	first, err := sb.Capture(ctx)
+	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	if _, err := sb.Capture(ctx); err != nil {
+	second, err := sb.Capture(ctx)
+	if err != nil {
 		t.Fatalf("Capture: %v", err)
+	}
+	k1, err := stateSnapshotKey(first)
+	if err != nil {
+		t.Fatalf("first state: %v", err)
+	}
+	k2, err := stateSnapshotKey(second)
+	if err != nil {
+		t.Fatalf("second state: %v", err)
 	}
 	log.mu.Lock()
 	log.ops = nil
@@ -280,20 +293,30 @@ func TestDestroy_RemovesOwnedLayersInChildFirstOrder(t *testing.T) {
 	if len(verbs) == 0 || verbs[0] != "stop" {
 		t.Errorf("Destroy ops = %v, want the task stopped first", verbs)
 	}
+	// Exactly one removal: the active layer. The two committed layers back
+	// states and must not be touched.
 	removals := 0
-	for _, v := range verbs {
-		if v == "remove" {
+	for _, op := range log.snapshot() {
+		if strings.HasPrefix(op, "remove:") {
 			removals++
+			if !strings.Contains(op, "/active/") {
+				t.Errorf("Destroy removed %q, which is not an active layer; committed "+
+					"layers are states and must survive", op)
+			}
 		}
 	}
-	// Two committed layers plus the active one.
-	if removals != 3 {
-		t.Errorf("removed %d layers, want 3 (ops: %v)", removals, log.snapshot())
+	if removals != 1 {
+		t.Errorf("Destroy performed %d removals, want 1 (ops: %v)", removals, log.snapshot())
 	}
-	// Only the image rootfs remains.
+	// The states and the image rootfs survive; only the active layer is gone.
 	left := snap.keys()
-	if len(left) != 1 || left[0] != "rootfs-image-digest" {
-		t.Errorf("layers left = %v, want only the image rootfs", left)
+	if len(left) != 3 {
+		t.Errorf("layers left = %v, want the image rootfs plus both committed states", left)
+	}
+	for _, key := range []string{"rootfs-image-digest", k1, k2} {
+		if !snap.has(key) {
+			t.Errorf("snapshot %q did not survive Destroy", key)
+		}
 	}
 	if tasks.isRunning() {
 		t.Error("Destroy must stop the task")
@@ -321,10 +344,14 @@ func TestDestroy_IsIdempotent(t *testing.T) {
 	}
 }
 
-// TestApply_PrunesOrphanedLayers verifies that resuming an earlier state removes
-// the layers created after it, so fork/apply cycles do not accumulate disk.
-func TestApply_PrunesOrphanedLayers(t *testing.T) {
+// TestApply_KeepsLaterLayersAsStates pins that resuming an earlier state leaves
+// the layers captured after it alone: they are states the caller still holds,
+// and states have no lifecycle. Disk comes back through ReleaseState, not by
+// Apply deciding a state is garbage on the caller's behalf.
+func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 	sb, snap, _, _ := newTestSandbox(t, "abc")
+	fl := &fakeLeases{}
+	sb.leases = fl
 	ctx := context.Background()
 	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -338,15 +365,23 @@ func TestApply_PrunesOrphanedLayers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Capture: %v", err)
 	}
-	k1, _ := stateSnapshotKey(first)
-	k2, _ := stateSnapshotKey(second)
+	k1, err := stateSnapshotKey(first)
+	if err != nil {
+		t.Fatalf("first state: %v", err)
+	}
+	k2, err := stateSnapshotKey(second)
+	if err != nil {
+		t.Fatalf("second state: %v", err)
+	}
 
-	// Resume the older state: the second committed layer is now unreachable.
+	// Resume the older state. The second committed layer is no longer an
+	// ancestor of anything this sandbox runs on, but it is still a state.
 	if err := sb.Apply(ctx, first); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if snap.has(k2) {
-		t.Errorf("layer %s created after the resumed state should be pruned", k2)
+	if !snap.has(k2) {
+		t.Errorf("layer %s was removed by Apply: it backs the captured state %q and "+
+			"the caller may still apply it", k2, k2)
 	}
 	if !snap.has(k1) {
 		t.Errorf("layer %s is the resumed state and must survive", k1)
@@ -354,6 +389,15 @@ func TestApply_PrunesOrphanedLayers(t *testing.T) {
 	// The sandbox keeps working after Apply.
 	if _, err := sb.Capture(ctx); err != nil {
 		t.Fatalf("Capture after Apply: %v", err)
+	}
+
+	// The caller decides when the superseded state's disk comes back.
+	if err := sb.ReleaseState(ctx, second); err != nil {
+		t.Fatalf("ReleaseState: %v", err)
+	}
+	want := leases.Resource{ID: k2, Type: "snapshots/" + defaultSnapshotter}
+	if len(fl.removed) != 1 || fl.removed[0] != want {
+		t.Errorf("released resources = %v, want [%v]", fl.removed, want)
 	}
 }
 
