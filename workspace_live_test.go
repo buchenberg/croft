@@ -1,4 +1,4 @@
-//go:build linux && !nolive && shepherd_p2b_live
+//go:build linux && !nolive
 
 package containerd
 
@@ -7,25 +7,20 @@ package containerd
 // materialize it through the sandbox, capture, destroy, apply, and verify
 // the substrate-written file is present in the re-provisioned workspace.
 //
-// # Why the extra build tag
+// # Why this file landed in two acts
 //
-// This file needs the core module's substrate API, which first ships in core
+// It needs the core module's substrate API, which first shipped in core
 // v0.7.0 — but this module compiles against *published* core only (no
-// replace directive; that is the T0.4 release discipline), and v0.7.0 does
-// not exist until the phase-2b release is tagged. So the work lands in two
-// acts, the same shape as the T0.8/T0.8b repin:
+// replace directive; that is the T0.4 release discipline), and v0.7.0 did
+// not exist when the test was written. So it landed dormant, behind an
+// extra build tag, in the same commit as the phase-2b code; this commit is
+// act 2 — the repin to v0.7.0 and the removal of the tag — the same two-act
+// shape as the T0.8/T0.8b repin. The constraint now matches live_test.go,
+// so the file joins the normal linux build graph and skips at runtime
+// without SHEPHERD_CONTAINERD_ADDR, exactly like the rest of the live
+// suite.
 //
-//  1. now: the test is complete and committed behind the shepherd_p2b_live
-//     tag, out of the default build graph;
-//  2. at the v0.7.0 release: bump this module's core requirement to v0.7.0
-//     (go get github.com/buchenberg/shepherd-kernel-go@v0.7.0), drop the
-//     extra tag from this file's constraint so it joins live_test.go, and
-//     tag the nested module as v0.1.3.
-//
-// Until act 2, this file is compile-unchecked — deliberately, not
-// accidentally: the constraint is written here so nobody assumes it runs.
-//
-// # Running it (after act 2)
+// # Running it
 //
 //	sudo env SHEPHERD_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 //	  go test -count=1 -v -run TestLive_WorkspaceSubstrate ./...
