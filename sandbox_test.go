@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	shepherd "github.com/buchenberg/shepherd-kernel-go"
-	"github.com/containerd/containerd/v2/core/leases"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -395,9 +394,8 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 	if err := sb.ReleaseState(ctx, second); err != nil {
 		t.Fatalf("ReleaseState: %v", err)
 	}
-	want := leases.Resource{ID: k2, Type: "snapshots/" + defaultSnapshotter}
-	if len(fl.removed) != 1 || fl.removed[0] != want {
-		t.Errorf("released resources = %v, want [%v]", fl.removed, want)
+	if !fl.releasedFrom(statesLeaseID, k2) {
+		t.Errorf("releasing the superseded state did not drop its %s pin", k2)
 	}
 }
 

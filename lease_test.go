@@ -15,6 +15,14 @@ import (
 	"github.com/containerd/errdefs"
 )
 
+// fakePin is one recorded resource operation, carrying the lease it targeted
+// so tests can assert the pin landed on the states lease — and not, say, the
+// sandbox's own — rather than only that *some* lease received it.
+type fakePin struct {
+	lease string
+	res   leases.Resource
+}
+
 // fakeLeases records the lease lifecycle. The daemon's real manager is the only
 // thing that can prove a snapshot is protected (see
 // TestLive_LeaseHoldsSnapshots); this exists so the sandbox's own bookkeeping —
@@ -31,8 +39,8 @@ type fakeLeases struct {
 	created       []leases.Lease
 	deleted       []string
 	existing      map[string]bool
-	added         []leases.Resource
-	removed       []leases.Resource
+	added         []fakePin
+	removed       []fakePin
 	lastLabel     map[string]string
 	createErr     error
 	deleteErr     error
@@ -101,24 +109,48 @@ func (f *fakeLeases) counts() (created, deleted int) {
 
 func (f *fakeLeases) List(context.Context, ...string) ([]leases.Lease, error) { return nil, nil }
 
-func (f *fakeLeases) AddResource(_ context.Context, _ leases.Lease, r leases.Resource) error {
+func (f *fakeLeases) AddResource(_ context.Context, l leases.Lease, r leases.Resource) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.addResErr != nil {
 		return f.addResErr
 	}
-	f.added = append(f.added, r)
+	f.added = append(f.added, fakePin{lease: l.ID, res: r})
 	return nil
 }
 
-func (f *fakeLeases) DeleteResource(_ context.Context, _ leases.Lease, r leases.Resource) error {
+func (f *fakeLeases) DeleteResource(_ context.Context, l leases.Lease, r leases.Resource) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.delResErr != nil {
 		return f.delResErr
 	}
-	f.removed = append(f.removed, r)
+	f.removed = append(f.removed, fakePin{lease: l.ID, res: r})
 	return nil
+}
+
+// pinnedOn reports whether the states lease holds id as a snapshotter resource.
+func (f *fakeLeases) pinnedOn(lease, id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.added {
+		if p.lease == lease && p.res.ID == id && strings.HasPrefix(p.res.Type, "snapshots/") {
+			return true
+		}
+	}
+	return false
+}
+
+// releasedFrom reports whether a pin for id was dropped from the states lease.
+func (f *fakeLeases) releasedFrom(lease, id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.removed {
+		if p.lease == lease && p.res.ID == id && strings.HasPrefix(p.res.Type, "snapshots/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeLeases) ListResources(context.Context, leases.Lease) ([]leases.Resource, error) {
@@ -211,9 +243,9 @@ func TestEnsureLease_CreatesOnceAndLabelsIt(t *testing.T) {
 
 func TestEnsureLease_NoManagerIsNoop(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
-	if sb.leases != nil {
-		t.Fatal("a substituted backend should carry no lease manager")
-	}
+	// The default test wiring installs a fake manager; clear it to exercise
+	// the no-manager path.
+	sb.leases = nil
 	if err := sb.ensureLease(context.Background()); err != nil {
 		t.Fatalf("ensureLease with no manager: %v", err)
 	}
@@ -544,16 +576,12 @@ func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
 		t.Fatalf("states lease label %s = %q, want states", sandboxLeaseLabel, got)
 	}
 
-	// Both committed layers are pinned as snapshotter resources.
-	pinned := make(map[leases.Resource]bool)
-	for _, r := range fl.added {
-		pinned[r] = true
-	}
-	resType := "snapshots/" + defaultSnapshotter
-	if !pinned[leases.Resource{ID: k1, Type: resType}] {
+	// Both committed layers are pinned as snapshotter resources — on the states
+	// lease specifically, not merely on whichever lease came first.
+	if !fl.pinnedOn(statesLeaseID, k1) {
 		t.Errorf("state %s is not pinned: a state must be a GC root beyond the sandbox lease", k1)
 	}
-	if !pinned[leases.Resource{ID: k2, Type: resType}] {
+	if !fl.pinnedOn(statesLeaseID, k2) {
 		t.Errorf("state %s is not pinned: a state must be a GC root beyond the sandbox lease", k2)
 	}
 }
@@ -603,13 +631,7 @@ func TestCapture_PinFailureRollsForwardNotOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("state after recovery: %v", err)
 	}
-	pinned := false
-	for _, r := range fl.added {
-		if r.ID == key && r.Type == "snapshots/"+defaultSnapshotter {
-			pinned = true
-		}
-	}
-	if !pinned {
+	if !fl.pinnedOn(statesLeaseID, key) {
 		t.Errorf("the post-recovery state %s is not pinned", key)
 	}
 }
@@ -629,14 +651,17 @@ func (f *failingStartTask) StartTask(ctx context.Context, id, key string) error 
 }
 
 // TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox pins the wedge
-// recovery: when the pin fails AND the roll-forward cannot restart the task,
-// bookkeeping must not keep pointing at the active key Commit renamed away.
-// A ghost activeKey would fail every later Capture on a nonexistent key and
-// make Destroy's first call error removing it; instead the sandbox reports
-// itself stopped and Destroy succeeds in one call.
+// recovery for the leak path: the pin SUCCEEDS but the successor cannot be
+// started (advance fails), so Capture errors without handing out a state. The
+// just-created pin must be dropped — the caller has no handle to ever release
+// it, and it would hold disk until namespace teardown — and bookkeeping must
+// not keep pointing at the active key Commit renamed away. A ghost activeKey
+// would fail every later Capture on a nonexistent key and make Destroy's first
+// call error removing it; instead the sandbox reports itself stopped and
+// Destroy succeeds in one call.
 func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
 	sb, snap, _, _ := newTestSandbox(t, "abc")
-	fl := &fakeLeases{addResErr: errors.New("lease service unavailable")}
+	fl := &fakeLeases{}
 	sb.leases = fl
 	tasks := &failingStartTask{taskService: sb.tasks}
 	sb.tasks = tasks
@@ -646,8 +671,8 @@ func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
 	}
 	tasks.armed = true
 
-	if _, err := sb.Capture(ctx); err == nil || !strings.Contains(err.Error(), "pin captured state") {
-		t.Fatalf("err = %v, want a wrapped pin-captured-state error", err)
+	if _, err := sb.Capture(ctx); err == nil || !strings.Contains(err.Error(), "restart task after capture") {
+		t.Fatalf("err = %v, want the advance error from the failed restart", err)
 	}
 
 	// The committed layer exists (Commit succeeded; Commit cannot be undone),
@@ -660,6 +685,13 @@ func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
 	}
 	if committed == "" {
 		t.Fatal("no committed layer after a failed roll-forward; the commit did happen")
+	}
+
+	// The pin that succeeded was dropped on the way out: the caller never
+	// received a state, so the pin would otherwise be unreachable and permanent.
+	if !fl.releasedFrom(statesLeaseID, committed) {
+		t.Errorf("the orphaned pin on %s was not released; it would hold disk until "+
+			"namespace teardown with no handle left to release it", committed)
 	}
 
 	// A later Capture must fail on the guard, not on committing a ghost key.
@@ -699,8 +731,8 @@ func TestReleaseState_DropsTheStatesLeasePin(t *testing.T) {
 		t.Fatalf("ReleaseState: %v", err)
 	}
 	want := leases.Resource{ID: key, Type: "snapshots/" + defaultSnapshotter}
-	if len(fl.removed) != 1 || fl.removed[0] != want {
-		t.Fatalf("removed resources = %v, want [%v]", fl.removed, want)
+	if len(fl.removed) != 1 || fl.removed[0].res != want || fl.removed[0].lease != statesLeaseID {
+		t.Fatalf("removed = %+v, want the %s resource %v on the states lease", fl.removed, statesLeaseID, want)
 	}
 
 	// Idempotent, and a resource the daemon already dropped is not an error.
@@ -741,11 +773,12 @@ func TestReleaseState_RejectsForeignAndIncompleteStates(t *testing.T) {
 	}
 }
 
-// TestReleaseState_NoManagerIsNoop covers the substituted backend: with no
-// daemon there is no lease to manage, and ReleaseState must say so quietly
-// rather than failing.
+// TestReleaseState_NoManagerIsNoop covers the no-manager path: with no lease
+// manager configured there is nothing to unpin, and ReleaseState must say so
+// quietly rather than failing.
 func TestReleaseState_NoManagerIsNoop(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "abc")
+	sb.leases = nil
 	ctx := context.Background()
 	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)

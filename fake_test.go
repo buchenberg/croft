@@ -339,6 +339,11 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 }
 
 // newTestSandbox wires a sandbox over the fakes with a seeded image rootfs.
+//
+// A default lease manager is installed so every test exercises the pin path
+// Capture takes on a real backend; tests that care about the lease lifecycle
+// overwrite sb.leases with their own fake. The nil-manager no-op behavior is
+// covered by tests that clear the manager explicitly.
 func newTestSandbox(t *testing.T, gitHead string) (*ContainerdSandbox, *fakeSnapshotter, *fakeTasks, *opLog) {
 	t.Helper()
 	log := &opLog{}
@@ -347,7 +352,7 @@ func newTestSandbox(t *testing.T, gitHead string) (*ContainerdSandbox, *fakeSnap
 	tasks := newFakeTasks(log, snap)
 	tasks.gitHead = gitHead
 	images := &fakeImages{rootfs: "rootfs-image-digest"}
-	sb := NewWithBackend(Config{Image: "example/dev:latest"}, snap, tasks, images)
+	sb := NewWithBackend(Config{Image: "example/dev:latest"}, snap, tasks, images, WithLeases(&fakeLeases{}))
 	return sb, snap, tasks, log
 }
 

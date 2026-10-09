@@ -558,10 +558,10 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	if err := sb.WriteFile(ctx, "layer.txt", []byte("forces a committed layer\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
+	// captureLive also registers the release with cleanup: if this test fails
+	// before its own explicit ReleaseState below, the persistent live namespace
+	// must not accumulate another pinned snapshot.
+	state := captureLive(t, ctx, sb)
 	committed, err := stateSnapshotKey(state)
 	if err != nil {
 		t.Fatalf("state: %v", err)

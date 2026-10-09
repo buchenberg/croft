@@ -229,8 +229,10 @@ func (s *ContainerdSandbox) stateResource(key string) leases.Resource {
 // (core/metadata registers ctx-lease snapshots under exactly this type), so the
 // daemon sees an explicit pin and an automatic one as the same kind of edge.
 //
-// A nil manager means the collaborators were substituted (tests): no daemon, no
-// GC, nothing to pin.
+// A nil manager means no lease manager was configured — test fakes, or
+// NewWithBackend without WithLeases. A test fake has no daemon GC and loses
+// nothing, but on a real backend a missing manager silently disables state
+// durability, which is why NewWithBackend flags the WithLeases option.
 func (s *ContainerdSandbox) pinState(ctx context.Context, key string) error {
 	mgr := s.leaseManager()
 	if mgr == nil {

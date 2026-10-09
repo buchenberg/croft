@@ -332,8 +332,29 @@ func New(cfg Config) *ContainerdSandbox {
 // NewWithBackend returns a sandbox backed by the supplied implementations.
 // Exported for tests and for embedding the sandbox in a host that already holds
 // a containerd client.
-func NewWithBackend(cfg Config, snap snapshots.Snapshotter, tasks taskService, images imageService) *ContainerdSandbox {
-	return &ContainerdSandbox{cfg: cfg, snap: snap, tasks: tasks, images: images}
+//
+// Without WithLeases the sandbox has no lease manager, and state durability is
+// inert: Capture still succeeds and hands out states, but nothing pins their
+// snapshots against the daemon's GC (see pinState). A host embedding a real
+// snapshotter should therefore pass WithLeases with the client's
+// LeasesService(); test fakes have no GC and lose nothing by omitting it.
+func NewWithBackend(cfg Config, snap snapshots.Snapshotter, tasks taskService, images imageService, opts ...BackendOption) *ContainerdSandbox {
+	s := &ContainerdSandbox{cfg: cfg, snap: snap, tasks: tasks, images: images}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// BackendOption configures optional collaborators on a NewWithBackend sandbox.
+type BackendOption func(*ContainerdSandbox)
+
+// WithLeases supplies the daemon's lease manager for hosts embedding the
+// sandbox over an existing containerd client — pass client.LeasesService().
+// Without it, pinState and unpinState are no-ops and captured states are not
+// durable (see NewWithBackend).
+func WithLeases(mgr leases.Manager) BackendOption {
+	return func(s *ContainerdSandbox) { s.leases = mgr }
 }
 
 // Backend reports the backend identifier.
@@ -540,6 +561,14 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 	}
 
 	if err := s.advance(ctx, id, committed, n); err != nil {
+		// The pin succeeded but no state is being handed out, so the caller
+		// can never ReleaseState this handle: drop the pin or it holds disk
+		// until namespace teardown. The committed layer itself stays — Commit
+		// already renamed the active key onto it, and advance has recorded it
+		// as this sandbox's lineage — where the sandbox lease protects it for
+		// the sandbox's remaining life and the daemon GC reclaims it after
+		// Destroy. Cancel-free, for the same reason as the pin-failure branch.
+		_ = s.unpinState(context.WithoutCancel(ctx), committed)
 		return shepherd.WorkspaceState{}, err
 	}
 
@@ -672,6 +701,12 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 // operation into the core interface is a kernel-level API decision.
 //
 // Idempotent: releasing an already-released state is a no-op.
+//
+// The pin is addressed by the releasing backend's own namespace and
+// snapshotter — a WorkspaceState carries no config identity — so release
+// through a backend configured the same way as the one that captured the
+// state. A mismatched release reports success (the target resource is simply
+// not found) while the real pin persists.
 func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws shepherd.WorkspaceState) error {
 	key, err := stateSnapshotKey(ws)
 	if err != nil {
