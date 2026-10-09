@@ -55,6 +55,14 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
+
+	// newLiveSandbox builds the sandbox value; Create provisions it. Every
+	// live test does this before touching the workspace — Exec and file IO
+	// both route through the container and fail with "sandbox not created"
+	// otherwise.
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
 	store, err := shepherd.NewSQLiteTraceStore(":memory:")
@@ -163,6 +171,9 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
+	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
 	store, err := shepherd.NewSQLiteTraceStore(":memory:")
