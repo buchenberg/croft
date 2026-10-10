@@ -69,10 +69,10 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLiteTraceStore: %v", err)
 	}
-	defer store.Close()
+	defer store.Close(context.Background())
 
 	content := "written through the trace"
-	declaration, err := store.Append(liveAppendContext, shepherd.AppendBatch{
+	declaration, err := store.Append(context.Background(), liveAppendContext, shepherd.AppendBatch{
 		AppendIntentID: "live:substrate:declare",
 		Groups: []shepherd.AppendGroup{{
 			TraceOwnerID: "owner:live-substrate",
@@ -148,7 +148,7 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	// The applied capture cites its declaration, so the trace stays
 	// interpretable: the write in the workspace is causally linked to the
 	// recorded intent.
-	capture, err := store.ReadFact(shepherd.ReadContext{ActorRef: "live:test", VisibilityProfile: shepherd.VisibilityPayload}, receipt.ProducedRecordIDs[0])
+	capture, err := store.ReadFact(context.Background(), shepherd.ReadContext{ActorRef: "live:test", VisibilityProfile: shepherd.VisibilityPayload}, receipt.ProducedRecordIDs[0])
 	if err != nil {
 		t.Fatalf("read capture: %v", err)
 	}
@@ -179,9 +179,9 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSQLiteTraceStore: %v", err)
 	}
-	defer store.Close()
+	defer store.Close(context.Background())
 
-	declaration, err := store.Append(liveAppendContext, shepherd.AppendBatch{
+	declaration, err := store.Append(context.Background(), liveAppendContext, shepherd.AppendBatch{
 		AppendIntentID: "live:substrate:exec-declare",
 		Groups: []shepherd.AppendGroup{{
 			TraceOwnerID: "owner:live-substrate-exec",

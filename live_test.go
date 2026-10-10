@@ -864,3 +864,144 @@ func TestLive_DestroyReleasesTheLease(t *testing.T) {
 			"pins snapshots against the GC indefinitely", len(after), after)
 	}
 }
+
+// TestLive_ApplyDeltaMergesOntoMovedParent is the settlement apply verb's
+// acceptance sequence: fork a child off the parent's committed layer, work in
+// the child, and while the parent moves on its own paths — including
+// uncommitted work, which is this substrate's steady state — merge the child's
+// sealed delta back without resetting anything.
+//
+// The three-way tree merge earns its keep on exactly this shape: the delta's
+// patch carries the parent's own pre-fork uncommitted files (they differ from
+// the git base but not from the parent's worktree), so a plain two-way apply
+// would refuse or clobber. theirs == ours must merge to a no-op for those
+// paths, and only the child's real work may land.
+func TestLive_ApplyDeltaMergesOntoMovedParent(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	parent := newLiveSandbox(t, ctx, cfg)
+	if err := parent.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	bootstrapGit(t, ctx, parent, cfg.Workdir)
+
+	// The parent's pre-fork state is deliberately uncommitted work plus a
+	// staged file: the committed git HEAD (the delta base) is behind the
+	// worktree, which is what the child inherits through the layer.
+	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent work\\n' > parentwork.txt")
+	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent staged\\n' > staged.txt")
+	mustExec(t, ctx, parent, cfg.Workdir, "git", "add", "staged.txt")
+
+	baseline := captureLive(t, ctx, parent)
+	baseHead, _ := baseline.Data[StateKeyGitHead].(string)
+	if baseHead == "" {
+		t.Fatalf("baseline has no %q: the fork flow needs the git HEAD as the delta base", StateKeyGitHead)
+	}
+
+	// The child is a fresh sandbox resumed from the baseline layer — the
+	// isolated-fork flow a host such as yaah will drive. No Create: Apply
+	// provisions.
+	child := newLiveSandbox(t, ctx, cfg)
+	if err := child.Apply(ctx, baseline); err != nil {
+		t.Fatalf("child Apply(baseline): %v", err)
+	}
+	// The layer, not git history, is what forks: the parent's uncommitted work
+	// is present in the child without either side committing anything.
+	if got, err := child.ReadFile(ctx, "parentwork.txt"); err != nil || string(got) != "parent work\n" {
+		t.Fatalf("child parentwork.txt = %q, %v; want the parent's uncommitted content", got, err)
+	}
+	mustExec(t, ctx, child, cfg.Workdir, "sh", "-c", "printf 'child feature\\n' > feature.txt")
+
+	delta := captureLive(t, ctx, child)
+	if got, _ := delta.Data[StateKeyDeltaBase].(string); got != baseHead {
+		t.Errorf("delta_base = %q, want the baseline's git HEAD %q", got, baseHead)
+	}
+	if patch, _ := delta.Data[StateKeyDeltaPatch].(string); patch == "" {
+		t.Fatalf("delta has no %q despite a changed worktree", StateKeyDeltaPatch)
+	}
+
+	// The parent moves on its own paths after the fork — uncommitted, like
+	// its pre-fork work.
+	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent move\\n' > parentmove.txt")
+
+	if err := parent.ApplyDelta(ctx, delta); err != nil {
+		t.Fatalf("ApplyDelta onto moved parent: %v", err)
+	}
+
+	// The child's work landed...
+	if got, err := parent.ReadFile(ctx, "feature.txt"); err != nil || string(got) != "child feature\n" {
+		t.Errorf("parent feature.txt = %q, %v; want the child's content", got, err)
+	}
+	// ...the parent's concurrent work survived...
+	for path, want := range map[string]string{
+		"parentwork.txt": "parent work\n",
+		"parentmove.txt": "parent move\n",
+		"base.txt":       "baseline\n",
+	} {
+		if got, err := parent.ReadFile(ctx, path); err != nil || string(got) != want {
+			t.Errorf("parent %s = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	// ...and nothing touched the parent's git index: the merge landed as
+	// unstaged worktree changes, and the pre-staged file is still the only
+	// staged one.
+	if staged := strings.TrimSpace(mustExec(t, ctx, parent, cfg.Workdir,
+		"git", "diff", "--cached", "--name-only")); staged != "staged.txt" {
+		t.Errorf("staged files after ApplyDelta = %q, want staged.txt alone", staged)
+	}
+}
+
+// TestLive_ApplyDeltaConflictRefusesUntouched pins the refusal half of the
+// DeltaApplier contract on a real daemon: a delta that collides with the
+// parent's own changes to the same path fails the call and leaves the
+// workspace untouched — no conflict markers, no partial application — and the
+// delta still merges cleanly onto an unmoved parent afterwards, which is what
+// "consumes nothing" means physically.
+func TestLive_ApplyDeltaConflictRefusesUntouched(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	parent := newLiveSandbox(t, ctx, cfg)
+	if err := parent.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	bootstrapGit(t, ctx, parent, cfg.Workdir)
+	baseline := captureLive(t, ctx, parent)
+
+	child := newLiveSandbox(t, ctx, cfg)
+	if err := child.Apply(ctx, baseline); err != nil {
+		t.Fatalf("child Apply(baseline): %v", err)
+	}
+	mustExec(t, ctx, child, cfg.Workdir, "sh", "-c", "printf 'child version\\n' > shared.txt")
+	delta := captureLive(t, ctx, child)
+
+	// The parent claims the same path with different content — uncommitted,
+	// so the collision is an add/add one that only the merge can see.
+	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent version\\n' > shared.txt")
+
+	err := parent.ApplyDelta(ctx, delta)
+	if err == nil {
+		t.Fatal("ApplyDelta over a colliding path must fail")
+	}
+	if !strings.Contains(err.Error(), "shared.txt") {
+		t.Errorf("refusal = %v, want it to name the conflicting path", err)
+	}
+	if got, readErr := parent.ReadFile(ctx, "shared.txt"); readErr != nil || string(got) != "parent version\n" {
+		t.Fatalf("parent shared.txt after refusal = %q, %v; want the parent's content, untouched", got, readErr)
+	}
+
+	// The refusal consumed nothing: an unmoved parent still merges the delta.
+	fresh := newLiveSandbox(t, ctx, cfg)
+	if err := fresh.Apply(ctx, baseline); err != nil {
+		t.Fatalf("fresh Apply(baseline): %v", err)
+	}
+	if err := fresh.ApplyDelta(ctx, delta); err != nil {
+		t.Fatalf("ApplyDelta onto the unmoved parent after a refusal elsewhere: %v", err)
+	}
+	if got, err := fresh.ReadFile(ctx, "shared.txt"); err != nil || string(got) != "child version\n" {
+		t.Errorf("fresh shared.txt = %q, %v; want the child's content", got, err)
+	}
+}

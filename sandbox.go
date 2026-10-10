@@ -138,6 +138,15 @@ const (
 	// StateKeyGitHead is the in-container git HEAD at capture time, when the
 	// workspace is a git repository. Diff needs it as a baseline.
 	StateKeyGitHead = "git_head"
+	// StateKeyDeltaBase is the git HEAD the sandbox last applied (the fork
+	// baseline for an isolated child), recorded so the captured state carries
+	// its own delta base. ApplyDelta needs it as the merge base.
+	StateKeyDeltaBase = "delta_base"
+	// StateKeyDeltaPatch is the base64 (StdEncoding) git binary patch from
+	// StateKeyDeltaBase to the captured working tree, present only when that
+	// range has changes. An absent key with a present StateKeyDeltaBase is a
+	// clean capture: nothing to merge.
+	StateKeyDeltaPatch = "delta_patch"
 )
 
 // ErrNotImplemented is returned when the containerd surface could not be
@@ -293,6 +302,12 @@ type ContainerdSandbox struct {
 	// parent key — not teardown: committed layers are states, outlive the
 	// sandbox, and are never removed by Destroy or Apply.
 	committedChain []string
+	// baseGitHead is the git HEAD recorded in the state this sandbox last
+	// applied — the fork baseline for an isolated child. Captures diff against
+	// it (deltaPatchScript) so the states they hand out can settle through
+	// ApplyDelta. Empty when no applied state carried a git HEAD, which means
+	// captures carry no delta payload and their settlement verb is Select only.
+	baseGitHead string
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
 }
@@ -577,6 +592,25 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 	// error: a non-git workspace simply cannot be diffed semantically.
 	if head, err := s.gitHead(ctx, id); err == nil && head != "" {
 		state.Data[StateKeyGitHead] = head
+		// Carry the delta payload so settlement's apply verb can merge this
+		// state onto a workspace that has moved since the base. Only when a
+		// base was recorded by Apply: a sandbox that never applied a git state
+		// has no base to diff against, and its states settle Select-only.
+		//
+		// Unlike the git HEAD, failure here fails the Capture. A sealed output
+		// whose state cannot settle-apply surfaces the gap only after a merge
+		// was approved, which is too late to fix; refusing at capture keeps
+		// the gap at sealing time, where the caller still holds the scope.
+		if base := s.baseGitHeadLocked(); base != "" {
+			res, err := s.shell(ctx, deltaPatchScript, base)
+			if err != nil {
+				return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture delta against base %s: %w", base, err)
+			}
+			state.Data[StateKeyDeltaBase] = base
+			if patch := res.Stdout; strings.TrimSpace(patch) != "" {
+				state.Data[StateKeyDeltaPatch] = base64.StdEncoding.EncodeToString([]byte(patch))
+			}
+		}
 	}
 	return state, nil
 }
@@ -679,6 +713,13 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 	s.id = id
 	s.activeKey = next
 	s.committedChain = kept
+	// The applied state's git HEAD becomes this sandbox's delta base: captures
+	// from here on diff against it, so the states they produce can settle
+	// through ApplyDelta. A state without one (a non-git workspace) leaves any
+	// previous base alone — applying it cannot have introduced a git baseline.
+	if head, _ := ws.Data[StateKeyGitHead].(string); head != "" {
+		s.baseGitHead = head
+	}
 	s.mu.Unlock()
 
 	// Best effort: the abandoned active layer is this sandbox's private
@@ -717,6 +758,69 @@ func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws shepherd.Worksp
 	}
 	return s.unpinState(ctx, key)
 }
+
+// ApplyDelta implements shepherd.DeltaApplier: it merges the changes captured
+// in delta onto the current workspace without resetting it, so a parent that
+// moved since the fork still lands the child's work. Settlement's apply verb
+// (settlement.go, SettleApply) calls this after the overlap guard has refused
+// same-path parent changes.
+//
+// The delta payload was recorded at Capture: a git binary patch from the
+// delta's own base (the git HEAD of the state the capturing sandbox last
+// applied) to its working tree. The merge itself runs at the tree level in the
+// object database (applyDeltaScript), so a conflicting delta refuses with the
+// working tree untouched — the DeltaApplier contract — and a clean one lands
+// as unstaged working tree changes, leaving the caller's staging state alone.
+//
+// A delta with no changes is a no-op. A state captured without a base (a
+// sandbox that never applied a git state) cannot be merged and returns
+// ErrUnsupported rather than pretending: its scope settles Select-only.
+func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, delta shepherd.WorkspaceState) error {
+	if delta.Backend != BackendName {
+		return fmt.Errorf("containerd sandbox: cannot apply delta from backend %q", delta.Backend)
+	}
+	base, _ := delta.Data[StateKeyDeltaBase].(string)
+	patchB64, _ := delta.Data[StateKeyDeltaPatch].(string)
+	if base == "" {
+		return fmt.Errorf("containerd sandbox: delta was captured without a recorded git base, so its changes cannot be merged onto a moved workspace: %w", shepherd.ErrUnsupported)
+	}
+	if patchB64 == "" {
+		return nil // clean capture: nothing to merge
+	}
+	patch, err := base64.StdEncoding.DecodeString(patchB64)
+	if err != nil {
+		return fmt.Errorf("containerd sandbox: delta patch is not valid base64: %w", err)
+	}
+	if err := s.requireBackend(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	id := s.id
+	s.mu.Unlock()
+	if id == "" {
+		return fmt.Errorf("containerd sandbox: ApplyDelta before Create")
+	}
+
+	// The patch travels through a temp file rather than an argument: delta
+	// payloads are argument-sized only for small workspaces, and WriteFile's
+	// chunked exec already handles arbitrary sizes.
+	patchPath := "/tmp/shepherd-delta-" + newSandboxID() + ".patch"
+	if err := s.WriteFile(ctx, patchPath, patch, 0o600); err != nil {
+		return fmt.Errorf("containerd sandbox: stage delta patch: %w", err)
+	}
+	defer func() {
+		_, _ = s.shell(ctx, "rm -f -- \"$1\"", patchPath)
+	}()
+
+	if _, err := s.execShell(ctx, nil, applyDeltaScript, patchPath, base); err != nil {
+		// execShell flattens the exit code into the error text; exit 3 is the
+		// script's conflict sentinel and names the paths in stderr.
+		return fmt.Errorf("containerd sandbox: apply delta: %w", err)
+	}
+	return nil
+}
+
+var _ shepherd.DeltaApplier = (*ContainerdSandbox)(nil)
 
 // splitChain partitions a committed-layer chain at key: layers up to and
 // including key are retained (they remain ancestors of a layer prepared from
@@ -771,6 +875,92 @@ git add -A
 git diff --cached --name-only "$head"
 printf '\n` + diffNamesMarker + `\n'
 git diff --cached "$head"`
+
+// deltaPatchScript emits the git binary patch from $1 (the recorded delta base)
+// to the current working tree, untracked files included. Capture stores it in
+// StateKeyDeltaPatch so ApplyDelta can merge the state onto a workspace that has
+// moved since the base.
+//
+// The staging mirrors diffScript — scratch GIT_INDEX_FILE seeded from the real
+// index when one exists — for the same non-mutation and stat-cache reasons.
+// `--binary` carries binary file changes, which a plain text diff would mark
+// "Binary files differ" and drop.
+var deltaPatchScript = `set -e
+head=$1
+dir=$(mktemp -d)
+trap 'rm -rf -- "$dir"' EXIT
+export GIT_INDEX_FILE="$dir/index"
+if [ -f .git/index ]; then
+  cp -- .git/index "$GIT_INDEX_FILE"
+elif git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+  git read-tree HEAD
+fi
+git add -A
+git diff --binary --cached "$head"`
+
+// applyDeltaScript merges the delta ($1 = patch file, $2 = its recorded base)
+// onto the current workspace without ever touching it on conflict.
+//
+// The merge runs at the tree level, purely in the object database:
+//
+//	theirs = the delta's content, reconstructed by applying the patch to the
+//	         recorded base (the patch's preimages are the base's blobs)
+//	ours   = the working tree as it stands, untracked included
+//	base   = the recorded base's tree
+//
+// git merge-tree --write-tree merges the three and exits nonzero on conflict,
+// having written nothing anywhere near the working tree — the refusal is
+// atomic by construction. On success the merged tree exists, and the merge is
+// materialized as a patch whose preimage is ours, i.e. exactly the working
+// tree: `git apply` (no --index, no --3way) then lands it as unstaged working
+// tree changes and cannot conflict, because the conflict was already answered.
+//
+// Exit 3 is the conflict sentinel so the caller can tell a refused merge (the
+// workspace untouched, the delta unconsumed) from an operational failure.
+// merge-tree prints the conflicted paths on stdout when it conflicts; the
+// script forwards them to stderr for the error message.
+//
+// Seeding the ours index from the real one (cp .git/index) keeps git's stat
+// cache so `git add -A` only rehashes what changed; add -A then overwrites
+// every entry from the working tree, which is what makes ours the working tree
+// rather than the index. The staged-vs-unstaged distinction is deliberately
+// flattened: the merge is content-level, and materialization through plain
+// `git apply` leaves the caller's staging state alone.
+var applyDeltaScript = `set -e
+patch=$1
+base=$2
+dir=$(mktemp -d)
+trap 'rm -rf -- "$dir"' EXIT
+export GIT_INDEX_FILE="$dir/theirs"
+git read-tree "$base"
+git apply --cached "$patch"
+theirs=$(git write-tree)
+export GIT_INDEX_FILE="$dir/ours"
+if [ -f .git/index ]; then
+  cp -- .git/index "$GIT_INDEX_FILE"
+else
+  git read-tree HEAD
+fi
+git add -A
+ours=$(git write-tree)
+unset GIT_INDEX_FILE
+basetree=$(git rev-parse "$base^{tree}")
+set +e
+merged=$(git merge-tree --write-tree --merge-base="$basetree" "$ours" "$theirs" 2>"$dir/mt.err")
+code=$?
+set -e
+if [ "$code" -eq 1 ]; then
+  printf 'conflicting paths:\n%s\n' "$merged" >&2
+  exit 3
+fi
+if [ "$code" -ne 0 ]; then
+  cat "$dir/mt.err" >&2
+  exit 1
+fi
+git diff --binary "$ours" "$merged" > "$dir/merge.patch"
+if [ -s "$dir/merge.patch" ]; then
+  git apply "$dir/merge.patch"
+fi`
 
 // Diff returns the unified diff and changed file paths between ws and the
 // current workspace, using the in-container git repository.
@@ -955,6 +1145,9 @@ func (s *ContainerdSandbox) parentKeyLocked() string {
 	}
 	return s.rootfsKey
 }
+
+// baseGitHeadLocked returns the recorded delta base. Caller holds s.mu.
+func (s *ContainerdSandbox) baseGitHeadLocked() string { return s.baseGitHead }
 
 // restart starts a task on an existing snapshot, used to recover when a capture
 // fails midway with the task already stopped.

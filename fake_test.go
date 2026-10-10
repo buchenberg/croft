@@ -249,6 +249,14 @@ type fakeTasks struct {
 	// diffStdout, when set, overrides the canned response for the diff script so
 	// a test can exercise malformed staging output.
 	diffStdout string
+	// deltaPatchStdout, when set, overrides the canned response for the delta
+	// patch script; the canned default is a one-line patch. Set to "\n" to
+	// model a clean capture (no changes against the base).
+	deltaPatchStdout string
+	// mergeConflict, when set, makes the apply-delta script fail with the
+	// conflict sentinel (exit 3) and conflicted paths on stderr, so a test can
+	// exercise the refused-merge path.
+	mergeConflict bool
 }
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
@@ -331,6 +339,18 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 			// the fake answers in the same shape: names, the marker, then the diff.
 			return shepherd.ExecResult{ExitCode: 0,
 				Stdout: "f\n\n" + diffNamesMarker + "\ndiff --git a/f b/f\n+change\n"}, nil
+		}
+		if strings.Contains(script, "git diff --binary --cached") {
+			if f.deltaPatchStdout != "" {
+				return shepherd.ExecResult{ExitCode: 0, Stdout: f.deltaPatchStdout}, nil
+			}
+			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+child\n"}, nil
+		}
+		if strings.Contains(script, "git merge-tree") {
+			if f.mergeConflict {
+				return shepherd.ExecResult{ExitCode: 3, Stderr: "conflicting paths:\nf.txt"}, nil
+			}
+			return shepherd.ExecResult{ExitCode: 0}, nil
 		}
 		return shepherd.ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
 	default:
