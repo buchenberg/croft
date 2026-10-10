@@ -307,6 +307,8 @@ type ContainerdSandbox struct {
 	// it (deltaPatchScript) so the states they hand out can settle through
 	// ApplyDelta. Empty when no applied state carried a git HEAD, which means
 	// captures carry no delta payload and their settlement verb is Select only.
+	// Create resets it and Apply reassigns it, so it never outlives the
+	// workspace it describes.
 	baseGitHead string
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
@@ -466,6 +468,11 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 	s.rootfsKey = rootfsKey
 	s.activeKey = active
 	s.committedChain = nil
+	// A fresh generation has no delta base: the previous one's git HEAD is a
+	// commit in a repository this workspace may not even contain, and a
+	// capture diffing against it would emit a state whose delta_base is
+	// unresolvable at ApplyDelta time.
+	s.baseGitHead = ""
 	s.seq = 0
 	s.mu.Unlock()
 
@@ -539,6 +546,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 
 	s.mu.Lock()
 	id, active, parent := s.id, s.activeKey, s.parentKeyLocked()
+	base := s.baseGitHeadLocked()
 	// active empty with an id set is the cleanly-stopped state advance leaves
 	// behind when a successor could not be started: there is no running layer
 	// to commit, so this is the same "not created (anymore)" case.
@@ -588,28 +596,38 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 	}
 
 	state := snapshotState(s.cfg.Image, committed, parent)
-	// Record the in-container git HEAD so Diff has a baseline. Absence is not an
-	// error: a non-git workspace simply cannot be diffed semantically.
-	if head, err := s.gitHead(ctx, id); err == nil && head != "" {
-		state.Data[StateKeyGitHead] = head
-		// Carry the delta payload so settlement's apply verb can merge this
-		// state onto a workspace that has moved since the base. Only when a
-		// base was recorded by Apply: a sandbox that never applied a git state
-		// has no base to diff against, and its states settle Select-only.
-		//
-		// Unlike the git HEAD, failure here fails the Capture. A sealed output
-		// whose state cannot settle-apply surfaces the gap only after a merge
-		// was approved, which is too late to fix; refusing at capture keeps
-		// the gap at sealing time, where the caller still holds the scope.
-		if base := s.baseGitHeadLocked(); base != "" {
-			res, err := s.shell(ctx, deltaPatchScript, base)
-			if err != nil {
-				return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture delta against base %s: %w", base, err)
-			}
-			state.Data[StateKeyDeltaBase] = base
-			if patch := res.Stdout; strings.TrimSpace(patch) != "" {
-				state.Data[StateKeyDeltaPatch] = base64.StdEncoding.EncodeToString([]byte(patch))
-			}
+	// Record the in-container git HEAD so Diff has a baseline. Without a
+	// recorded delta base, absence is not an error: a non-git workspace simply
+	// cannot be diffed semantically.
+	//
+	// With a base, absence is an error. Apply recorded a git HEAD, so the
+	// workspace was a repository at that point; a HEAD that cannot be read now
+	// means something is wrong that a delta cannot be built on, and the
+	// delta-generation failure below exists for the same reason: a sealed
+	// output whose state cannot settle-apply surfaces the gap only after a
+	// merge was approved, which is too late to fix. Refusing at capture keeps
+	// the gap at sealing time, where the caller still holds the scope. Both
+	// refusals drop the state pin first: the caller is handed no state, so
+	// nothing else can ever call ReleaseState, and the pin would hold the
+	// layer on disk until namespace teardown.
+	head, headErr := s.gitHead(ctx, id)
+	if headErr != nil || head == "" {
+		if base == "" {
+			return state, nil
+		}
+		_ = s.unpinState(context.WithoutCancel(ctx), committed)
+		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture: read git HEAD for delta base %s: %v", base, headErr)
+	}
+	state.Data[StateKeyGitHead] = head
+	if base != "" {
+		res, err := s.shell(ctx, deltaPatchScript, base)
+		if err != nil {
+			_ = s.unpinState(context.WithoutCancel(ctx), committed)
+			return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture delta against base %s: %w", base, err)
+		}
+		state.Data[StateKeyDeltaBase] = base
+		if patch := res.Stdout; strings.TrimSpace(patch) != "" {
+			state.Data[StateKeyDeltaPatch] = base64.StdEncoding.EncodeToString([]byte(patch))
 		}
 	}
 	return state, nil
@@ -715,11 +733,10 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 	s.committedChain = kept
 	// The applied state's git HEAD becomes this sandbox's delta base: captures
 	// from here on diff against it, so the states they produce can settle
-	// through ApplyDelta. A state without one (a non-git workspace) leaves any
-	// previous base alone — applying it cannot have introduced a git baseline.
-	if head, _ := ws.Data[StateKeyGitHead].(string); head != "" {
-		s.baseGitHead = head
-	}
+	// through ApplyDelta. A state without one (a non-git workspace) clears the
+	// base: Apply rebinds the sandbox to that state's workspace, so any earlier
+	// base is a commit in a repository this workspace may not contain.
+	s.baseGitHead, _ = ws.Data[StateKeyGitHead].(string)
 	s.mu.Unlock()
 
 	// Best effort: the abandoned active layer is this sandbox's private
@@ -805,12 +822,17 @@ func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, delta shepherd.Works
 	// payloads are argument-sized only for small workspaces, and WriteFile's
 	// chunked exec already handles arbitrary sizes.
 	patchPath := "/tmp/shepherd-delta-" + newSandboxID() + ".patch"
+	// The removal is registered before the write and runs cancel-free: a
+	// chunked WriteFile can fail partway, and a merge failure or a context
+	// expiry mid-apply leaves the caller's context done — an rm on that
+	// context would never run, so every failure would leave another
+	// source-bearing patch file in the container.
+	defer func() {
+		_, _ = s.shell(context.WithoutCancel(ctx), "rm -f -- \"$1\"", patchPath)
+	}()
 	if err := s.WriteFile(ctx, patchPath, patch, 0o600); err != nil {
 		return fmt.Errorf("containerd sandbox: stage delta patch: %w", err)
 	}
-	defer func() {
-		_, _ = s.shell(ctx, "rm -f -- \"$1\"", patchPath)
-	}()
 
 	if _, err := s.execShell(ctx, nil, applyDeltaScript, patchPath, base); err != nil {
 		// execShell flattens the exit code into the error text; exit 3 is the

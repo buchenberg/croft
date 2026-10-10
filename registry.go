@@ -18,9 +18,12 @@ import (
 // registry; before that, hosts had to register a factory themselves because the
 // adapter could not see RegisterSandbox.
 //
-// Registering a second factory for the same name panics, so a host that also
-// calls shepherd.RegisterSandbox(BackendName, ...) must not: import this
-// package and the registration is done.
+// Migration note: registering a second factory for the same name panics, so a
+// host upgrading from the old wiring — shepherd.RegisterSandbox("containerd",
+// …) at startup — must REMOVE that call when it starts importing this package,
+// or the process dies during init, before main runs. The panic is the
+// database/sql-driver convention and is deliberate: a silent winner between
+// two registrations would make backend selection depend on import order.
 func init() {
 	shepherd.RegisterSandbox(BackendName, func(cfg any) (shepherd.Sandbox, error) {
 		c, ok := cfg.(Config)

@@ -257,6 +257,11 @@ type fakeTasks struct {
 	// conflict sentinel (exit 3) and conflicted paths on stderr, so a test can
 	// exercise the refused-merge path.
 	mergeConflict bool
+
+	// mu guards the mutable state above. The production sandbox is documented
+	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
+	// from two goroutines, so the fake must honor the same contract.
+	mu sync.Mutex
 }
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
@@ -264,6 +269,8 @@ func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
 }
 
 func (f *fakeTasks) StartTask(_ context.Context, id, snapshotKey string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.current != "" {
 		return fmt.Errorf("start %s: task already running on %s", id, f.current)
 	}
@@ -277,6 +284,8 @@ func (f *fakeTasks) StartTask(_ context.Context, id, snapshotKey string) error {
 }
 
 func (f *fakeTasks) StopTask(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.current == "" {
 		return nil // idempotent
 	}
@@ -292,32 +301,47 @@ func (f *fakeTasks) Running(_ context.Context, id string) (bool, error) {
 
 // isRunning reports whether a task is currently rooted anywhere. Test
 // convenience, avoiding a context and error in every assertion.
-func (f *fakeTasks) isRunning() bool { return f.current != "" }
+func (f *fakeTasks) isRunning() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.current != ""
+}
 
 func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest) (shepherd.ExecResult, error) {
+	f.mu.Lock()
 	if f.current == "" {
+		f.mu.Unlock()
 		return shepherd.ExecResult{}, fmt.Errorf("exec: no running task for %s", id)
 	}
 	// A command writes into the layer the task is rooted at. If Capture committed
 	// that layer without stopping the task, this fails.
 	if err := f.snap.write(f.current); err != nil {
+		f.mu.Unlock()
 		return shepherd.ExecResult{}, err
 	}
 	f.lastReq = req
 	f.lastStdin = req.Stdin
 	f.allReqs = append(f.allReqs, req)
+	current := f.current
+	gitHead := f.gitHead
+	diffStdout := f.diffStdout
+	deltaPatchStdout := f.deltaPatchStdout
+	mergeConflict := f.mergeConflict
+	runErr, hasRunErr := f.runErr[req.Command]
+	f.mu.Unlock()
 
-	if err, ok := f.runErr[req.Command]; ok {
-		return shepherd.ExecResult{ExitCode: 1, Stderr: err.Error()}, nil
+	if hasRunErr {
+		return shepherd.ExecResult{ExitCode: 1, Stderr: runErr.Error()}, nil
 	}
+	_ = current
 
 	switch req.Command {
 	case "git":
 		if len(req.Args) >= 1 && req.Args[0] == "rev-parse" {
-			if f.gitHead == "" {
+			if gitHead == "" {
 				return shepherd.ExecResult{ExitCode: 128, Stderr: "fatal: not a git repository"}, nil
 			}
-			return shepherd.ExecResult{ExitCode: 0, Stdout: f.gitHead + "\n"}, nil
+			return shepherd.ExecResult{ExitCode: 0, Stdout: gitHead + "\n"}, nil
 		}
 		if len(req.Args) >= 1 && req.Args[0] == "diff" {
 			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+change\n"}, nil
@@ -332,8 +356,8 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 			script = req.Args[1]
 		}
 		if strings.Contains(script, "git diff --cached") {
-			if f.diffStdout != "" {
-				return shepherd.ExecResult{ExitCode: 0, Stdout: f.diffStdout}, nil
+			if diffStdout != "" {
+				return shepherd.ExecResult{ExitCode: 0, Stdout: diffStdout}, nil
 			}
 			// Diff stages once and gets both sections back from that one exec, so
 			// the fake answers in the same shape: names, the marker, then the diff.
@@ -341,13 +365,13 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 				Stdout: "f\n\n" + diffNamesMarker + "\ndiff --git a/f b/f\n+change\n"}, nil
 		}
 		if strings.Contains(script, "git diff --binary --cached") {
-			if f.deltaPatchStdout != "" {
-				return shepherd.ExecResult{ExitCode: 0, Stdout: f.deltaPatchStdout}, nil
+			if deltaPatchStdout != "" {
+				return shepherd.ExecResult{ExitCode: 0, Stdout: deltaPatchStdout}, nil
 			}
 			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+child\n"}, nil
 		}
 		if strings.Contains(script, "git merge-tree") {
-			if f.mergeConflict {
+			if mergeConflict {
 				return shepherd.ExecResult{ExitCode: 3, Stderr: "conflicting paths:\nf.txt"}, nil
 			}
 			return shepherd.ExecResult{ExitCode: 0}, nil
