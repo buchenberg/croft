@@ -30,13 +30,16 @@ import (
 	"encoding/base64"
 	"testing"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	materialize "github.com/buchenberg/shepherd-kernel-go/materialize"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
+	substrate "github.com/buchenberg/shepherd-kernel-go/substrate"
+	trace "github.com/buchenberg/shepherd-kernel-go/trace"
 )
 
 // liveAppendContext is the trusted append context the trace side of the
 // test uses, in the shape of core's TrustedAppendContext but with a
 // test-local actor so trace provenance names this suite.
-var liveAppendContext = shepherd.AppendContext{
+var liveAppendContext = trace.AppendContext{
 	ActorRef:             "runtime:containerd-live",
 	PresentedWitnessRefs: []string{"trusted:internal"},
 	SchemaVersionSet:     "shepherd2-slice-a",
@@ -60,29 +63,29 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	// live test does this before touching the workspace — Exec and file IO
 	// both route through the container and fail with "sandbox not created"
 	// otherwise.
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
-	store, err := shepherd.NewSQLiteTraceStore(":memory:")
+	store, err := trace.NewSQLiteTraceStore(":memory:")
 	if err != nil {
 		t.Fatalf("NewSQLiteTraceStore: %v", err)
 	}
 	defer store.Close(context.Background())
 
 	content := "written through the trace"
-	declaration, err := store.Append(context.Background(), liveAppendContext, shepherd.AppendBatch{
+	declaration, err := store.Append(context.Background(), liveAppendContext, trace.AppendBatch{
 		AppendIntentID: "live:substrate:declare",
-		Groups: []shepherd.AppendGroup{{
+		Groups: []trace.AppendGroup{{
 			TraceOwnerID: "owner:live-substrate",
-			RetainedContext: &shepherd.RetainedContext{
-				SubstrateRef: shepherd.WorkspaceSubstrateRef,
+			RetainedContext: &trace.RetainedContext{
+				SubstrateRef: substrate.WorkspaceSubstrateRef,
 				Containment:  sb.Capabilities().Containment,
 			},
-			FactDrafts: []shepherd.RecordDraft{{
-				Mode:      shepherd.Declaration,
-				SchemaRef: shepherd.SchemaWorkspaceFileWrite,
+			FactDrafts: []trace.RecordDraft{{
+				Mode:      trace.Declaration,
+				SchemaRef: substrate.SchemaWorkspaceFileWrite,
 				KindLabel: "workspace_file_write",
 				Payload: map[string]any{
 					"path":        "notes/greeting.txt",
@@ -95,20 +98,20 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 		t.Fatalf("append declaration: %v", err)
 	}
 
-	registry := shepherd.NewSubstrateRegistry()
-	if err := registry.Register(shepherd.NewWorkspaceSubstrate(sb)); err != nil {
+	registry := substrate.NewSubstrateRegistry()
+	if err := registry.Register(substrate.NewWorkspaceSubstrate(sb)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	receipt, err := shepherd.Materialize(ctx, store, liveAppendContext.ToOperationContext(shepherd.OpMaterialize), shepherd.MaterializationRequest{
+	receipt, err := materialize.Materialize(ctx, store, liveAppendContext.ToOperationContext(trace.OpMaterialize), materialize.MaterializationRequest{
 		AppendIntentID:            "live:substrate:apply",
 		TargetTraceOwnerID:        "owner:live-substrate",
 		TargetRecordIDs:           declaration.FactIDs,
-		TargetThroughOwnerOrdinal: shepherd.MaxOwnerOrdinal,
+		TargetThroughOwnerOrdinal: materialize.MaxOwnerOrdinal,
 	}, registry)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
-	if receipt.Outcome != shepherd.MaterializationSuccess {
+	if receipt.Outcome != trace.MaterializationSuccess {
 		t.Fatalf("outcome = %q, want success (reason: %s)", receipt.Outcome, receipt.FailureReason)
 	}
 	if len(receipt.ProducedRecordIDs) != 1 {
@@ -148,13 +151,13 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	// The applied capture cites its declaration, so the trace stays
 	// interpretable: the write in the workspace is causally linked to the
 	// recorded intent.
-	capture, err := store.ReadFact(context.Background(), shepherd.ReadContext{ActorRef: "live:test", VisibilityProfile: shepherd.VisibilityPayload}, receipt.ProducedRecordIDs[0])
+	capture, err := store.ReadFact(context.Background(), trace.ReadContext{ActorRef: "live:test", VisibilityProfile: trace.VisibilityPayload}, receipt.ProducedRecordIDs[0])
 	if err != nil {
 		t.Fatalf("read capture: %v", err)
 	}
 	env := capture.GetEnvelope()
-	if env.SchemaRef != shepherd.SchemaWorkspaceFileWriteApplied || env.Mode != shepherd.Capture {
-		t.Errorf("capture = %q/%q, want %q/capture", env.SchemaRef, env.Mode, shepherd.SchemaWorkspaceFileWriteApplied)
+	if env.SchemaRef != substrate.SchemaWorkspaceFileWriteApplied || env.Mode != trace.Capture {
+		t.Errorf("capture = %q/%q, want %q/capture", env.SchemaRef, env.Mode, substrate.SchemaWorkspaceFileWriteApplied)
 	}
 	if len(env.CausedByIDs) != 1 || env.CausedByIDs[0] != declaration.FactIDs[0] {
 		t.Errorf("capture caused_by = %v, want %v", env.CausedByIDs, declaration.FactIDs)
@@ -170,28 +173,28 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
-	store, err := shepherd.NewSQLiteTraceStore(":memory:")
+	store, err := trace.NewSQLiteTraceStore(":memory:")
 	if err != nil {
 		t.Fatalf("NewSQLiteTraceStore: %v", err)
 	}
 	defer store.Close(context.Background())
 
-	declaration, err := store.Append(context.Background(), liveAppendContext, shepherd.AppendBatch{
+	declaration, err := store.Append(context.Background(), liveAppendContext, trace.AppendBatch{
 		AppendIntentID: "live:substrate:exec-declare",
-		Groups: []shepherd.AppendGroup{{
+		Groups: []trace.AppendGroup{{
 			TraceOwnerID: "owner:live-substrate-exec",
-			RetainedContext: &shepherd.RetainedContext{
-				SubstrateRef: shepherd.WorkspaceSubstrateRef,
+			RetainedContext: &trace.RetainedContext{
+				SubstrateRef: substrate.WorkspaceSubstrateRef,
 				Containment:  sb.Capabilities().Containment,
 			},
-			FactDrafts: []shepherd.RecordDraft{{
-				Mode:      shepherd.Declaration,
-				SchemaRef: shepherd.SchemaWorkspaceExec,
+			FactDrafts: []trace.RecordDraft{{
+				Mode:      trace.Declaration,
+				SchemaRef: substrate.SchemaWorkspaceExec,
 				KindLabel: "workspace_exec",
 				Payload: map[string]any{
 					"command": "sh",
@@ -205,20 +208,20 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 		t.Fatalf("append declaration: %v", err)
 	}
 
-	registry := shepherd.NewSubstrateRegistry()
-	if err := registry.Register(shepherd.NewWorkspaceSubstrate(sb)); err != nil {
+	registry := substrate.NewSubstrateRegistry()
+	if err := registry.Register(substrate.NewWorkspaceSubstrate(sb)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	receipt, err := shepherd.Materialize(ctx, store, liveAppendContext.ToOperationContext(shepherd.OpMaterialize), shepherd.MaterializationRequest{
+	receipt, err := materialize.Materialize(ctx, store, liveAppendContext.ToOperationContext(trace.OpMaterialize), materialize.MaterializationRequest{
 		AppendIntentID:            "live:substrate:exec-apply",
 		TargetTraceOwnerID:        "owner:live-substrate-exec",
 		TargetRecordIDs:           declaration.FactIDs,
-		TargetThroughOwnerOrdinal: shepherd.MaxOwnerOrdinal,
+		TargetThroughOwnerOrdinal: materialize.MaxOwnerOrdinal,
 	}, registry)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
-	if receipt.Outcome != shepherd.MaterializationSuccess {
+	if receipt.Outcome != trace.MaterializationSuccess {
 		t.Fatalf("outcome = %q, want success (reason: %s)", receipt.Outcome, receipt.FailureReason)
 	}
 

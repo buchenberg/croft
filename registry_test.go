@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
 )
 
 // TestRegistry_BackendIsRegistered pins the OpenSandbox registration this
@@ -13,16 +13,16 @@ import (
 // explicit lifecycle step.
 func TestRegistry_BackendIsRegistered(t *testing.T) {
 	found := false
-	for _, name := range shepherd.SandboxBackends() {
+	for _, name := range sbx.SandboxBackends() {
 		if name == BackendName {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("SandboxBackends() = %v, want %q registered by this package's init", shepherd.SandboxBackends(), BackendName)
+		t.Fatalf("SandboxBackends() = %v, want %q registered by this package's init", sbx.SandboxBackends(), BackendName)
 	}
 
-	sb, err := shepherd.OpenSandbox(BackendName, Config{Image: "example/dev:latest"})
+	sb, err := sbx.OpenSandbox(BackendName, Config{Image: "example/dev:latest"})
 	if err != nil {
 		t.Fatalf("OpenSandbox: %v", err)
 	}
@@ -39,12 +39,12 @@ func TestRegistry_BackendIsRegistered(t *testing.T) {
 // mismatched configuration is a startup error naming what was received, never a
 // silent default backend.
 func TestRegistry_RejectsWrongConfiguration(t *testing.T) {
-	_, err := shepherd.OpenSandbox(BackendName, nil)
+	_, err := sbx.OpenSandbox(BackendName, nil)
 	if err == nil || !strings.Contains(err.Error(), "nil is not one") {
 		t.Errorf("OpenSandbox(nil) = %v, want an explicit refusal", err)
 	}
 
-	_, err = shepherd.OpenSandbox(BackendName, "containerd, but as a string")
+	_, err = sbx.OpenSandbox(BackendName, "containerd, but as a string")
 	if err == nil || !strings.Contains(err.Error(), "string") {
 		t.Errorf("OpenSandbox(string) = %v, want the offending type named", err)
 	}

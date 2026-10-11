@@ -61,7 +61,8 @@ import (
 	"testing"
 	"time"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
+	trace "github.com/buchenberg/shepherd-kernel-go/trace"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -264,7 +265,7 @@ func newLiveSandbox(t *testing.T, ctx context.Context, cfg liveConfig) *Containe
 func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, command string, args ...string) string {
 	t.Helper()
 	start := time.Now()
-	res, err := sb.Exec(ctx, shepherd.ExecRequest{Command: command, Args: args, Cwd: cwd})
+	res, err := sb.Exec(ctx, sbx.ExecRequest{Command: command, Args: args, Cwd: cwd})
 	// Per-command duration is what separates "this one command hangs" from
 	// "every exec is slow", which are indistinguishable in a single total.
 	t.Logf("exec %s %s: %s (exit %d)", command, strings.Join(args, " "),
@@ -285,7 +286,7 @@ func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, com
 // snapshot behind. States captured *inside* Materialize (the substrate's own
 // captures) have no test-side handle and intentionally keep their pins —
 // releasing them is the kernel's state-expiry business, not the test's.
-func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) shepherd.WorkspaceState {
+func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) trace.WorkspaceState {
 	t.Helper()
 	state, err := sb.Capture(ctx)
 	if err != nil {
@@ -336,7 +337,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	sb := newLiveSandbox(t, ctx, cfg)
 
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
@@ -407,7 +408,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 	}
 
 	// Exec: exit code, stream separation, and Duration.
-	res, err := sb.Exec(ctx, shepherd.ExecRequest{
+	res, err := sb.Exec(ctx, sbx.ExecRequest{
 		Command: "sh",
 		Args:    []string{"-c", "echo to-stdout; echo to-stderr >&2"},
 		Cwd:     cfg.Workdir,
@@ -438,7 +439,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	// A non-zero exit is a result, not an error: Exec returns the code with a
 	// nil error, matching the interface contract callers branch on.
-	failed, err := sb.Exec(ctx, shepherd.ExecRequest{
+	failed, err := sb.Exec(ctx, sbx.ExecRequest{
 		Command: "sh",
 		Args:    []string{"-c", "exit 7"},
 		Cwd:     cfg.Workdir,
@@ -494,7 +495,7 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -551,7 +552,7 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
@@ -665,7 +666,7 @@ func TestLive_DiffPreservesPreStagedChanges(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
@@ -729,12 +730,12 @@ func TestLive_ExecRejectsStdin(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	start := time.Now()
-	_, err := sb.Exec(ctx, shepherd.ExecRequest{
+	_, err := sb.Exec(ctx, sbx.ExecRequest{
 		Command: "cat",
 		Cwd:     cfg.Workdir,
 		Stdin:   []byte("never sees EOF\n"),
@@ -776,7 +777,7 @@ func TestLive_LeaseHoldsSnapshots(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -829,7 +830,7 @@ func TestLive_DestroyReleasesTheLease(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -882,7 +883,7 @@ func TestLive_ApplyDeltaMergesOntoMovedParent(t *testing.T) {
 	defer cancel()
 
 	parent := newLiveSandbox(t, ctx, cfg)
-	if err := parent.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := parent.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, parent, cfg.Workdir)
@@ -965,7 +966,7 @@ func TestLive_ApplyDeltaConflictRefusesUntouched(t *testing.T) {
 	defer cancel()
 
 	parent := newLiveSandbox(t, ctx, cfg)
-	if err := parent.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := parent.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, parent, cfg.Workdir)

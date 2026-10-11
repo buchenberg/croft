@@ -3,11 +3,11 @@ package containerd
 import (
 	"fmt"
 
-	"github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
 )
 
 // OpenSandbox registration: importing this package makes the containerd
-// backend resolvable by name through shepherd.OpenSandbox(BackendName, Config),
+// backend resolvable by name through sbx.OpenSandbox(BackendName, Config),
 // the same database/sql-driver convention the in-core git backend follows
 // (sandbox_git.go). A host that wires its own construction (NewWithBackend over
 // an existing containerd client) does not need this path, but the registry is
@@ -19,13 +19,13 @@ import (
 // adapter could not see RegisterSandbox.
 //
 // Migration note: registering a second factory for the same name panics, so a
-// host upgrading from the old wiring — shepherd.RegisterSandbox("containerd",
+// host upgrading from the old wiring — sbx.RegisterSandbox("containerd",
 // …) at startup — must REMOVE that call when it starts importing this package,
 // or the process dies during init, before main runs. The panic is the
 // database/sql-driver convention and is deliberate: a silent winner between
 // two registrations would make backend selection depend on import order.
 func init() {
-	shepherd.RegisterSandbox(BackendName, func(cfg any) (shepherd.Sandbox, error) {
+	sbx.RegisterSandbox(BackendName, func(cfg any) (sbx.Sandbox, error) {
 		c, ok := cfg.(Config)
 		if !ok {
 			if cfg == nil {

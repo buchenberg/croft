@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -510,11 +510,11 @@ func (t *containerdTasks) Running(ctx context.Context, id string) (bool, error) 
 }
 
 // Exec runs a command in the sandbox's current container generation.
-func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.ExecRequest) (shepherd.ExecResult, error) {
+func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecRequest) (sbx.ExecResult, error) {
 	// Rejected before any RPC: the process would start, block on a stdin that can
 	// never reach EOF, and cost the caller its whole context budget to find out.
 	if len(req.Stdin) > 0 {
-		return shepherd.ExecResult{}, fmt.Errorf("%w: %s would block until the context "+
+		return sbx.ExecResult{}, fmt.Errorf("%w: %s would block until the context "+
 			"expires because the runc-v2 shim keeps a write end on the exec's stdin FIFO; "+
 			"pass data through arguments instead, as WriteFile does",
 			ErrStdinUnsupported, req.Command)
@@ -525,7 +525,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 
 	task, err := t.currentTask(ctx, id)
 	if err != nil {
-		return shepherd.ExecResult{}, err
+		return sbx.ExecResult{}, err
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -554,7 +554,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 	)
 	proc, err := task.Exec(ctx, execID, spec, ioCreator)
 	if err != nil {
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, err)
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, err)
 	}
 
 	// Wait returns a channel that receives exactly one status. Prefer the
@@ -562,7 +562,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 	statusCh, err := proc.Wait(ctx)
 	if err != nil {
 		_, _ = proc.Delete(context.WithoutCancel(ctx))
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: wait for %s: %w", req.Command, err)
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: wait for %s: %w", req.Command, err)
 	}
 
 	// task.Exec only *creates* the process in the shim; Start is what runs it.
@@ -576,7 +576,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 	// which is why Create works while Exec does not.
 	if err := proc.Start(ctx); err != nil {
 		_, _ = proc.Delete(context.WithoutCancel(ctx))
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: start %s: %w", req.Command, err)
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: start %s: %w", req.Command, err)
 	}
 
 	var status containerd.ExitStatus
@@ -585,7 +585,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 	case <-ctx.Done():
 		_ = proc.Kill(context.WithoutCancel(ctx), syscall.SIGKILL)
 		_, _ = proc.Delete(context.WithoutCancel(ctx))
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctx.Err())
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctx.Err())
 	}
 
 	// A cancelled context makes both branches ready at once: process.Wait
@@ -601,17 +601,17 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req shepherd.Exec
 		// Prefer the context's own error: "context deadline exceeded" says more
 		// than the transport-level cancellation wrapped inside the status.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctxErr)
+			return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctxErr)
 		}
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, statusErr)
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, statusErr)
 	}
 
 	// Always release the process, even when the command failed.
 	if _, delErr := proc.Delete(context.WithoutCancel(ctx)); delErr != nil {
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: release exec %s: %w", req.Command, delErr)
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: release exec %s: %w", req.Command, delErr)
 	}
 
-	return shepherd.ExecResult{
+	return sbx.ExecResult{
 		ExitCode: int(status.ExitCode()),
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),

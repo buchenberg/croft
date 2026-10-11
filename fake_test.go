@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
@@ -236,12 +236,12 @@ type fakeTasks struct {
 	snap      *fakeSnapshotter
 	gitHead   string
 	runErr    map[string]error // command -> error
-	lastReq   shepherd.ExecRequest
+	lastReq   sbx.ExecRequest
 	lastStdin []byte
 	// allReqs records every Exec in order, so a multi-exec operation such as a
 	// chunked WriteFile can be asserted on as a sequence rather than only by its
 	// last call.
-	allReqs []shepherd.ExecRequest
+	allReqs []sbx.ExecRequest
 	// current is the layer the running task is rooted at, "" when stopped.
 	current string
 	started int
@@ -307,17 +307,17 @@ func (f *fakeTasks) isRunning() bool {
 	return f.current != ""
 }
 
-func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest) (shepherd.ExecResult, error) {
+func (f *fakeTasks) Exec(_ context.Context, id string, req sbx.ExecRequest) (sbx.ExecResult, error) {
 	f.mu.Lock()
 	if f.current == "" {
 		f.mu.Unlock()
-		return shepherd.ExecResult{}, fmt.Errorf("exec: no running task for %s", id)
+		return sbx.ExecResult{}, fmt.Errorf("exec: no running task for %s", id)
 	}
 	// A command writes into the layer the task is rooted at. If Capture committed
 	// that layer without stopping the task, this fails.
 	if err := f.snap.write(f.current); err != nil {
 		f.mu.Unlock()
-		return shepherd.ExecResult{}, err
+		return sbx.ExecResult{}, err
 	}
 	f.lastReq = req
 	f.lastStdin = req.Stdin
@@ -331,7 +331,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 	f.mu.Unlock()
 
 	if hasRunErr {
-		return shepherd.ExecResult{ExitCode: 1, Stderr: runErr.Error()}, nil
+		return sbx.ExecResult{ExitCode: 1, Stderr: runErr.Error()}, nil
 	}
 	_ = current
 
@@ -339,14 +339,14 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 	case "git":
 		if len(req.Args) >= 1 && req.Args[0] == "rev-parse" {
 			if gitHead == "" {
-				return shepherd.ExecResult{ExitCode: 128, Stderr: "fatal: not a git repository"}, nil
+				return sbx.ExecResult{ExitCode: 128, Stderr: "fatal: not a git repository"}, nil
 			}
-			return shepherd.ExecResult{ExitCode: 0, Stdout: gitHead + "\n"}, nil
+			return sbx.ExecResult{ExitCode: 0, Stdout: gitHead + "\n"}, nil
 		}
 		if len(req.Args) >= 1 && req.Args[0] == "diff" {
-			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+change\n"}, nil
+			return sbx.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+change\n"}, nil
 		}
-		return shepherd.ExecResult{ExitCode: 0}, nil
+		return sbx.ExecResult{ExitCode: 0}, nil
 	case "sh":
 		// Dispatch on the script rather than answering every shell call with one
 		// canned string: Diff's scratch-index script and the ReadFile/WriteFile
@@ -357,28 +357,28 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req shepherd.ExecRequest)
 		}
 		if strings.Contains(script, "git diff --cached") {
 			if diffStdout != "" {
-				return shepherd.ExecResult{ExitCode: 0, Stdout: diffStdout}, nil
+				return sbx.ExecResult{ExitCode: 0, Stdout: diffStdout}, nil
 			}
 			// Diff stages once and gets both sections back from that one exec, so
 			// the fake answers in the same shape: names, the marker, then the diff.
-			return shepherd.ExecResult{ExitCode: 0,
+			return sbx.ExecResult{ExitCode: 0,
 				Stdout: "f\n\n" + diffNamesMarker + "\ndiff --git a/f b/f\n+change\n"}, nil
 		}
 		if strings.Contains(script, "git diff --binary --cached") {
 			if deltaPatchStdout != "" {
-				return shepherd.ExecResult{ExitCode: 0, Stdout: deltaPatchStdout}, nil
+				return sbx.ExecResult{ExitCode: 0, Stdout: deltaPatchStdout}, nil
 			}
-			return shepherd.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+child\n"}, nil
+			return sbx.ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+child\n"}, nil
 		}
 		if strings.Contains(script, "git merge-tree") {
 			if mergeConflict {
-				return shepherd.ExecResult{ExitCode: 3, Stderr: "conflicting paths:\nf.txt"}, nil
+				return sbx.ExecResult{ExitCode: 3, Stderr: "conflicting paths:\nf.txt"}, nil
 			}
-			return shepherd.ExecResult{ExitCode: 0}, nil
+			return sbx.ExecResult{ExitCode: 0}, nil
 		}
-		return shepherd.ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
+		return sbx.ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
 	default:
-		return shepherd.ExecResult{ExitCode: 0}, nil
+		return sbx.ExecResult{ExitCode: 0}, nil
 	}
 }
 

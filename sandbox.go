@@ -93,7 +93,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
+	trace "github.com/buchenberg/shepherd-kernel-go/trace"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
@@ -150,7 +151,7 @@ const (
 )
 
 // ErrNotImplemented is returned when the containerd surface could not be
-// connected. It is deliberately distinct from shepherd.ErrUnsupported:
+// connected. It is deliberately distinct from sbx.ErrUnsupported:
 // Capabilities declares these operations supported, so reporting "unsupported"
 // would be false.
 var ErrNotImplemented = errors.New("containerd sandbox: not implemented")
@@ -229,7 +230,7 @@ type taskService interface {
 	// Running reports whether task id exists and is running.
 	Running(ctx context.Context, id string) (bool, error)
 	// Exec runs a command inside task id.
-	Exec(ctx context.Context, id string, req shepherd.ExecRequest) (shepherd.ExecResult, error)
+	Exec(ctx context.Context, id string, req sbx.ExecRequest) (sbx.ExecResult, error)
 }
 
 // imageService resolves an image reference to the snapshotter key holding its
@@ -314,12 +315,12 @@ type ContainerdSandbox struct {
 	seq uint64
 }
 
-// The compile-time assertion is load-bearing: if shepherd.Sandbox gains or
+// The compile-time assertion is load-bearing: if sbx.Sandbox gains or
 // changes a method, this package stops building until the adapter matches.
-var _ shepherd.Sandbox = (*ContainerdSandbox)(nil)
+var _ sbx.Sandbox = (*ContainerdSandbox)(nil)
 
 // StateReleaser is the optional state-discard surface this backend adds beyond
-// shepherd.Sandbox. The kernel's WorkspaceState has no lifecycle — a state
+// sbx.Sandbox. The kernel's WorkspaceState has no lifecycle — a state
 // outlives the sandbox that captured it — and the lease pin that makes that
 // true holds daemon disk. This is how a caller gives it back deliberately.
 //
@@ -335,7 +336,7 @@ type StateReleaser interface {
 	// ReleaseState drops the pin holding ws's snapshot. The daemon's garbage
 	// collector reclaims the layer once no other snapshot, container, or lease
 	// references it; until then the state stays valid.
-	ReleaseState(ctx context.Context, ws shepherd.WorkspaceState) error
+	ReleaseState(ctx context.Context, ws trace.WorkspaceState) error
 }
 
 var _ StateReleaser = (*ContainerdSandbox)(nil)
@@ -378,8 +379,8 @@ func WithLeases(mgr leases.Manager) BackendOption {
 func (s *ContainerdSandbox) Backend() string { return BackendName }
 
 // Capabilities reports the backend's support matrix.
-func (s *ContainerdSandbox) Capabilities() shepherd.SandboxCapabilities {
-	return shepherd.SandboxCapabilities{
+func (s *ContainerdSandbox) Capabilities() sbx.SandboxCapabilities {
+	return sbx.SandboxCapabilities{
 		Lifecycle: true,
 		Exec:      true,
 		FileIO:    true,
@@ -387,7 +388,7 @@ func (s *ContainerdSandbox) Capabilities() shepherd.SandboxCapabilities {
 		Isolated:  true,
 		// Namespaces plus a separate rootfs, but not a VM boundary: a kernel
 		// exploit escapes it, so this is not ContainFull.
-		Containment: shepherd.ContainContained,
+		Containment: trace.ContainContained,
 	}
 }
 
@@ -400,7 +401,7 @@ func (s *ContainerdSandbox) ID() string {
 }
 
 // Create provisions the base snapshot from Config.Image and starts the task.
-func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpec) error {
+func (s *ContainerdSandbox) Create(ctx context.Context, spec sbx.SandboxSpec) error {
 	if s.cfg.Image == "" {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
 	}
@@ -449,7 +450,7 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec shepherd.SandboxSpe
 	// every later operation fails with a chdir error, which reads as a broken
 	// sandbox rather than a missing directory.
 	wd := s.cfg.workdir()
-	res, err := s.tasks.Exec(ctx, id, shepherd.ExecRequest{
+	res, err := s.tasks.Exec(ctx, id, sbx.ExecRequest{
 		Command: "mkdir",
 		Args:    []string{"-p", wd},
 		Cwd:     "/",
@@ -539,9 +540,9 @@ func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
 //
 // Stopping the task loses in-container process state. That is the price of a
 // coherent snapshot with this API.
-func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceState, error) {
+func (s *ContainerdSandbox) Capture(ctx context.Context) (trace.WorkspaceState, error) {
 	if err := s.requireBackend(ctx); err != nil {
-		return shepherd.WorkspaceState{}, err
+		return trace.WorkspaceState{}, err
 	}
 
 	s.mu.Lock()
@@ -552,7 +553,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 	// to commit, so this is the same "not created (anymore)" case.
 	if id == "" || active == "" {
 		s.mu.Unlock()
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: Capture before Create")
+		return trace.WorkspaceState{}, fmt.Errorf("containerd sandbox: Capture before Create")
 	}
 	s.seq++
 	n := s.seq
@@ -560,7 +561,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 
 	// A layer the task is still writing to must not be committed.
 	if err := s.tasks.StopTask(ctx, id); err != nil {
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: stop task before capture: %w", err)
+		return trace.WorkspaceState{}, fmt.Errorf("containerd sandbox: stop task before capture: %w", err)
 	}
 
 	committed := s.key(id, "committed", n)
@@ -568,7 +569,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 		// The task is stopped; restart it on the old layer so the sandbox is
 		// left usable rather than wedged.
 		_ = s.restart(ctx, id, active)
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: commit snapshot: %w", err)
+		return trace.WorkspaceState{}, fmt.Errorf("containerd sandbox: commit snapshot: %w", err)
 	}
 
 	// The kernel's contract is that a WorkspaceState outlives the sandbox that
@@ -580,7 +581,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 	// may itself be a cancellation.
 	if err := s.pinState(ctx, committed); err != nil {
 		_ = s.advance(context.WithoutCancel(ctx), id, committed, n)
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: pin captured state: %w", err)
+		return trace.WorkspaceState{}, fmt.Errorf("containerd sandbox: pin captured state: %w", err)
 	}
 
 	if err := s.advance(ctx, id, committed, n); err != nil {
@@ -592,7 +593,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 		// the sandbox's remaining life and the daemon GC reclaims it after
 		// Destroy. Cancel-free, for the same reason as the pin-failure branch.
 		_ = s.unpinState(context.WithoutCancel(ctx), committed)
-		return shepherd.WorkspaceState{}, err
+		return trace.WorkspaceState{}, err
 	}
 
 	state := snapshotState(s.cfg.Image, committed, parent)
@@ -616,14 +617,14 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (shepherd.WorkspaceStat
 			return state, nil
 		}
 		_ = s.unpinState(context.WithoutCancel(ctx), committed)
-		return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture: read git HEAD for delta base %s: %v", base, headErr)
+		return trace.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture: read git HEAD for delta base %s: %v", base, headErr)
 	}
 	state.Data[StateKeyGitHead] = head
 	if base != "" {
 		res, err := s.shell(ctx, deltaPatchScript, base)
 		if err != nil {
 			_ = s.unpinState(context.WithoutCancel(ctx), committed)
-			return shepherd.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture delta against base %s: %w", base, err)
+			return trace.WorkspaceState{}, fmt.Errorf("containerd sandbox: capture delta against base %s: %w", base, err)
 		}
 		state.Data[StateKeyDeltaBase] = base
 		if patch := res.Stdout; strings.TrimSpace(patch) != "" {
@@ -678,7 +679,7 @@ func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n
 // removed. Single-use per state: the sandbox now runs on the given committed
 // layer, so applying a different state moves it again. This differs from the
 // git backend, whose states are freely reusable.
-func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceState) error {
+func (s *ContainerdSandbox) Apply(ctx context.Context, ws trace.WorkspaceState) error {
 	committed, err := stateSnapshotKey(ws)
 	if err != nil {
 		return err
@@ -755,7 +756,7 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 // This is the state-discard half of the kernel's "a WorkspaceState has no
 // lifecycle" contract: the state stays valid for exactly as long as the caller
 // wants it, and disk comes back when the caller says so. It is deliberately not
-// part of shepherd.Sandbox — see StateReleaser — because promoting a discard
+// part of sbx.Sandbox — see StateReleaser — because promoting a discard
 // operation into the core interface is a kernel-level API decision.
 //
 // Idempotent: releasing an already-released state is a no-op.
@@ -765,7 +766,7 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws shepherd.WorkspaceStat
 // through a backend configured the same way as the one that captured the
 // state. A mismatched release reports success (the target resource is simply
 // not found) while the real pin persists.
-func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws shepherd.WorkspaceState) error {
+func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws trace.WorkspaceState) error {
 	key, err := stateSnapshotKey(ws)
 	if err != nil {
 		return err
@@ -776,7 +777,7 @@ func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws shepherd.Worksp
 	return s.unpinState(ctx, key)
 }
 
-// ApplyDelta implements shepherd.DeltaApplier: it merges the changes captured
+// ApplyDelta implements sbx.DeltaApplier: it merges the changes captured
 // in delta onto the current workspace without resetting it, so a parent that
 // moved since the fork still lands the child's work. Settlement's apply verb
 // (settlement.go, SettleApply) calls this after the overlap guard has refused
@@ -792,14 +793,14 @@ func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws shepherd.Worksp
 // A delta with no changes is a no-op. A state captured without a base (a
 // sandbox that never applied a git state) cannot be merged and returns
 // ErrUnsupported rather than pretending: its scope settles Select-only.
-func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, delta shepherd.WorkspaceState) error {
+func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, delta trace.WorkspaceState) error {
 	if delta.Backend != BackendName {
 		return fmt.Errorf("containerd sandbox: cannot apply delta from backend %q", delta.Backend)
 	}
 	base, _ := delta.Data[StateKeyDeltaBase].(string)
 	patchB64, _ := delta.Data[StateKeyDeltaPatch].(string)
 	if base == "" {
-		return fmt.Errorf("containerd sandbox: delta was captured without a recorded git base, so its changes cannot be merged onto a moved workspace: %w", shepherd.ErrUnsupported)
+		return fmt.Errorf("containerd sandbox: delta was captured without a recorded git base, so its changes cannot be merged onto a moved workspace: %w", sbx.ErrUnsupported)
 	}
 	if patchB64 == "" {
 		return nil // clean capture: nothing to merge
@@ -842,7 +843,7 @@ func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, delta shepherd.Works
 	return nil
 }
 
-var _ shepherd.DeltaApplier = (*ContainerdSandbox)(nil)
+var _ sbx.DeltaApplier = (*ContainerdSandbox)(nil)
 
 // splitChain partitions a committed-layer chain at key: layers up to and
 // including key are retained (they remain ancestors of a layer prepared from
@@ -996,7 +997,7 @@ fi`
 //
 // Both outputs come from one staging pass, so they cannot describe different
 // workspace states. See diffScript; pinned by TestDiff_StagesOncePerCall.
-func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState, maxLines int) (string, []string, error) {
+func (s *ContainerdSandbox) Diff(ctx context.Context, ws trace.WorkspaceState, maxLines int) (string, []string, error) {
 	if _, err := stateSnapshotKey(ws); err != nil {
 		return "", nil, err
 	}
@@ -1035,15 +1036,15 @@ func (s *ContainerdSandbox) Diff(ctx context.Context, ws shepherd.WorkspaceState
 }
 
 // Exec runs a command inside the sandbox.
-func (s *ContainerdSandbox) Exec(ctx context.Context, req shepherd.ExecRequest) (shepherd.ExecResult, error) {
+func (s *ContainerdSandbox) Exec(ctx context.Context, req sbx.ExecRequest) (sbx.ExecResult, error) {
 	if err := s.requireBackend(ctx); err != nil {
-		return shepherd.ExecResult{}, err
+		return sbx.ExecResult{}, err
 	}
 	s.mu.Lock()
 	id := s.id
 	s.mu.Unlock()
 	if id == "" {
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: Exec before Create")
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: Exec before Create")
 	}
 	if req.Cwd == "" {
 		req.Cwd = s.cfg.workdir()
@@ -1155,7 +1156,7 @@ func base64Args(data []byte) []string {
 //
 // This is Capture without the state bookkeeping, exposed because a fork needs the
 // same "commit then continue on a fresh layer" sequence.
-func (s *ContainerdSandbox) ForkState(ctx context.Context) (shepherd.WorkspaceState, error) {
+func (s *ContainerdSandbox) ForkState(ctx context.Context) (trace.WorkspaceState, error) {
 	return s.Capture(ctx)
 }
 
@@ -1188,7 +1189,7 @@ func (s *ContainerdSandbox) gitHead(ctx context.Context, id string) (string, err
 
 // run executes a command with the workspace as its working directory.
 func (s *ContainerdSandbox) run(ctx context.Context, id, command string, args ...string) (string, error) {
-	res, err := s.tasks.Exec(ctx, id, shepherd.ExecRequest{
+	res, err := s.tasks.Exec(ctx, id, sbx.ExecRequest{
 		Command: command,
 		Args:    args,
 		Cwd:     s.cfg.workdir(),
@@ -1204,22 +1205,22 @@ func (s *ContainerdSandbox) run(ctx context.Context, id, command string, args ..
 }
 
 // shell runs a POSIX shell script with positional arguments.
-func (s *ContainerdSandbox) shell(ctx context.Context, script string, args ...string) (shepherd.ExecResult, error) {
+func (s *ContainerdSandbox) shell(ctx context.Context, script string, args ...string) (sbx.ExecResult, error) {
 	return s.execShell(ctx, nil, script, args...)
 }
 
 // execShell runs a shell script with optional stdin and positional arguments.
-func (s *ContainerdSandbox) execShell(ctx context.Context, stdin []byte, script string, args ...string) (shepherd.ExecResult, error) {
+func (s *ContainerdSandbox) execShell(ctx context.Context, stdin []byte, script string, args ...string) (sbx.ExecResult, error) {
 	s.mu.Lock()
 	id := s.id
 	s.mu.Unlock()
 	if id == "" {
-		return shepherd.ExecResult{}, fmt.Errorf("containerd sandbox: sandbox not created")
+		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: sandbox not created")
 	}
 	// `sh -c script name arg1 arg2...`: $0 is a placeholder so the caller's
 	// arguments start at $1.
 	shArgs := append([]string{"-c", script, "shepherd"}, args...)
-	res, err := s.tasks.Exec(ctx, id, shepherd.ExecRequest{
+	res, err := s.tasks.Exec(ctx, id, sbx.ExecRequest{
 		Command: "sh",
 		Args:    shArgs,
 		Cwd:     s.cfg.workdir(),
@@ -1288,8 +1289,8 @@ func newSandboxID() string {
 
 // snapshotState encodes a committed snapshot as a backend-neutral workspace
 // state. Capture returns this shape and Apply consumes it.
-func snapshotState(image, snapshotKey, parentKey string) shepherd.WorkspaceState {
-	return shepherd.WorkspaceState{
+func snapshotState(image, snapshotKey, parentKey string) trace.WorkspaceState {
+	return trace.WorkspaceState{
 		Backend:  BackendName,
 		Revision: snapshotKey,
 		Data: map[string]any{
@@ -1302,7 +1303,7 @@ func snapshotState(image, snapshotKey, parentKey string) shepherd.WorkspaceState
 
 // stateSnapshotKey extracts the committed snapshot key from a state, rejecting
 // states produced by another backend so a git state can never be applied here.
-func stateSnapshotKey(ws shepherd.WorkspaceState) (string, error) {
+func stateSnapshotKey(ws trace.WorkspaceState) (string, error) {
 	if ws.Backend != BackendName {
 		return "", fmt.Errorf("containerd sandbox: cannot use a %q workspace state", ws.Backend)
 	}

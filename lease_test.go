@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	shepherd "github.com/buchenberg/shepherd-kernel-go"
+	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
+	trace "github.com/buchenberg/shepherd-kernel-go/trace"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
@@ -323,7 +324,7 @@ func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
 	sb.leases = fl
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if len(fl.created) != 1 {
@@ -341,7 +342,7 @@ func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
 		t.Fatalf("lease = %q after Destroy, want empty", got)
 	}
 
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create (second generation): %v", err)
 	}
 	if len(fl.created) != 2 {
@@ -440,7 +441,7 @@ func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- sb.Create(context.Background(), shepherd.SandboxSpec{Timeout: 200 * time.Millisecond})
+		done <- sb.Create(context.Background(), sbx.SandboxSpec{Timeout: 200 * time.Millisecond})
 	}()
 
 	select {
@@ -464,7 +465,7 @@ func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
 func TestDiff_StagesOncePerCall(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -513,7 +514,7 @@ func TestDiff_StagesOncePerCall(t *testing.T) {
 func TestDiff_MissingSeparatorIsAnError(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -541,7 +542,7 @@ func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	first, err := sb.Capture(ctx)
@@ -597,7 +598,7 @@ func TestCapture_PinFailureRollsForwardNotOut(t *testing.T) {
 	fl := &fakeLeases{addResErr: errors.New("lease service unavailable")}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	before := len(snap.keys())
@@ -666,7 +667,7 @@ func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
 	tasks := &failingStartTask{taskService: sb.tasks}
 	sb.tasks = tasks
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	tasks.armed = true
@@ -715,7 +716,7 @@ func TestReleaseState_DropsTheStatesLeasePin(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -761,11 +762,11 @@ func TestReleaseState_RejectsForeignAndIncompleteStates(t *testing.T) {
 	sb.leases = fl
 	ctx := context.Background()
 
-	if err := sb.ReleaseState(ctx, shepherd.WorkspaceState{Backend: "git", Revision: "abc123"}); err == nil {
+	if err := sb.ReleaseState(ctx, trace.WorkspaceState{Backend: "git", Revision: "abc123"}); err == nil {
 		t.Error("ReleaseState accepted a git state: it would have unpinned a key the " +
 			"git backend knows nothing about")
 	}
-	if err := sb.ReleaseState(ctx, shepherd.WorkspaceState{Backend: BackendName}); err == nil {
+	if err := sb.ReleaseState(ctx, trace.WorkspaceState{Backend: BackendName}); err == nil {
 		t.Error("ReleaseState accepted a state with no snapshot key")
 	}
 	if len(fl.removed) != 0 {
@@ -780,7 +781,7 @@ func TestReleaseState_NoManagerIsNoop(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "abc")
 	sb.leases = nil
 	ctx := context.Background()
-	if err := sb.Create(ctx, shepherd.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
