@@ -485,10 +485,11 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 // resolved.
 func withNumericUser(user string) oci.SpecOpts {
 	const idBits = 31 // strconv bitSize for the MaxInt32 ids runc accepts
-	// parseID returns the id, or nil for a non-numeric string (the named
-	// user falls back to the spec default), or an error when the id is
-	// syntactically numeric but out of runc's range.
-	parseID := func(s, kind string) (uint64, bool, error) {
+	// parseID parses one id component. numeric reports whether the string
+	// was an id at all: a non-numeric string is the named-user fallback
+	// (zero value, no error), while an id that is out of runc's range is
+	// an error.
+	parseID := func(s, kind string) (id uint64, numeric bool, err error) {
 		v, err := strconv.ParseUint(s, 10, idBits)
 		if err == nil {
 			return v, true, nil
