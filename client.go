@@ -17,6 +17,7 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -426,14 +427,23 @@ func (t *containerdTasks) initArgs() []string {
 // already authorizes.
 //
 // Kept from WithImageConfig: env, working directory, and a numeric uid[:gid]
-// user. A *named* user is left unresolved (spec default: root): resolving it
-// would need exactly the rootfs read this function exists to avoid, and the
-// sandbox contract's execs define their own credentials, so the image user
-// only affects the init process sleeping in the background.
+// user. A *named* user is left unresolved (spec default: root), and a
+// uid-only user leaves the gid at the spec default (0): resolving either
+// needs /etc/passwd or /etc/group out of the rootfs — exactly the read
+// this function exists to avoid. Supplemental groups are not resolved for
+// the same reason. The sandbox contract's execs define their own
+// credentials, so the image user only affects the init process sleeping
+// in the background.
 func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image) ([]oci.SpecOpts, error) {
 	ic, err := img.Config(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd sandbox: read image config descriptor: %w", err)
+	}
+	// The media type check is WithImageConfig's own guard: an unexpected
+	// descriptor would otherwise unmarshal into a zero-value config —
+	// empty env, "/" cwd, root user — instead of failing loudly.
+	if !images.IsConfigType(ic.MediaType) {
+		return nil, fmt.Errorf("containerd sandbox: unknown image config media type %s", ic.MediaType)
 	}
 	blob, err := content.ReadBlob(ctx, img.ContentStore(), ic)
 	if err != nil {
@@ -448,6 +458,10 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 	opts := make([]oci.SpecOpts, 0, 3)
 	if len(cfg.Env) > 0 {
 		opts = append(opts, oci.WithEnv(cfg.Env))
+	} else {
+		// WithImageConfig's fallback: an image with no env still gets the
+		// package's default PATH, not an empty environment.
+		opts = append(opts, oci.WithDefaultPathEnv)
 	}
 	cwd := cfg.WorkingDir
 	if cwd == "" {
@@ -461,20 +475,29 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 }
 
 // withNumericUser applies a numeric uid[:gid] image user directly onto the
-// spec. Non-numeric users are ignored on purpose — see initSpecOpts.
+// spec. The bound is runc's, as enforced by containerd's own WithUser: ids
+// above math.MaxInt32 parse as uint32 but runc rejects them. Anything
+// non-numeric — a named user, or a malformed pair such as "1000:staff" — is
+// ignored as a whole: half-applying a pair would give the init a uid with
+// the root group. See initSpecOpts for why names are not resolved.
 func withNumericUser(user string) oci.SpecOpts {
+	const idBits = 31 // strconv bitSize for the MaxInt32 ids runc accepts
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
 		uidStr, gidStr, hasGid := strings.Cut(user, ":")
-		uid, err := strconv.ParseUint(uidStr, 10, 32)
+		uid, err := strconv.ParseUint(uidStr, 10, idBits)
+		if err != nil {
+			return nil
+		}
+		if !hasGid {
+			s.Process.User.UID = uint32(uid)
+			return nil
+		}
+		gid, err := strconv.ParseUint(gidStr, 10, idBits)
 		if err != nil {
 			return nil
 		}
 		s.Process.User.UID = uint32(uid)
-		if hasGid {
-			if gid, err := strconv.ParseUint(gidStr, 10, 32); err == nil {
-				s.Process.User.GID = uint32(gid)
-			}
-		}
+		s.Process.User.GID = uint32(gid)
 		return nil
 	}
 }
