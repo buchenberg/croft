@@ -58,7 +58,7 @@ func newConfigImage(t *testing.T, cfg v1.ImageConfig) configImage {
 // GenerateSpec call NewContainer's WithNewSpec performs, so the tests pin
 // the composition production actually uses — default spec, then image
 // settings, then the init args — rather than each opt in isolation.
-func generateInitSpec(t *testing.T, cfg v1.ImageConfig) *oci.Spec {
+func generateInitSpec(t *testing.T, cfg v1.ImageConfig) (*oci.Spec, error) {
 	t.Helper()
 	// GenerateSpec requires a containerd namespace (the default spec's
 	// cgroup path resolves against it).
@@ -67,25 +67,24 @@ func generateInitSpec(t *testing.T, cfg v1.ImageConfig) *oci.Spec {
 	tasks := &containerdTasks{}
 	opts, err := tasks.initSpecOpts(ctx, img)
 	if err != nil {
-		t.Fatalf("initSpecOpts: %v", err)
+		return nil, err
 	}
 	opts = append(opts, oci.WithProcessArgs(tasks.initArgs()...))
-	spec, err := oci.GenerateSpec(ctx, nil, &containers.Container{}, opts...)
-	if err != nil {
-		t.Fatalf("GenerateSpec: %v", err)
-	}
-	return spec
+	return oci.GenerateSpec(ctx, nil, &containers.Container{}, opts...)
 }
 
 // TestInitSpecOpts pins the WithImageConfig parity this translation keeps:
 // image env applied over the default spec env, the image working directory
 // (with the "/" fallback), a numeric uid[:gid] user, and the init args.
 func TestInitSpecOpts(t *testing.T) {
-	spec := generateInitSpec(t, v1.ImageConfig{
+	spec, err := generateInitSpec(t, v1.ImageConfig{
 		Env:        []string{"PATH=/opt/bin", "GOLANG=1"},
 		WorkingDir: "/workdir",
 		User:       "1000:1000",
 	})
+	if err != nil {
+		t.Fatalf("generateInitSpec: %v", err)
+	}
 
 	env := strings.Join(spec.Process.Env, "\n")
 	for _, want := range []string{"PATH=/opt/bin", "GOLANG=1"} {
@@ -110,7 +109,10 @@ func TestInitSpecOpts(t *testing.T) {
 // default env (which includes a PATH) untouched, and no working directory
 // resolves to "/".
 func TestInitSpecOpts_Defaults(t *testing.T) {
-	spec := generateInitSpec(t, v1.ImageConfig{})
+	spec, err := generateInitSpec(t, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("generateInitSpec: %v", err)
+	}
 	if !strings.Contains(strings.Join(spec.Process.Env, "\n"), "PATH=") {
 		t.Errorf("Process.Env = %q, want the default spec PATH preserved", spec.Process.Env)
 	}
@@ -121,24 +123,37 @@ func TestInitSpecOpts_Defaults(t *testing.T) {
 
 // TestInitSpecOpts_UserForms pins how image user forms map onto the spec.
 // Named users and malformed pairs are ignored as a whole (spec default
-// root), a uid-only user sets the uid and leaves the gid at 0, and ids
-// beyond runc's MaxInt32 bound are rejected even though the field is
-// uint32 — containerd's own WithUser enforces the same bound.
+// root), and a uid-only user sets the uid and leaves the gid at 0. An id
+// that is syntactically numeric but beyond runc's MaxInt32 bound fails
+// the spec loudly — silently falling back to root would change the
+// identity the image asked for — matching containerd's own WithUser
+// range check.
 func TestInitSpecOpts_UserForms(t *testing.T) {
 	cases := []struct {
 		user    string
 		wantUID uint32
 		wantGID uint32
+		wantErr string // empty: the user must apply (or fall back) cleanly
 	}{
 		{user: "1000", wantUID: 1000},
 		{user: "1000:1000", wantUID: 1000, wantGID: 1000},
-		{user: "appuser"},    // named: unresolved by design
-		{user: "1000:staff"}, // malformed pair: applied as a whole or not at all
-		{user: "4294967295"}, // MaxUint32: parses as uint32, runc rejects
-		{user: "2147483648"}, // MaxInt32 + 1: runc rejects
+		{user: "appuser"},                                  // named: unresolved by design
+		{user: "1000:staff"},                               // malformed pair: applied as a whole or not at all
+		{user: "4294967295", wantErr: "outside the range"}, // MaxUint32
+		{user: "2147483648", wantErr: "outside the range"}, // MaxInt32 + 1
+		{user: "1000:4294967295", wantErr: "outside the range"},
 	}
 	for _, tc := range cases {
-		spec := generateInitSpec(t, v1.ImageConfig{User: tc.user})
+		spec, err := generateInitSpec(t, v1.ImageConfig{User: tc.user})
+		if tc.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("user %q: error = %v, want %q", tc.user, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("user %q: generateInitSpec: %v", tc.user, err)
+		}
 		if spec.Process.User.UID != tc.wantUID || spec.Process.User.GID != tc.wantGID {
 			t.Errorf("user %q: Process.User = %d:%d, want %d:%d",
 				tc.user, spec.Process.User.UID, spec.Process.User.GID, tc.wantUID, tc.wantGID)

@@ -476,25 +476,42 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 
 // withNumericUser applies a numeric uid[:gid] image user directly onto the
 // spec. The bound is runc's, as enforced by containerd's own WithUser: ids
-// above math.MaxInt32 parse as uint32 but runc rejects them. Anything
-// non-numeric — a named user, or a malformed pair such as "1000:staff" — is
-// ignored as a whole: half-applying a pair would give the init a uid with
-// the root group. See initSpecOpts for why names are not resolved.
+// above math.MaxInt32 parse as uint32 but runc rejects them, so an
+// out-of-range id fails the spec loudly rather than silently running the
+// init as root. A *named* user, or a malformed pair such as "1000:staff",
+// is ignored as a whole — resolving a name needs /etc/passwd out of the
+// rootfs (see initSpecOpts), and half-applying a pair would give the init
+// a uid with the root group. See initSpecOpts for why names are not
+// resolved.
 func withNumericUser(user string) oci.SpecOpts {
 	const idBits = 31 // strconv bitSize for the MaxInt32 ids runc accepts
+	// parseID returns the id, or nil for a non-numeric string (the named
+	// user falls back to the spec default), or an error when the id is
+	// syntactically numeric but out of runc's range.
+	parseID := func(s, kind string) (uint64, bool, error) {
+		v, err := strconv.ParseUint(s, 10, idBits)
+		if err == nil {
+			return v, true, nil
+		}
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) && numErr.Err == strconv.ErrRange {
+			return 0, true, fmt.Errorf("containerd sandbox: image user %q: %s %s is outside the range runc accepts", user, kind, s)
+		}
+		return 0, false, nil
+	}
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
 		uidStr, gidStr, hasGid := strings.Cut(user, ":")
-		uid, err := strconv.ParseUint(uidStr, 10, idBits)
-		if err != nil {
-			return nil
+		uid, numeric, err := parseID(uidStr, "uid")
+		if err != nil || !numeric {
+			return err
 		}
 		if !hasGid {
 			s.Process.User.UID = uint32(uid)
 			return nil
 		}
-		gid, err := strconv.ParseUint(gidStr, 10, idBits)
-		if err != nil {
-			return nil
+		gid, numeric, err := parseID(gidStr, "gid")
+		if err != nil || !numeric {
+			return err
 		}
 		s.Process.User.UID = uint32(uid)
 		s.Process.User.GID = uint32(gid)
