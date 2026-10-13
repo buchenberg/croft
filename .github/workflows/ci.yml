@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt (must be empty)
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "gofmt found unformatted files:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The unit suite runs everywhere; the live suite skips without
+      # CROFT_CONTAINERD_ADDR, so this stays green on a stock runner.
+      - name: go test
+        run: go test -count=1 ./...
