@@ -1,9 +1,8 @@
-module github.com/buchenberg/shepherd-kernel-go/sandbox/containerd
+module github.com/buchenberg/croft
 
 go 1.26.3
 
 require (
-	github.com/buchenberg/shepherd-kernel-go v0.12.0
 	github.com/containerd/containerd/v2 v2.3.5
 	github.com/containerd/errdefs v1.0.0
 	github.com/opencontainers/go-digest v1.0.0
@@ -67,3 +66,8 @@ require (
 	modernc.org/strutil v1.2.0 // indirect
 	modernc.org/token v1.1.0 // indirect
 )
+
+// Test-only: the live integration suite (workspace_live_test.go) exercises a
+// consumer host's full materialize path against a real containerd daemon, and
+// that host is shepherd-kernel-go. The library itself has no dependency on it.
+require github.com/buchenberg/shepherd-kernel-go v0.12.0

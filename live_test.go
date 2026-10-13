@@ -1,6 +1,6 @@
 //go:build linux && !nolive
 
-package containerd
+package croft
 
 // Live-daemon acceptance test for the containerd backend (plan 05 §3, T0.5).
 //
@@ -13,14 +13,14 @@ package containerd
 //
 // # Gating
 //
-// Skipped unless SHEPHERD_CONTAINERD_ADDR is set, so `go test ./...` stays green
+// Skipped unless CROFT_CONTAINERD_ADDR is set, so `go test ./...` stays green
 // on a machine with no daemon and in CI. The build tag keeps it out of non-Linux
 // builds entirely: the backend is Linux-only by construction (overlayfs plus
 // runc), so compiling it elsewhere would only produce a test that cannot pass.
 //
 // Run it with:
 //
-//	sudo env SHEPHERD_CONTAINERD_ADDR=/run/containerd/containerd.sock \
+//	sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 //	  go test -count=1 -v -run TestLive ./...
 //
 // # Why root
@@ -61,8 +61,6 @@ import (
 	"testing"
 	"time"
 
-	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
-	trace "github.com/buchenberg/shepherd-kernel-go/trace"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -74,12 +72,12 @@ import (
 // configurable rather than baked in, so a different image, namespace, or
 // snapshotter is a variable change and not a code change.
 const (
-	envAddr        = "SHEPHERD_CONTAINERD_ADDR"
-	envImage       = "SHEPHERD_CONTAINERD_IMAGE"
-	envNamespace   = "SHEPHERD_CONTAINERD_NAMESPACE"
-	envSnapshotter = "SHEPHERD_CONTAINERD_SNAPSHOTTER"
-	envWorkdir     = "SHEPHERD_CONTAINERD_WORKDIR"
-	envTimeout     = "SHEPHERD_CONTAINERD_TIMEOUT"
+	envAddr        = "CROFT_CONTAINERD_ADDR"
+	envImage       = "CROFT_CONTAINERD_IMAGE"
+	envNamespace   = "CROFT_CONTAINERD_NAMESPACE"
+	envSnapshotter = "CROFT_CONTAINERD_SNAPSHOTTER"
+	envWorkdir     = "CROFT_CONTAINERD_WORKDIR"
+	envTimeout     = "CROFT_CONTAINERD_TIMEOUT"
 )
 
 // Defaults for the knobs above. defaultSnapshotter is client.go's own constant
@@ -96,7 +94,7 @@ const (
 	defaultWorkdir   = "/workspace"
 	// Deliberately well under `go test`'s own 10m default, so a hang surfaces as
 	// a context-deadline error from the code under test rather than as a testing
-	// panic with a goroutine dump. Raise it via SHEPHERD_CONTAINERD_TIMEOUT for a
+	// panic with a goroutine dump. Raise it via CROFT_CONTAINERD_TIMEOUT for a
 	// cold image pull, and pass a matching `go test -timeout`.
 	defaultTimeout = 5 * time.Minute
 )
@@ -265,7 +263,7 @@ func newLiveSandbox(t *testing.T, ctx context.Context, cfg liveConfig) *Containe
 func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, command string, args ...string) string {
 	t.Helper()
 	start := time.Now()
-	res, err := sb.Exec(ctx, sbx.ExecRequest{Command: command, Args: args, Cwd: cwd})
+	res, err := sb.Exec(ctx, ExecRequest{Command: command, Args: args, Cwd: cwd})
 	// Per-command duration is what separates "this one command hangs" from
 	// "every exec is slow", which are indistinguishable in a single total.
 	t.Logf("exec %s %s: %s (exit %d)", command, strings.Join(args, " "),
@@ -286,7 +284,7 @@ func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, com
 // snapshot behind. States captured *inside* Materialize (the substrate's own
 // captures) have no test-side handle and intentionally keep their pins —
 // releasing them is the kernel's state-expiry business, not the test's.
-func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) trace.WorkspaceState {
+func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) WorkspaceState {
 	t.Helper()
 	state, err := sb.Capture(ctx)
 	if err != nil {
@@ -337,7 +335,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	sb := newLiveSandbox(t, ctx, cfg)
 
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
@@ -351,7 +349,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	// File I/O round-trip. Paths are relative on purpose, so this also covers
 	// resolve() against the configured workdir.
-	const want = "shepherd live verification\n"
+	const want = "croft live verification\n"
 	if err := sb.WriteFile(ctx, "live.txt", []byte(want), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -408,7 +406,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 	}
 
 	// Exec: exit code, stream separation, and Duration.
-	res, err := sb.Exec(ctx, sbx.ExecRequest{
+	res, err := sb.Exec(ctx, ExecRequest{
 		Command: "sh",
 		Args:    []string{"-c", "echo to-stdout; echo to-stderr >&2"},
 		Cwd:     cfg.Workdir,
@@ -439,7 +437,7 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	// A non-zero exit is a result, not an error: Exec returns the code with a
 	// nil error, matching the interface contract callers branch on.
-	failed, err := sb.Exec(ctx, sbx.ExecRequest{
+	failed, err := sb.Exec(ctx, ExecRequest{
 		Command: "sh",
 		Args:    []string{"-c", "exit 7"},
 		Cwd:     cfg.Workdir,
@@ -495,7 +493,7 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -552,7 +550,7 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
@@ -666,7 +664,7 @@ func TestLive_DiffPreservesPreStagedChanges(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
@@ -730,12 +728,12 @@ func TestLive_ExecRejectsStdin(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	start := time.Now()
-	_, err := sb.Exec(ctx, sbx.ExecRequest{
+	_, err := sb.Exec(ctx, ExecRequest{
 		Command: "cat",
 		Cwd:     cfg.Workdir,
 		Stdin:   []byte("never sees EOF\n"),
@@ -777,7 +775,7 @@ func TestLive_LeaseHoldsSnapshots(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -830,7 +828,7 @@ func TestLive_DestroyReleasesTheLease(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -883,7 +881,7 @@ func TestLive_ApplyDeltaMergesOntoMovedParent(t *testing.T) {
 	defer cancel()
 
 	parent := newLiveSandbox(t, ctx, cfg)
-	if err := parent.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := parent.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, parent, cfg.Workdir)
@@ -966,7 +964,7 @@ func TestLive_ApplyDeltaConflictRefusesUntouched(t *testing.T) {
 	defer cancel()
 
 	parent := newLiveSandbox(t, ctx, cfg)
-	if err := parent.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := parent.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, parent, cfg.Workdir)

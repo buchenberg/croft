@@ -1,6 +1,6 @@
 //go:build linux && !nolive
 
-package containerd
+package croft
 
 // Live workspace-substrate integration (plan 03 T2b.7): WorkspaceSubstrate
 // over a live containerd daemon — declare a file write in a trace store,
@@ -17,17 +17,18 @@ package containerd
 // act 2 — the repin to v0.7.0 and the removal of the tag — the same two-act
 // shape as the T0.8/T0.8b repin. The constraint now matches live_test.go,
 // so the file joins the normal linux build graph and skips at runtime
-// without SHEPHERD_CONTAINERD_ADDR, exactly like the rest of the live
+// without CROFT_CONTAINERD_ADDR, exactly like the rest of the live
 // suite.
 //
 // # Running it
 //
-//	sudo env SHEPHERD_CONTAINERD_ADDR=/run/containerd/containerd.sock \
+//	sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 //	  go test -count=1 -v -run TestLive_WorkspaceSubstrate ./...
 
 import (
 	"context"
 	"encoding/base64"
+	"io/fs"
 	"testing"
 
 	materialize "github.com/buchenberg/shepherd-kernel-go/materialize"
@@ -40,11 +41,85 @@ import (
 // test uses, in the shape of core's TrustedAppendContext but with a
 // test-local actor so trace provenance names this suite.
 var liveAppendContext = trace.AppendContext{
-	ActorRef:             "runtime:containerd-live",
+	ActorRef:             "runtime:croft-live",
 	PresentedWitnessRefs: []string{"trusted:internal"},
 	SchemaVersionSet:     "shepherd2-slice-a",
 	TrustMode:            "internal",
 }
+
+// shepherdSandbox adapts a croft sandbox to shepherd's sandbox.Sandbox, so
+// this suite can exercise the full materialize path of a consumer host. It is
+// also the reference shape for a real host-side adapter: croft's types map
+// one-to-one, and the conversion is field copies plus the Containment string
+// cast.
+type shepherdSandbox struct{ sb *ContainerdSandbox }
+
+func (a shepherdSandbox) Backend() string { return a.sb.Backend() }
+
+func (a shepherdSandbox) Capabilities() sbx.SandboxCapabilities {
+	caps := a.sb.Capabilities()
+	return sbx.SandboxCapabilities{
+		Lifecycle:   caps.Lifecycle,
+		Exec:        caps.Exec,
+		FileIO:      caps.FileIO,
+		Diff:        caps.Diff,
+		Isolated:    caps.Isolated,
+		Containment: trace.Containment(caps.Containment),
+	}
+}
+
+func (a shepherdSandbox) Create(ctx context.Context, spec sbx.SandboxSpec) error {
+	return a.sb.Create(ctx, SandboxSpec{Workdir: spec.Workdir, Env: spec.Env, Timeout: spec.Timeout})
+}
+
+func (a shepherdSandbox) Destroy(ctx context.Context) error { return a.sb.Destroy(ctx) }
+
+func (a shepherdSandbox) toShepherd(ws WorkspaceState) trace.WorkspaceState {
+	data := make(map[string]any, len(ws.Data))
+	for k, v := range ws.Data {
+		data[k] = v
+	}
+	return trace.WorkspaceState{Backend: ws.Backend, Revision: ws.Revision, Data: data}
+}
+
+func (a shepherdSandbox) fromShepherd(ws trace.WorkspaceState) WorkspaceState {
+	data := make(map[string]any, len(ws.Data))
+	for k, v := range ws.Data {
+		data[k] = v
+	}
+	return WorkspaceState{Backend: ws.Backend, Revision: ws.Revision, Data: data}
+}
+
+func (a shepherdSandbox) Capture(ctx context.Context) (trace.WorkspaceState, error) {
+	ws, err := a.sb.Capture(ctx)
+	if err != nil {
+		return trace.WorkspaceState{}, err
+	}
+	return a.toShepherd(ws), nil
+}
+
+func (a shepherdSandbox) Apply(ctx context.Context, ws trace.WorkspaceState) error {
+	return a.sb.Apply(ctx, a.fromShepherd(ws))
+}
+
+func (a shepherdSandbox) Diff(ctx context.Context, ws trace.WorkspaceState, maxLines int) (string, []string, error) {
+	return a.sb.Diff(ctx, a.fromShepherd(ws), maxLines)
+}
+
+func (a shepherdSandbox) Exec(ctx context.Context, req sbx.ExecRequest) (sbx.ExecResult, error) {
+	res, err := a.sb.Exec(ctx, ExecRequest{Command: req.Command, Args: req.Args, Cwd: req.Cwd, Env: req.Env, Timeout: req.Timeout, Stdin: req.Stdin})
+	return sbx.ExecResult{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr, Duration: res.Duration}, err
+}
+
+func (a shepherdSandbox) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	return a.sb.ReadFile(ctx, path)
+}
+
+func (a shepherdSandbox) WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error {
+	return a.sb.WriteFile(ctx, path, data, perm)
+}
+
+var _ sbx.Sandbox = shepherdSandbox{}
 
 // TestLive_WorkspaceSubstrateWriteSurvivesRecycle is plan 03's acceptance
 // sequence: write -> capture -> destroy -> apply -> verify. The point is the
@@ -63,7 +138,7 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	// live test does this before touching the workspace — Exec and file IO
 	// both route through the container and fail with "sandbox not created"
 	// otherwise.
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
@@ -81,7 +156,7 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 			TraceOwnerID: "owner:live-substrate",
 			RetainedContext: &trace.RetainedContext{
 				SubstrateRef: substrate.WorkspaceSubstrateRef,
-				Containment:  sb.Capabilities().Containment,
+				Containment:  trace.Containment(sb.Capabilities().Containment),
 			},
 			FactDrafts: []trace.RecordDraft{{
 				Mode:      trace.Declaration,
@@ -99,7 +174,7 @@ func TestLive_WorkspaceSubstrateWriteSurvivesRecycle(t *testing.T) {
 	}
 
 	registry := substrate.NewSubstrateRegistry()
-	if err := registry.Register(substrate.NewWorkspaceSubstrate(sb)); err != nil {
+	if err := registry.Register(substrate.NewWorkspaceSubstrate(shepherdSandbox{sb})); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	receipt, err := materialize.Materialize(ctx, store, liveAppendContext.ToOperationContext(trace.OpMaterialize), materialize.MaterializationRequest{
@@ -173,7 +248,7 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	bootstrapGit(t, ctx, sb, cfg.Workdir)
@@ -190,7 +265,7 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 			TraceOwnerID: "owner:live-substrate-exec",
 			RetainedContext: &trace.RetainedContext{
 				SubstrateRef: substrate.WorkspaceSubstrateRef,
-				Containment:  sb.Capabilities().Containment,
+				Containment:  trace.Containment(sb.Capabilities().Containment),
 			},
 			FactDrafts: []trace.RecordDraft{{
 				Mode:      trace.Declaration,
@@ -209,7 +284,7 @@ func TestLive_WorkspaceSubstrateRecordsExecOutcome(t *testing.T) {
 	}
 
 	registry := substrate.NewSubstrateRegistry()
-	if err := registry.Register(substrate.NewWorkspaceSubstrate(sb)); err != nil {
+	if err := registry.Register(substrate.NewWorkspaceSubstrate(shepherdSandbox{sb})); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	receipt, err := materialize.Materialize(ctx, store, liveAppendContext.ToOperationContext(trace.OpMaterialize), materialize.MaterializationRequest{

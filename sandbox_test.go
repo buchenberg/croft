@@ -1,4 +1,4 @@
-package containerd
+package croft
 
 import (
 	"context"
@@ -8,9 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
-	trace "github.com/buchenberg/shepherd-kernel-go/trace"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -53,9 +50,9 @@ func TestContainerdSandbox_Capabilities(t *testing.T) {
 	if !caps.Isolated {
 		t.Error("Isolated must be true: the workspace is not the host filesystem")
 	}
-	if caps.Containment != trace.ContainContained {
+	if caps.Containment != ContainContained {
 		t.Errorf("Containment = %q, want %q (a container is not a VM boundary)",
-			caps.Containment, trace.ContainContained)
+			caps.Containment, ContainContained)
 	}
 }
 
@@ -63,7 +60,7 @@ func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t, "")
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
@@ -89,7 +86,7 @@ func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 func TestCreate_ProvisionsWorkdir(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -117,7 +114,7 @@ func TestCreate_ValidatesImage(t *testing.T) {
 	snap := newFakeSnapshotter(log)
 	sb := NewWithBackend(Config{}, snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
 
-	err := sb.Create(context.Background(), sbx.SandboxSpec{})
+	err := sb.Create(context.Background(), SandboxSpec{})
 	if err == nil {
 		t.Fatal("Create without Config.Image must fail")
 	}
@@ -138,7 +135,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t, "abc123")
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	log.mu.Lock()
@@ -160,7 +157,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 	if !tasks.isRunning() {
 		t.Fatal("Capture must leave a running task")
 	}
-	if _, err := sb.Exec(ctx, sbx.ExecRequest{Command: "true"}); err != nil {
+	if _, err := sb.Exec(ctx, ExecRequest{Command: "true"}); err != nil {
 		t.Errorf("Exec after Capture: %v", err)
 	}
 
@@ -180,7 +177,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 func TestCapture_RecordsStateAndGitHead(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "deadbeef")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -206,7 +203,7 @@ func TestCapture_RecordsStateAndGitHead(t *testing.T) {
 
 	// A non-git workspace simply omits the baseline rather than failing.
 	sb2, _, _, _ := newTestSandbox(t, "")
-	if err := sb2.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb2.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state2, err := sb2.Capture(ctx)
@@ -221,7 +218,7 @@ func TestCapture_RecordsStateAndGitHead(t *testing.T) {
 func TestCapture_RepeatedCapturesChain(t *testing.T) {
 	sb, snap, _, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -264,7 +261,7 @@ func TestCapture_BeforeCreateFails(t *testing.T) {
 func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	first, err := sb.Capture(ctx)
@@ -330,7 +327,7 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 func TestDestroy_IsIdempotent(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := sb.Destroy(ctx); err != nil {
@@ -355,7 +352,7 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -405,7 +402,7 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
 	sb, _, tasks, log := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -433,7 +430,7 @@ func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
 
 func TestApply_RejectsForeignBackend(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
-	err := sb.Apply(context.Background(), trace.WorkspaceState{Backend: "git"})
+	err := sb.Apply(context.Background(), WorkspaceState{Backend: "git"})
 	if err == nil {
 		t.Fatal("Apply must reject a git workspace state")
 	}
@@ -444,7 +441,7 @@ func TestApply_RejectsForeignBackend(t *testing.T) {
 
 func TestExec_BeforeCreateFails(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
-	if _, err := sb.Exec(context.Background(), sbx.ExecRequest{Command: "true"}); err == nil {
+	if _, err := sb.Exec(context.Background(), ExecRequest{Command: "true"}); err == nil {
 		t.Fatal("Exec before Create must fail")
 	}
 }
@@ -454,7 +451,7 @@ func TestExec_BeforeCreateFails(t *testing.T) {
 func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -496,7 +493,7 @@ func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 func TestWriteFile_EncodesContentInArgs(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -566,7 +563,7 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 	sb := NewWithBackend(Config{Image: "example/dev:latest", WriteChunkBytes: 4}, snap, tasks, images)
 
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -618,7 +615,7 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	before := len(tasks.allReqs)
@@ -641,7 +638,7 @@ func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 func TestDiff_RequiresGitBaseline(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -651,7 +648,7 @@ func TestDiff_RequiresGitBaseline(t *testing.T) {
 		t.Fatal("Diff without a git baseline must fail")
 	}
 	// A foreign state is rejected before anything else.
-	if _, _, err := sb.Diff(ctx, trace.WorkspaceState{Backend: "git"}, 0); err == nil {
+	if _, _, err := sb.Diff(ctx, WorkspaceState{Backend: "git"}, 0); err == nil {
 		t.Fatal("Diff must reject a foreign state")
 	}
 }
@@ -659,7 +656,7 @@ func TestDiff_RequiresGitBaseline(t *testing.T) {
 func TestDiff_TruncatesAndReportsFiles(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "deadbeef")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -691,7 +688,7 @@ func TestDiff_TruncatesAndReportsFiles(t *testing.T) {
 func TestDiff_StagesIntoScratchIndex(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -767,7 +764,7 @@ func TestSnapshotState_RoundTrip(t *testing.T) {
 
 func TestStateSnapshotKey_RejectsBadStates(t *testing.T) {
 	t.Run("foreign backend", func(t *testing.T) {
-		_, err := stateSnapshotKey(trace.WorkspaceState{
+		_, err := stateSnapshotKey(WorkspaceState{
 			Backend:  "git",
 			Revision: "abc123",
 			Data:     map[string]any{"head_sha": "abc123"},
@@ -778,7 +775,7 @@ func TestStateSnapshotKey_RejectsBadStates(t *testing.T) {
 	})
 
 	t.Run("missing snapshot key", func(t *testing.T) {
-		_, err := stateSnapshotKey(trace.WorkspaceState{Backend: BackendName, Data: map[string]any{}})
+		_, err := stateSnapshotKey(WorkspaceState{Backend: BackendName, Data: map[string]any{}})
 		if err == nil {
 			t.Fatal("a state without a snapshot key must be rejected")
 		}
@@ -821,7 +818,7 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 	// on the test host.
 	sb := New(Config{Address: "unix:///nonexistent/shepherd-test.sock"})
 
-	_, err := sb.Exec(context.Background(), sbx.ExecRequest{Command: "true"})
+	_, err := sb.Exec(context.Background(), ExecRequest{Command: "true"})
 	if err == nil {
 		t.Fatal("Exec without a reachable daemon must fail")
 	}
@@ -837,7 +834,7 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 func TestApply_RecordsDeltaBaseAndCaptureCarriesDelta(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	baseline, err := sb.Capture(ctx)
@@ -875,7 +872,7 @@ func TestCapture_CleanDeltaOmitsPatch(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "abc")
 	tasks.deltaPatchStdout = "\n"
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	baseline, err := sb.Capture(ctx)
@@ -905,7 +902,7 @@ func TestCapture_CleanDeltaOmitsPatch(t *testing.T) {
 func TestCapture_WithoutBaseCarriesNoDelta(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "deadbeef")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -924,7 +921,7 @@ func TestCapture_WithoutBaseCarriesNoDelta(t *testing.T) {
 // state can never be merged here.
 func TestApplyDelta_RejectsForeignBackend(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
-	err := sb.ApplyDelta(context.Background(), trace.WorkspaceState{Backend: "git"})
+	err := sb.ApplyDelta(context.Background(), WorkspaceState{Backend: "git"})
 	if err == nil {
 		t.Fatal("ApplyDelta must reject a git workspace state")
 	}
@@ -938,11 +935,11 @@ func TestApplyDelta_RejectsForeignBackend(t *testing.T) {
 // the merge verb can fail loudly at selection time.
 func TestApplyDelta_UnbasedDeltaIsUnsupported(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
-	err := sb.ApplyDelta(context.Background(), trace.WorkspaceState{
+	err := sb.ApplyDelta(context.Background(), WorkspaceState{
 		Backend: BackendName,
 		Data:    map[string]any{StateKeySnapshotKey: "k"},
 	})
-	if !errors.Is(err, sbx.ErrUnsupported) {
+	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("ApplyDelta without a base = %v, want ErrUnsupported", err)
 	}
 }
@@ -952,11 +949,11 @@ func TestApplyDelta_UnbasedDeltaIsUnsupported(t *testing.T) {
 func TestApplyDelta_CleanCaptureIsNoOp(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	afterCreate := len(tasks.allReqs)
-	err := sb.ApplyDelta(ctx, trace.WorkspaceState{
+	err := sb.ApplyDelta(ctx, WorkspaceState{
 		Backend: BackendName,
 		Data:    map[string]any{StateKeyDeltaBase: "basehead"},
 	})
@@ -973,11 +970,11 @@ func TestApplyDelta_CleanCaptureIsNoOp(t *testing.T) {
 func TestApplyDelta_AppliesPatchAndCleansUp(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	patch := base64.StdEncoding.EncodeToString([]byte("diff --git a/f b/f\n+child\n"))
-	delta := trace.WorkspaceState{
+	delta := WorkspaceState{
 		Backend: BackendName,
 		Data: map[string]any{
 			StateKeyDeltaBase:  "basehead",
@@ -1021,11 +1018,11 @@ func TestApplyDelta_ConflictRefusesWithPaths(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t, "abc")
 	tasks.mergeConflict = true
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	patch := base64.StdEncoding.EncodeToString([]byte("diff --git a/f.txt b/f.txt\n+child\n"))
-	err := sb.ApplyDelta(ctx, trace.WorkspaceState{
+	err := sb.ApplyDelta(ctx, WorkspaceState{
 		Backend: BackendName,
 		Data: map[string]any{
 			StateKeyDeltaBase:  "basehead",
@@ -1045,7 +1042,7 @@ func TestApplyDelta_ConflictRefusesWithPaths(t *testing.T) {
 func TestApplyDelta_BeforeCreateFails(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "")
 	patch := base64.StdEncoding.EncodeToString([]byte("diff --git a/f b/f\n+child\n"))
-	err := sb.ApplyDelta(context.Background(), trace.WorkspaceState{
+	err := sb.ApplyDelta(context.Background(), WorkspaceState{
 		Backend: BackendName,
 		Data: map[string]any{
 			StateKeyDeltaBase:  "basehead",
@@ -1081,7 +1078,7 @@ func TestCapture_BaseWithoutGitHeadFailsAndUnpins(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	applyBasedState(t, ctx, sb)
@@ -1110,7 +1107,7 @@ func TestCapture_DeltaFailureFailsAndUnpins(t *testing.T) {
 	sb.leases = fl
 	tasks.runErr["sh"] = errors.New("delta script boom")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	applyBasedState(t, ctx, sb)
@@ -1130,7 +1127,7 @@ func TestCapture_DeltaFailureFailsAndUnpins(t *testing.T) {
 func TestApply_StateWithoutGitHeadClearsBase(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	applyBasedState(t, ctx, sb)
@@ -1159,7 +1156,7 @@ func TestApply_StateWithoutGitHeadClearsBase(t *testing.T) {
 func TestCreate_ResetsBase(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	applyBasedState(t, ctx, sb)
@@ -1168,7 +1165,7 @@ func TestCreate_ResetsBase(t *testing.T) {
 	if err := sb.Destroy(ctx); err != nil {
 		t.Fatalf("Destroy before re-Create: %v", err)
 	}
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("re-Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -1187,7 +1184,7 @@ func TestCreate_ResetsBase(t *testing.T) {
 func TestCapture_ConcurrentWithApply(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t, "abc")
 	ctx := context.Background()
-	if err := sb.Create(ctx, sbx.SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)

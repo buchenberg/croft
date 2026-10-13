@@ -1,4 +1,4 @@
-package containerd
+package croft
 
 import (
 	"bytes"
@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	sbx "github.com/buchenberg/shepherd-kernel-go/sandbox"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
@@ -34,6 +33,10 @@ import (
 // be found again without in-process bookkeeping. That matters because Capture and
 // Apply replace the container on every generation, and because a crashed process
 // must not leave containers only it can find.
+//
+// The label value is an inherited identifier, kept verbatim so containers
+// created by this code's ancestors remain findable on the same daemon. Treat
+// it as a wire format, not branding.
 const sandboxLabel = "shepherd.sandbox"
 
 // defaultSnapshotter is containerd's overlayfs snapshotter. Other snapshotters
@@ -147,7 +150,7 @@ func (s *ContainerdSandbox) ensureLease(ctx context.Context) error {
 
 	lctx := namespaces.WithNamespace(ctx, namespaceOrDefault(s.cfg))
 	l, err := mgr.Create(lctx,
-		leases.WithID("shepherd-"+newSandboxID()),
+		leases.WithID("croft-"+newSandboxID()),
 		leases.WithLabels(map[string]string{sandboxLeaseLabel: "sandbox"}),
 	)
 	if err != nil {
@@ -202,6 +205,11 @@ func (s *ContainerdSandbox) releaseLease(ctx context.Context) error {
 // captured state with it, so states need a pin with a different lifetime. A
 // resource on this lease is exactly that: the daemon's GC treats a leased
 // snapshot as a root, the same mechanism the sandbox lease already relies on.
+//
+// The lease id is an inherited identifier, kept verbatim so states pinned by
+// this code's ancestors stay releasable: the pin lives on the lease this id
+// names, and a different id would orphan every one of them. Treat it as a
+// wire format, not branding.
 const statesLeaseID = "shepherd-states"
 
 // snapshotterName resolves the configured snapshotter plugin name, matching
@@ -629,11 +637,11 @@ func (t *containerdTasks) Running(ctx context.Context, id string) (bool, error) 
 }
 
 // Exec runs a command in the sandbox's current container generation.
-func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecRequest) (sbx.ExecResult, error) {
+func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) (ExecResult, error) {
 	// Rejected before any RPC: the process would start, block on a stdin that can
 	// never reach EOF, and cost the caller its whole context budget to find out.
 	if len(req.Stdin) > 0 {
-		return sbx.ExecResult{}, fmt.Errorf("%w: %s would block until the context "+
+		return ExecResult{}, fmt.Errorf("%w: %s would block until the context "+
 			"expires because the runc-v2 shim keeps a write end on the exec's stdin FIFO; "+
 			"pass data through arguments instead, as WriteFile does",
 			ErrStdinUnsupported, req.Command)
@@ -644,7 +652,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecReque
 
 	task, err := t.currentTask(ctx, id)
 	if err != nil {
-		return sbx.ExecResult{}, err
+		return ExecResult{}, err
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -673,7 +681,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecReque
 	)
 	proc, err := task.Exec(ctx, execID, spec, ioCreator)
 	if err != nil {
-		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, err)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, err)
 	}
 
 	// Wait returns a channel that receives exactly one status. Prefer the
@@ -681,7 +689,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecReque
 	statusCh, err := proc.Wait(ctx)
 	if err != nil {
 		_, _ = proc.Delete(context.WithoutCancel(ctx))
-		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: wait for %s: %w", req.Command, err)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: wait for %s: %w", req.Command, err)
 	}
 
 	// task.Exec only *creates* the process in the shim; Start is what runs it.
@@ -695,7 +703,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecReque
 	// which is why Create works while Exec does not.
 	if err := proc.Start(ctx); err != nil {
 		_, _ = proc.Delete(context.WithoutCancel(ctx))
-		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: start %s: %w", req.Command, err)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: start %s: %w", req.Command, err)
 	}
 
 	var status containerd.ExitStatus
@@ -704,7 +712,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecReque
 	case <-ctx.Done():
 		_ = proc.Kill(context.WithoutCancel(ctx), syscall.SIGKILL)
 		_, _ = proc.Delete(context.WithoutCancel(ctx))
-		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctx.Err())
+		return ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctx.Err())
 	}
 
 	// A cancelled context makes both branches ready at once: process.Wait
@@ -720,17 +728,17 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req sbx.ExecReque
 		// Prefer the context's own error: "context deadline exceeded" says more
 		// than the transport-level cancellation wrapped inside the status.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctxErr)
+			return ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, ctxErr)
 		}
-		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, statusErr)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: exec %s: %w", req.Command, statusErr)
 	}
 
 	// Always release the process, even when the command failed.
 	if _, delErr := proc.Delete(context.WithoutCancel(ctx)); delErr != nil {
-		return sbx.ExecResult{}, fmt.Errorf("containerd sandbox: release exec %s: %w", req.Command, delErr)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: release exec %s: %w", req.Command, delErr)
 	}
 
-	return sbx.ExecResult{
+	return ExecResult{
 		ExitCode: int(status.ExitCode()),
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
