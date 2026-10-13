@@ -13,13 +13,6 @@ the fakes cannot reach everything a real daemon does:
 
 ## What the live suite verifies
 
-- **Unprivileged operation.** Any user sharing only the containerd socket
-  group can start sandboxes: the init spec is built from the image config
-  blob read through the daemon's content store (env, working directory,
-  numeric `uid[:gid]`), never from the client process's filesystem, so the
-  daemon's 0700-root snapshot directories are never read. `Config.FIFODir`
-  gives the client's stdio FIFOs a user-writable directory for the same
-  reason.
 - **Delta merges.** `ApplyDelta` merges a captured delta onto a workspace
   that moved past the delta's base: `Apply` records the applied state's git
   HEAD as the sandbox's delta base, every `Capture` carries a git binary
@@ -31,11 +24,10 @@ the fakes cannot reach everything a real daemon does:
   namespace-scoped states lease that outlives any sandbox, `Destroy` removes
   only the sandbox's private active layer, and `ReleaseState` is the
   deliberate reclaim path — disk comes back when the caller says so, not
-  when a sandbox happens to die. The suite covers a *cold* daemon (fresh
-  namespace, no image) and the destroy-keeps-states sequence.
-- **Lifecycle and teardown.** Leases hold snapshots against the daemon's
-  garbage collector, Destroy does not leak containers, exec'd processes do
-  not outlive their tasks, and Diff never mutates the caller's git index.
+  when a sandbox happens to die. The destroy-keeps-states sequence (capture,
+  destroy, apply) is pinned live.
+- **Leases and non-mutation.** Leases hold snapshots against the daemon's
+  garbage collector, and Diff never mutates the caller's git index.
 
 ## Running the live suite
 
@@ -46,6 +38,17 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 
 A stock image and the overlayfs snapshotter suffice; the tests set `FIFODir`
 to a temp directory so a non-root client can drive the daemon.
+
+## Unprivileged operation
+
+Any user sharing only the containerd socket group can start sandboxes: the
+init spec is built from the image config blob read through the daemon's
+content store (env, working directory, numeric `uid[:gid]`), never from the
+client process's filesystem, so the daemon's 0700-root snapshot directories
+are never read, and `Config.FIFODir` gives the client's stdio FIFOs a
+user-writable directory. This is a design property of the daemon adapter,
+exercised by its construction paths — not something the live suite asserts,
+because that suite runs as root.
 
 ## Honesty notes
 
