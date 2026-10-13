@@ -54,9 +54,6 @@ const (
 	StateKeyParentKey = "parent_key"
 	// StateKeyImage is the image the sandbox was provisioned from.
 	StateKeyImage = "image"
-	// StateKeyGitHead is the in-container git HEAD at capture time, when the
-	// workspace is a git repository. Diff needs it as a baseline.
-	StateKeyGitHead = "git_head"
 )
 
 // ErrNotImplemented is returned when the containerd surface could not be
@@ -284,7 +281,7 @@ func (s *ContainerdSandbox) Capabilities() SandboxCapabilities {
 		Lifecycle: true,
 		Exec:      true,
 		FileIO:    true,
-		Diff:      true,
+		Diff:      false,
 		Isolated:  true,
 		// Namespaces plus a separate rootfs, but not a VM boundary: a kernel
 		// exploit escapes it, so this is not ContainFull.
@@ -645,95 +642,6 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 	return nil, chain
 }
 
-// diffNamesMarker separates Diff's two outputs inside one staging pass, so the
-// changed-file list and the unified diff always describe the same workspace
-// state. It is safe as a delimiter because git quotes paths containing control
-// characters, so no filename can produce a bare newline-wrapped marker line.
-const diffNamesMarker = "__croft_diff_names__"
-
-// diffScript stages the working tree into a throwaway index once, then prints
-// the changed file list followed by the unified diff, separated by
-// diffNamesMarker. $1 is the baseline commit.
-//
-// One exec rather than two. Calling this twice would stage twice, and a write to
-// the workspace between the two calls would make the returned file list and diff
-// describe different states — a race the earlier mutating implementation did not
-// have, because it staged once into the real index. This keeps both the
-// single-staging consistency and the non-mutation.
-//
-// This mirrors sandbox_git.go's stagedIndex: seed the scratch from the real
-// index when one exists, so git's stat cache survives and `git add -A` only
-// hashes what changed; otherwise fall back to read-tree, because an empty index
-// would report every tracked file as newly added. The real index is only ever
-// read, never written, which is what makes Diff non-mutating.
-//
-// mktemp -d gives the scratch a 0700 directory rather than a bare file in a
-// shared temp dir, and the trap removes it even when a command fails.
-var diffScript = `set -e
-head=$1
-dir=$(mktemp -d)
-trap 'rm -rf -- "$dir"' EXIT
-export GIT_INDEX_FILE="$dir/index"
-if [ -f .git/index ]; then
-  cp -- .git/index "$GIT_INDEX_FILE"
-elif git rev-parse --verify -q HEAD >/dev/null 2>&1; then
-  git read-tree HEAD
-fi
-git add -A
-git diff --cached --name-only "$head"
-printf '\n` + diffNamesMarker + `\n'
-git diff --cached "$head"`
-
-// Diff returns the unified diff and changed file paths between ws and the
-// current workspace, using the in-container git repository.
-//
-// Non-mutating: staging happens in a scratch GIT_INDEX_FILE (diffScript), so a
-// caller's pre-staged changes survive the call, as the Sandbox contract in
-// sandbox.go requires. This used to stage with `git add -A` and unwind with
-// `git reset`, which restored the index to HEAD rather than to the state it was
-// found in and silently dropped the caller's staged work. Fixed 2026-10-05 and
-// pinned by TestLive_DiffPreservesPreStagedChanges.
-//
-// Both outputs come from one staging pass, so they cannot describe different
-// workspace states. See diffScript; pinned by TestDiff_StagesOncePerCall.
-func (s *ContainerdSandbox) Diff(ctx context.Context, ws WorkspaceState, maxLines int) (string, []string, error) {
-	if _, err := stateSnapshotKey(ws); err != nil {
-		return "", nil, err
-	}
-	head, _ := ws.Data[StateKeyGitHead].(string)
-	if head == "" {
-		return "", nil, fmt.Errorf("containerd sandbox: diff needs a git workspace; state has no %q", StateKeyGitHead)
-	}
-
-	s.mu.Lock()
-	id := s.id
-	s.mu.Unlock()
-	if id == "" {
-		return "", nil, fmt.Errorf("containerd sandbox: Diff before Create")
-	}
-
-	res, err := s.shell(ctx, diffScript, head)
-	if err != nil {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: %w", err)
-	}
-	namesPart, full, ok := strings.Cut(res.Stdout, "\n"+diffNamesMarker+"\n")
-	if !ok {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: output has no %q separator, so the "+
-			"file list and the diff cannot be told apart", diffNamesMarker)
-	}
-	var files []string
-	if trimmed := strings.TrimSpace(namesPart); trimmed != "" {
-		files = strings.Split(trimmed, "\n")
-	}
-	if maxLines > 0 {
-		lines := strings.Split(full, "\n")
-		if len(lines) > maxLines {
-			full = strings.Join(lines[:maxLines], "\n") + "\n...[diff truncated]"
-		}
-	}
-	return full, files, nil
-}
-
 // Exec runs a command inside the sandbox.
 func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResult, error) {
 	if err := s.requireBackend(ctx); err != nil {
@@ -863,32 +771,6 @@ func (s *ContainerdSandbox) parentKeyLocked() string {
 // fails midway with the task already stopped.
 func (s *ContainerdSandbox) restart(ctx context.Context, id, activeKey string) error {
 	return s.tasks.StartTask(ctx, id, activeKey)
-}
-
-// gitHead returns the workspace's git HEAD, or "" when it is not a repository.
-func (s *ContainerdSandbox) gitHead(ctx context.Context, id string) (string, error) {
-	out, err := s.run(ctx, id, "git", "rev-parse", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
-}
-
-// run executes a command with the workspace as its working directory.
-func (s *ContainerdSandbox) run(ctx context.Context, id, command string, args ...string) (string, error) {
-	res, err := s.tasks.Exec(ctx, id, ExecRequest{
-		Command: command,
-		Args:    args,
-		Cwd:     s.cfg.workdir(),
-	})
-	if err != nil {
-		return "", err
-	}
-	if res.ExitCode != 0 {
-		return res.Stdout, fmt.Errorf("%s %s: exit %d: %s",
-			command, strings.Join(args, " "), res.ExitCode, strings.TrimSpace(res.Stderr))
-	}
-	return res.Stdout, nil
 }
 
 // shell runs a POSIX shell script with positional arguments.

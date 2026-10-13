@@ -300,26 +300,6 @@ func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) Works
 	return state
 }
 
-// bootstrapGit seeds a committed git repository in the workdir.
-//
-// Capture records StateKeyGitHead only when the workdir is a repository, and
-// Diff needs that baseline — without a commit, Diff returns an error instead of
-// a diff. Create provisions the workdir itself (finding F1), so this does not
-// have to.
-//
-// git identity is set explicitly because alpine/git ships none, and a commit
-// without it fails.
-func bootstrapGit(t *testing.T, ctx context.Context, sb *ContainerdSandbox, workdir string) {
-	t.Helper()
-
-	mustExec(t, ctx, sb, workdir, "git", "init", "-q", ".")
-	mustExec(t, ctx, sb, workdir, "git", "config", "user.email", "croft-live@test.invalid")
-	mustExec(t, ctx, sb, workdir, "git", "config", "user.name", "croft-live")
-	mustExec(t, ctx, sb, workdir, "sh", "-c", "printf 'baseline\\n' > base.txt")
-	mustExec(t, ctx, sb, workdir, "git", "add", "-A")
-	mustExec(t, ctx, sb, workdir, "git", "commit", "-q", "-m", "baseline")
-}
-
 // TestLive_FullLifecycle is the acceptance sequence from plan 05 §3: create
 // from a public image, write, capture, mutate, apply, verify the rollback,
 // exec, diff, destroy.
@@ -344,8 +324,6 @@ func TestLive_FullLifecycle(t *testing.T) {
 	if got := sb.Backend(); got != BackendName {
 		t.Errorf("Backend() = %q, want %q", got, BackendName)
 	}
-
-	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
 	// File I/O round-trip. Paths are relative on purpose, so this also covers
 	// resolve() against the configured workdir.
@@ -377,11 +355,6 @@ func TestLive_FullLifecycle(t *testing.T) {
 	if state.Revision == "" {
 		t.Error("state.Revision is empty")
 	}
-	if head, _ := state.Data[StateKeyGitHead].(string); head == "" {
-		t.Errorf("state.Data[%q] is empty: Capture must record the in-container git HEAD "+
-			"when the workdir is a repository, or Diff has no baseline", StateKeyGitHead)
-	}
-
 	// Mutate, confirm the mutation is really on the new layer, then roll back.
 	const mutated = "mutated after capture\n"
 	if err := sb.WriteFile(ctx, "live.txt", []byte(mutated), 0o644); err != nil {
@@ -447,30 +420,6 @@ func TestLive_FullLifecycle(t *testing.T) {
 	}
 	if failed.ExitCode != 7 {
 		t.Errorf("Exec exit = %d, want 7", failed.ExitCode)
-	}
-
-	// Diff against the captured state, with a change made after it.
-	if err := sb.WriteFile(ctx, "changed.txt", []byte("added after capture\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile (for diff): %v", err)
-	}
-	diff, files, err := sb.Diff(ctx, state, 0)
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if len(files) == 0 {
-		t.Error("Diff reported no changed files")
-	}
-	var found bool
-	for _, f := range files {
-		if strings.TrimSpace(f) == "changed.txt" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Diff files = %v, want it to include changed.txt", files)
-	}
-	if !strings.Contains(diff, "changed.txt") {
-		t.Errorf("Diff output does not mention changed.txt:\n%s", diff)
 	}
 
 	// Destroy runs again in cleanup; it is idempotent, so this only asserts the
@@ -589,7 +538,6 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	bootstrapGit(t, ctx, sb, cfg.Workdir)
 	if err := sb.WriteFile(ctx, "layer.txt", []byte("forces a committed layer\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -683,65 +631,6 @@ func leaseHoldsSnapshot(t *testing.T, svc leases.Manager, ctx context.Context, k
 		}
 	}
 	return false
-}
-
-// TestLive_DiffPreservesPreStagedChanges is the regression test for the Sandbox
-// non-mutating contract: a caller's staged-but-uncommitted work must survive a
-// Diff, and Diff must still report the change it was asked about.
-//
-// Diff used to stage with `git add -A` and unwind with `git reset`, which
-// restored the index to HEAD rather than to the state it was found in. A live
-// run on 2026-10-05 confirmed the loss — the index held staged.txt before Diff
-// and was empty after. It now stages into a scratch GIT_INDEX_FILE the way
-// sandbox_git.go's stagedIndex does, so the real index is only ever read.
-func TestLive_DiffPreservesPreStagedChanges(t *testing.T) {
-	cfg := loadLiveConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
-	defer cancel()
-
-	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	bootstrapGit(t, ctx, sb, cfg.Workdir)
-
-	state := captureLive(t, ctx, sb)
-
-	// Stage a change without committing, as a caller legitimately might.
-	mustExec(t, ctx, sb, cfg.Workdir, "sh", "-c", "printf 'staged by caller\\n' > staged.txt")
-	mustExec(t, ctx, sb, cfg.Workdir, "git", "add", "staged.txt")
-
-	stagedBefore := strings.TrimSpace(mustExec(t, ctx, sb, cfg.Workdir, "git", "diff", "--cached", "--name-only"))
-	if !strings.Contains(stagedBefore, "staged.txt") {
-		t.Fatalf("setup failed: staged.txt is not in the index before Diff (got %q)", stagedBefore)
-	}
-
-	diff, files, err := sb.Diff(ctx, state, 0)
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-
-	// The contract under test: the caller's index is exactly as it was found.
-	stagedAfter := strings.TrimSpace(mustExec(t, ctx, sb, cfg.Workdir, "git", "diff", "--cached", "--name-only"))
-	if stagedAfter != stagedBefore {
-		t.Errorf("Diff mutated the caller's index: staged before=%q, after=%q", stagedBefore, stagedAfter)
-	}
-
-	// And Diff still reports the change it was asked about — a scratch index that
-	// preserved the caller's state but staged nothing would pass the check above
-	// while returning an empty diff.
-	var found bool
-	for _, f := range files {
-		if strings.TrimSpace(f) == "staged.txt" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Diff files = %v, want it to include staged.txt", files)
-	}
-	if !strings.Contains(diff, "staged.txt") {
-		t.Errorf("Diff output does not mention staged.txt:\n%s", diff)
-	}
 }
 
 // TestLive_ExecRejectsStdin pins that Exec refuses a non-empty

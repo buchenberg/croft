@@ -43,11 +43,9 @@
 //
 // # The image contract
 //
-// Diff and ApplyDelta run git inside the container, so the image must provide
-// sh, stat, GNU find, and git; a workspace that is not a git repository simply
-// cannot be diffed or merged semantically and degrades to snapshot-only
-// states. Hosts should probe the image for this contract before selecting the
-// backend.
+// The workspace's file operations shell out inside the container, so the
+// image must provide a shell and the small coreutils they use (see the
+// README for the exact list).
 //
 // # Status
 //
@@ -215,11 +213,6 @@ type Sandbox interface {
 	// this sandbox. Layers created after the applied state survive as
 	// states; reclaim them with ReleaseState.
 	Apply(ctx context.Context, ws WorkspaceState) error
-
-	// Diff returns the unified diff and changed file paths between ws and
-	// the current workspace, using the in-container git repository. Requires
-	// the image contract's git. maxLines <= 0 means unbounded. Non-mutating.
-	Diff(ctx context.Context, ws WorkspaceState, maxLines int) (diff string, files []string, err error)
 
 	// Exec runs a command in the sandbox and returns its result.
 	Exec(ctx context.Context, req ExecRequest) (ExecResult, error)

@@ -21,7 +21,7 @@ func opVerbs(ops []string) []string {
 }
 
 func TestContainerdSandbox_Backend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	if got := sb.Backend(); got != BackendName {
 		t.Errorf("Backend() = %q, want %q", got, BackendName)
 	}
@@ -31,7 +31,7 @@ func TestContainerdSandbox_Backend(t *testing.T) {
 // values callers branch on, so a false here would make the operation unavailable
 // even though it is implemented.
 func TestContainerdSandbox_Capabilities(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	caps := sb.Capabilities()
 
 	if !caps.Lifecycle {
@@ -43,9 +43,6 @@ func TestContainerdSandbox_Capabilities(t *testing.T) {
 	if !caps.FileIO {
 		t.Error("FileIO must be true")
 	}
-	if !caps.Diff {
-		t.Error("Diff must be true")
-	}
 	if !caps.Isolated {
 		t.Error("Isolated must be true: the workspace is not the host filesystem")
 	}
@@ -56,7 +53,7 @@ func TestContainerdSandbox_Capabilities(t *testing.T) {
 }
 
 func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
-	sb, snap, tasks, log := newTestSandbox(t, "")
+	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
@@ -83,7 +80,7 @@ func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 // operation fails with a chdir error that reads as a broken sandbox rather than
 // a missing directory.
 func TestCreate_ProvisionsWorkdir(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -131,7 +128,7 @@ func TestCreate_ValidatesImage(t *testing.T) {
 // snapshotter rejects writes to committed layers and the fake task service writes
 // on every Exec, so skipping the stop makes this test fail.
 func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
-	sb, snap, tasks, log := newTestSandbox(t, "abc123")
+	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
@@ -174,7 +171,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 }
 
 func TestCapture_RepeatedCapturesChain(t *testing.T) {
-	sb, snap, _, _ := newTestSandbox(t, "abc")
+	sb, snap, _, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -205,7 +202,7 @@ func TestCapture_RepeatedCapturesChain(t *testing.T) {
 }
 
 func TestCapture_BeforeCreateFails(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	if _, err := sb.Capture(context.Background()); err == nil {
 		t.Fatal("Capture before Create must fail")
 	}
@@ -217,7 +214,7 @@ func TestCapture_BeforeCreateFails(t *testing.T) {
 // and must survive — a caller may Apply one long after Destroy, and the kernel
 // contract says states have no lifecycle.
 func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
-	sb, snap, tasks, log := newTestSandbox(t, "abc")
+	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -283,7 +280,7 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 // TestDestroy_IsIdempotent pins the contract the kernel relies on: Discard,
 // Merge, and Halt may all call Destroy, and a second call must not error.
 func TestDestroy_IsIdempotent(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -295,7 +292,7 @@ func TestDestroy_IsIdempotent(t *testing.T) {
 		t.Errorf("second Destroy = %v, want nil", err)
 	}
 	// Destroy on a never-created sandbox is also fine.
-	fresh, _, _, _ := newTestSandbox(t, "")
+	fresh, _, _, _ := newTestSandbox(t)
 	if err := fresh.Destroy(ctx); err != nil {
 		t.Errorf("Destroy on unused sandbox = %v, want nil", err)
 	}
@@ -306,7 +303,7 @@ func TestDestroy_IsIdempotent(t *testing.T) {
 // and states have no lifecycle. Disk comes back through ReleaseState, not by
 // Apply deciding a state is garbage on the caller's behalf.
 func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
-	sb, snap, _, _ := newTestSandbox(t, "abc")
+	sb, snap, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
@@ -358,7 +355,7 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 }
 
 func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
-	sb, _, tasks, log := newTestSandbox(t, "abc")
+	sb, _, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -387,7 +384,7 @@ func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
 }
 
 func TestApply_RejectsForeignBackend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	err := sb.Apply(context.Background(), WorkspaceState{Backend: "git"})
 	if err == nil {
 		t.Fatal("Apply must reject a git workspace state")
@@ -398,7 +395,7 @@ func TestApply_RejectsForeignBackend(t *testing.T) {
 }
 
 func TestExec_BeforeCreateFails(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	if _, err := sb.Exec(context.Background(), ExecRequest{Command: "true"}); err == nil {
 		t.Fatal("Exec before Create must fail")
 	}
@@ -407,7 +404,7 @@ func TestExec_BeforeCreateFails(t *testing.T) {
 // TestReadFile_PassesPathAsPositionalArgument pins the injection defence: the
 // path must never be interpolated into the shell script.
 func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -449,7 +446,7 @@ func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 // end on an exec's stdin FIFO for the process's lifetime, so a stdin reader
 // never sees EOF and depending on one hangs until the context expires.
 func TestWriteFile_EncodesContentInArgs(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -571,7 +568,7 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 // zero bytes must still create the file rather than being a no-op, so a caller
 // clearing a file gets the same result as writing content.
 func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -698,7 +695,7 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 // it. Errors are expected and ignored — the point is that -race sees the
 // unsynchronized read, not lifecycle success.
 func TestCapture_ConcurrentWithApply(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
+	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -707,7 +704,6 @@ func TestCapture_ConcurrentWithApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	state.Data[StateKeyGitHead] = "basehead"
 
 	var wg sync.WaitGroup
 	wg.Add(2)

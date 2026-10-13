@@ -211,7 +211,7 @@ func TestLeaseRef_SetGetClear(t *testing.T) {
 }
 
 func TestEnsureLease_CreatesOnceAndLabelsIt(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 
@@ -241,7 +241,7 @@ func TestEnsureLease_CreatesOnceAndLabelsIt(t *testing.T) {
 }
 
 func TestEnsureLease_NoManagerIsNoop(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	// The default test wiring installs a fake manager; clear it to exercise
 	// the no-manager path.
 	sb.leases = nil
@@ -254,7 +254,7 @@ func TestEnsureLease_NoManagerIsNoop(t *testing.T) {
 }
 
 func TestEnsureLease_PropagatesFailure(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = &fakeLeases{createErr: errors.New("boom")}
 
 	err := sb.ensureLease(context.Background())
@@ -267,7 +267,7 @@ func TestEnsureLease_PropagatesFailure(t *testing.T) {
 }
 
 func TestReleaseLease_DeletesOnceAndClears(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	sb.lease.set("lease-1")
@@ -293,7 +293,7 @@ func TestReleaseLease_DeletesOnceAndClears(t *testing.T) {
 }
 
 func TestReleaseLease_ToleratesAlreadyDeleted(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = &fakeLeases{deleteErr: fmt.Errorf("lease gone: %w", errdefs.ErrNotFound)}
 	sb.lease.set("gone")
 
@@ -303,7 +303,7 @@ func TestReleaseLease_ToleratesAlreadyDeleted(t *testing.T) {
 }
 
 func TestReleaseLease_PropagatesRealFailure(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = &fakeLeases{deleteErr: errors.New("daemon down")}
 	sb.lease.set("lease-1")
 
@@ -317,7 +317,7 @@ func TestReleaseLease_PropagatesRealFailure(t *testing.T) {
 // re-leases itself. Destroy drops the lease, so without ensureLease running on
 // every Create a second generation would silently run unprotected.
 func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
@@ -359,7 +359,7 @@ func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
 // pinning this sandbox's snapshots against the GC for good, which is the failure
 // the lease exists to prevent.
 func TestEnsureLease_ConcurrentCallsCreateOneLease(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 
@@ -399,7 +399,7 @@ func TestEnsureLease_ConcurrentCallsCreateOneLease(t *testing.T) {
 // failure leaves the id in place. Discarding it would make a later Destroy
 // report success while the orphaned lease keeps snapshots pinned forever.
 func TestReleaseLease_FailedDeleteKeepsTheIDForRetry(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{deleteErr: errors.New("daemon unavailable")}
 	sb.leases = fl
 	sb.lease.set("lease-1")
@@ -434,7 +434,7 @@ func TestReleaseLease_FailedDeleteKeepsTheIDForRetry(t *testing.T) {
 // Create runs in a goroutine so a regression fails on the deadline instead of
 // hanging the suite.
 func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = &fakeLeases{createBlocks: true}
 
 	done := make(chan error, 1)
@@ -463,7 +463,7 @@ func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
 // shared states lease, and that lease must be adopted (not duplicated) by later
 // captures and sibling sandboxes.
 func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
@@ -519,7 +519,7 @@ func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
 // forward onto the committed layer as an internal layer: the sandbox stays
 // usable and no half-state is handed out.
 func TestCapture_PinFailureRollsForwardNotOut(t *testing.T) {
-	sb, snap, tasks, _ := newTestSandbox(t, "abc")
+	sb, snap, tasks, _ := newTestSandbox(t)
 	fl := &fakeLeases{addResErr: errors.New("lease service unavailable")}
 	sb.leases = fl
 	ctx := context.Background()
@@ -586,7 +586,7 @@ func (f *failingStartTask) StartTask(ctx context.Context, id, key string) error 
 // call error removing it; instead the sandbox reports itself stopped and
 // Destroy succeeds in one call.
 func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
-	sb, snap, _, _ := newTestSandbox(t, "abc")
+	sb, snap, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	tasks := &failingStartTask{taskService: sb.tasks}
@@ -637,7 +637,7 @@ func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
 // removes exactly the state's resource, stays idempotent, and tolerates a
 // resource the daemon already reclaimed — while a real failure surfaces.
 func TestReleaseState_DropsTheStatesLeasePin(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
@@ -682,7 +682,7 @@ func TestReleaseState_DropsTheStatesLeasePin(t *testing.T) {
 // git backend's state must never reach the containerd lease manager, and a
 // containerd state without a snapshot key is a bug, not a no-op.
 func TestReleaseState_RejectsForeignAndIncompleteStates(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
@@ -703,7 +703,7 @@ func TestReleaseState_RejectsForeignAndIncompleteStates(t *testing.T) {
 // manager configured there is nothing to unpin, and ReleaseState must say so
 // quietly rather than failing.
 func TestReleaseState_NoManagerIsNoop(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
+	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = nil
 	ctx := context.Background()
 	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
