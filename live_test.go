@@ -533,6 +533,42 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	}
 }
 
+// TestLive_ApplyAfterDestroyRecyclesState pins the recycle path: a captured
+// state re-provisions a sandbox after the capturing sandbox's Destroy. This is
+// the acceptance sequence the substrate integration used to carry (write,
+// capture, destroy, apply, verify) — the durability contract made observable:
+// states outlive sandboxes, and an Apply after Destroy proves it end to end.
+func TestLive_ApplyAfterDestroyRecyclesState(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	sb := newLiveSandbox(t, ctx, cfg)
+	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	content := "written before the capture\n"
+	if err := sb.WriteFile(ctx, "recycle.txt", []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// captureLive registers the state's release with cleanup: the pin must
+	// outlive Destroy — that is what this test proves — but not the test.
+	state := captureLive(t, ctx, sb)
+	if err := sb.Destroy(ctx); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if err := sb.Apply(ctx, state); err != nil {
+		t.Fatalf("Apply after Destroy: %v", err)
+	}
+	after, err := sb.ReadFile(ctx, "recycle.txt")
+	if err != nil {
+		t.Fatalf("ReadFile after recycle: %v", err)
+	}
+	if string(after) != content {
+		t.Errorf("file after recycle = %q, want %q — the captured state and the pre-capture write disagree", after, content)
+	}
+}
+
 // TestLive_DestroyRemovesActiveLayerKeepsStates verifies teardown against the
 // real snapshotter under the state-durability contract: the active layer is the
 // sandbox's private writable layer and must be gone after Destroy, while the

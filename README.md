@@ -70,19 +70,22 @@ client-side FIFO directory (set the last to a user-writable path to drive
 containerd without root). See `Config` in `croft.go` for the full contract of
 each field.
 
-## Compatibility and provenance
+## State format
 
-Croft was extracted from the `sandbox/containerd` nested module of
-[shepherd-kernel-go](https://github.com/buchenberg/shepherd-kernel-go) (its
-v0.1.x–v0.2.x history is preserved here) and now defines its own interface,
-types, and state format. It is a clean break: croft uses its own snapshot key
-prefix (`croft/…`), lease and container labels (`croft.*`), states lease
-(`croft-states`), and digest version (`croft.state.canonical.v1`). States,
-leases, and snapshots created by the old module are not interchangeable with
-croft's, and its digests are not comparable with other ecosystems'
-workspace-state formats. `WorkspaceState` data keys (`snapshot_key`,
-`parent_key`, `image`, `git_head`, `delta_base`, `delta_patch`) and the
-backend identifier (`"containerd"`) are unchanged in shape and meaning.
+The state format is croft's own, and it is not comparable with other
+ecosystems' workspace-state formats. The pieces:
+
+- `WorkspaceState` data keys. Always present: `snapshot_key`, `parent_key`,
+  `image`. Conditional: `git_head` only when the workspace is a git
+  repository, `delta_base` only once a state carrying a git HEAD has been
+  applied, `delta_patch` only when that range has changes — a state without
+  them is valid, and consumers must not reject it for lacking them.
+- Snapshot keys use the `croft/` prefix; leases and containers are labeled
+  `croft.lease` and `croft.sandbox`; the states lease is `croft-states`;
+  the digest version is `croft.state.canonical.v1`.
+- The backend identifier is `"containerd"` — the technology, not a brand:
+  hosts' config strings and recorded states name the backend, and croft
+  reports it.
 
 Known gap, inherited and recorded: a state's identity is its sequence-derived
 snapshot key, so two captures of identical content produce different digests.
@@ -101,6 +104,8 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 ```
 
 Croft has no dependencies beyond containerd and the Go standard library.
+What the live suite verifies, and how to run it against a real daemon, is in
+[docs/verification.md](docs/verification.md).
 
 ## License
 
