@@ -12,7 +12,9 @@ boundaries.
 | 2 — Snapshot-native diff | [snapshot-native-diff.md](snapshot-native-diff.md) | croft v0.4.0 |
 | 3 — Snapshot-native delta | [snapshot-native-delta.md](snapshot-native-delta.md) | croft v0.4.0 |
 | 4 — Exec I/O | [exec-io.md](exec-io.md) | croft v0.5.0 |
-| 5 — MCP broker | [multi-tenant-sandbox-broker.md](multi-tenant-sandbox-broker.md) | croft-broker v0.1.0+ |
+| 5 — Network policy | [network-policy.md](network-policy.md) | croft v0.6.0 |
+| 6 — Secrets delivery | [secrets-delivery.md](secrets-delivery.md) | croft v0.7.0 |
+| 7 — MCP broker | [multi-tenant-sandbox-broker.md](multi-tenant-sandbox-broker.md) | croft-broker v0.1.0+ |
 
 The architectural-review remediation plan is superseded by phase 1; its
 surviving items are folded in there and the original is archived in
@@ -89,26 +91,50 @@ The single most important authorization rule survives the remap verbatim: no
 tool accepts raw `WorkspaceState` JSON from a client; handles are broker IDs
 the broker recorded (D3).
 
+### D6 — The network default stays `host`
+
+Phases 4–6 deliberately change no default behavior: workspaces without
+`Config.Network` set keep the host's network exactly as today (agents need
+package installs and git remotes), and `none` is the opt-in off-switch. The
+default being a footgun for generated-code workloads is a documentation
+problem — the README says what `host` means — not a breaking change.
+Controlled egress is follow-on work, not a phase.
+
+### D7 — Secrets are files, not a vault
+
+Secret delivery is bind-mounted host files (never env — `/proc/*/environ`
+leaks it; never argv — `/proc/*/cmdline` leaks it), and croft stops there:
+no encryption, rotation, issuance, or audit. The broker owns a 0600
+per-tenant directory and maps credentials into mounts; vault integration is
+a host concern. The same ruling extends to the argv-free write path: it is
+exposure control, not secrecy.
+
 ## Sequencing and parallelism
 
 ```
-Phase 1 lean ──► Phase 2 diff ──► Phase 3 delta ──► croft v0.4.0 tag
-      │                                                 │
-      │                                                 └──► Phase 4 exec I/O ──► croft v0.5.0 tag
+Phase 1 lean ──► Phase 2 diff ──► Phase 3 delta ──► v0.4.0
+      │                                            │
+      │                                            └──► Phase 4 exec I/O ──► v0.5.0
+      │                                                       │
+      │                                                       ├──► Phase 5 network ──► v0.6.0
+      │                                                       └──► Phase 6 secrets ──► v0.7.0
       │
       └──► broker Phase 0 spike (MCP over lean surface)     [croft-broker repo]
       └──► Config.Limits upstream PR (D2) ─► broker Phases 1–3
-                                            broker tools for diff/delta
-                                            unlock as phases 2–3 land;
                                             broker v0.1.0 pins croft v0.5.0
-                                            and drops its output-cap shim
-                                            for Config.MaxOutputBytes
+                                            (output caps become
+                                            Config.MaxOutputBytes);
+                                            network posture and secret
+                                            mounts (phases 5–6) unlock the
+                                            broker's tenant-isolation and
+                                            credentials features in v0.2.0
 ```
 
 - Phases 1→2→3 are strictly sequential in the library (each plan's Part 0
-  assumes exactly this order); phase 4 (exec I/O) follows the v0.4.0 tag and
-  touches none of the diff/delta machinery, so it could also run in parallel
-  with phase 2 or 3 if that is ever worth the merge traffic.
+  assumes exactly this order); phases 4–6 each follow the v0.4.0 tag, touch
+  none of the diff/delta machinery, and are independent of one another —
+  they can land in any order or interleaved, whichever the release train
+  prefers.
 - The broker Phase 0 spike (one sandbox over MCP, in-memory registry) needs
   only the lean surface and can start the moment phase 1 lands.
 - `Config.Limits` (D2) and the other upstream extensions (state enumeration,
@@ -157,10 +183,45 @@ yaah, not here. Long term, an open question below.
 - **v0.5.0 tag**: the exec I/O plan's live set — stdin-as-data, the
   truncation marker, and both background-process tests (survives-exec and
   dies-at-Capture) — green against a real daemon.
+- **v0.6.0 tag**: both network tests green (`lo`-only under `none`; the
+  honest host-interface listing under the default).
+- **v0.7.0 tag**: the secrets live set green, and the fake's recorded exec
+  log for a staging write contains no base64 payload — the exposure-closure
+  assertion.
 - **Broker v0.1.0**: its plan's §11 phase-2 exit criteria (parked sandbox
   resumes with an identical workspace; cross-tenant apply/apply_delta/release
   rejected in tests; the reaper survives broker restart), plus the chaos test
   (kill broker mid-capture, restart, workspace resumable).
+
+## Follow-on work
+
+Recognized gaps with no phase yet — recorded so they are choices, not
+surprises. Each gets a plan only when a consumer hits it; none block v0.4.0
+through v0.7.0 or the broker's v0.1.0.
+
+- **State portability / multi-host** — states are pinned layers on one
+  daemon; no export, import, or migration, and the broker is a single
+  process against a single daemon. Cross-host workspaces and broker
+  sharding are the gap; a state-archive format (layer chain exported as OCI
+  artifacts) is the likely shape when fleet use arrives.
+- **Directory API** — `ListDir`/`Glob` on the `Sandbox` interface; today
+  consumers shell out via exec. Cheap filler, and the broker's tools are the
+  natural first consumer (`list_files` maps to it).
+- **Line-level merge** — the delta plan's accepted tree-level-only tradeoff;
+  the follow-up exists as a scoped future plan there. Trigger: yaah's
+  apply-out hits divergent same-file edits in practice.
+- **Streaming output** — bounded-but-buffered is v0.5.0's answer; chunked
+  exec output (callback or reader session) is API design on plumbing that
+  already streams. Trigger: a consumer tailing long builds live.
+- **Controlled egress** — the network phase's deliberate boundary: an
+  egress proxy or allowlist story short of CNI machinery. Trigger: a tenant
+  needs exactly-one-registry-reachable workspaces.
+- **`MaxDiffBytes`/`MaxDeltaBytes`** — blob-cost ceilings, documented risks
+  until a host hits the ceiling.
+
+Permanent scope boundaries (not follow-on work, not open questions):
+process-preserving capture (exec I/O plan), env-based secrets (secrets
+plan), non-Linux runtimes (the README's platform statement).
 
 ## Open questions
 
