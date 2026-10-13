@@ -24,8 +24,10 @@ the fakes cannot reach everything a real daemon does:
   namespace-scoped states lease that outlives any sandbox, `Destroy` removes
   only the sandbox's private active layer, and `ReleaseState` is the
   deliberate reclaim path — disk comes back when the caller says so, not
-  when a sandbox happens to die. The destroy-keeps-states sequence (capture,
-  destroy, apply) is pinned live.
+  when a sandbox happens to die. The recycle path — capture, destroy, then
+  apply the captured state, and the pre-capture write is present in the
+  re-provisioned workspace — is pinned live
+  (`TestLive_ApplyAfterDestroyRecyclesState`).
 - **Leases and non-mutation.** Leases hold snapshots against the daemon's
   garbage collector, and Diff never mutates the caller's git index.
 
@@ -36,8 +38,10 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
   go test -count=1 -v -run TestLive ./...
 ```
 
-A stock image and the overlayfs snapshotter suffice; the tests set `FIFODir`
-to a temp directory so a non-root client can drive the daemon.
+A stock image and the overlayfs snapshotter suffice. The suite runs as root
+(the daemon socket usually requires it); the tests set `FIFODir` to a temp
+directory because the default is a root-owned path the client writes to
+locally — see "Unprivileged operation" for driving the daemon without root.
 
 ## Unprivileged operation
 
