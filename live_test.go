@@ -533,17 +533,6 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	}
 }
 
-// TestLive_DestroyRemovesActiveLayerKeepsStates verifies teardown against the
-// real snapshotter under the state-durability contract: the active layer is the
-// sandbox's private writable layer and must be gone after Destroy, while the
-// committed layer backing a captured state must survive — a caller may Apply it
-// long after this sandbox is gone. Survival is asserted twice, structurally
-// (the snapshot still exists) and mechanically (the states lease still holds
-// its pin), and ReleaseState is exercised as the reclaim path.
-//
-// Layer-removal ordering is no longer Destroy's concern: committed layers can
-// have children (later captures, sibling forks), so reaping them children-first
-// is the daemon GC's job once ReleaseState drops the pins.
 // TestLive_ApplyAfterDestroyRecyclesState pins the recycle path: a captured
 // state re-provisions a sandbox after the capturing sandbox's Destroy. This is
 // the acceptance sequence the substrate integration used to carry (write,
@@ -579,6 +568,18 @@ func TestLive_ApplyAfterDestroyRecyclesState(t *testing.T) {
 		t.Errorf("file after recycle = %q, want %q — the captured state and the pre-capture write disagree", after, content)
 	}
 }
+
+// TestLive_DestroyRemovesActiveLayerKeepsStates verifies teardown against the
+// real snapshotter under the state-durability contract: the active layer is the
+// sandbox's private writable layer and must be gone after Destroy, while the
+// committed layer backing a captured state must survive — a caller may Apply it
+// long after this sandbox is gone. Survival is asserted twice, structurally
+// (the snapshot still exists) and mechanically (the states lease still holds
+// its pin), and ReleaseState is exercised as the reclaim path.
+//
+// Layer-removal ordering is no longer Destroy's concern: committed layers can
+// have children (later captures, sibling forks), so reaping them children-first
+// is the daemon GC's job once ReleaseState drops the pins.
 
 func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	cfg := loadLiveConfig(t)

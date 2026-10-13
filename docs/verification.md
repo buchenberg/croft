@@ -5,9 +5,10 @@ the fakes cannot reach everything a real daemon does:
 
 - **Unit suite** — runs against containerd's real `snapshots.Snapshotter`
   interface using an in-memory fake that enforces the overlayfs invariants: a
-  key cannot be prepared twice, a parent must be committed, only a committed
-  layer can be committed once, a committed layer is read-only, and a layer
-  with children cannot be removed.
+  key cannot be prepared twice, a parent must be committed, only an active
+  layer can be committed (exactly once — an already committed layer is
+  rejected), a committed layer is read-only, and a layer with children
+  cannot be removed.
 - **Live suite** — the whole lifecycle against a real daemon, env-gated so
   `go test ./...` stays green without one.
 

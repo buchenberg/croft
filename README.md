@@ -75,8 +75,11 @@ each field.
 The state format is croft's own, and it is not comparable with other
 ecosystems' workspace-state formats. The pieces:
 
-- `WorkspaceState` data keys: `snapshot_key`, `parent_key`, `image`,
-  `git_head`, `delta_base`, `delta_patch`.
+- `WorkspaceState` data keys. Always present: `snapshot_key`, `parent_key`,
+  `image`. Conditional: `git_head` only when the workspace is a git
+  repository, `delta_base` only once a state carrying a git HEAD has been
+  applied, `delta_patch` only when that range has changes — a state without
+  them is valid, and consumers must not reject it for lacking them.
 - Snapshot keys use the `croft/` prefix; leases and containers are labeled
   `croft.lease` and `croft.sandbox`; the states lease is `croft-states`;
   the digest version is `croft.state.canonical.v1`.
@@ -101,7 +104,7 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 ```
 
 Croft has no dependencies beyond containerd and the Go standard library.
-The live harness's defect record — what the fakes could not reach — is in
+What the live suite verifies, and how to run it against a real daemon, is in
 [docs/verification.md](docs/verification.md).
 
 ## License
