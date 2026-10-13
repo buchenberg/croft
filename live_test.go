@@ -294,7 +294,7 @@ func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) Works
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
 		if err := sb.ReleaseState(rctx, state); err != nil {
-			t.Logf("release state %s during cleanup: %v", state.Revision, err)
+			t.Logf("release state %s during cleanup: %v", state.SnapshotKey, err)
 		}
 	})
 	return state
@@ -315,14 +315,11 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	sb := newLiveSandbox(t, ctx, cfg)
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
 		t.Fatal("Create must assign a container id")
-	}
-	if got := sb.Backend(); got != BackendName {
-		t.Errorf("Backend() = %q, want %q", got, BackendName)
 	}
 
 	// File I/O round-trip. Paths are relative on purpose, so this also covers
@@ -346,14 +343,11 @@ func TestLive_FullLifecycle(t *testing.T) {
 	}
 
 	state := captureLive(t, ctx, sb)
-	if state.Backend != BackendName {
-		t.Errorf("state.Backend = %q, want %q", state.Backend, BackendName)
+	if state.SnapshotKey == "" {
+		t.Error("state.SnapshotKey is empty: Apply cannot resume without it")
 	}
-	if key, _ := state.Data[StateKeySnapshotKey].(string); key == "" {
-		t.Errorf("state.Data[%q] is empty: Apply cannot resume without it", StateKeySnapshotKey)
-	}
-	if state.Revision == "" {
-		t.Error("state.Revision is empty")
+	if state.Image != cfg.Image {
+		t.Errorf("state.Image = %q, want %q", state.Image, cfg.Image)
 	}
 	// Mutate, confirm the mutation is really on the new layer, then roll back.
 	const mutated = "mutated after capture\n"
@@ -442,7 +436,7 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -493,7 +487,7 @@ func TestLive_ApplyAfterDestroyRecyclesState(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	content := "written before the capture\n"
@@ -535,7 +529,7 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := sb.WriteFile(ctx, "layer.txt", []byte("forces a committed layer\n"), 0o644); err != nil {
@@ -545,10 +539,7 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	// before its own explicit ReleaseState below, the persistent live namespace
 	// must not accumulate another pinned snapshot.
 	state := captureLive(t, ctx, sb)
-	committed, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("state: %v", err)
-	}
+	committed := state.SnapshotKey
 	sb.mu.Lock()
 	active := sb.activeKey
 	rootfs := sb.rootfsKey
@@ -653,7 +644,7 @@ func TestLive_ExecRejectsStdin(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -700,7 +691,7 @@ func TestLive_LeaseHoldsSnapshots(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -753,7 +744,7 @@ func TestLive_DestroyReleasesTheLease(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 

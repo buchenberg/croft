@@ -20,43 +20,11 @@ func opVerbs(ops []string) []string {
 	return out
 }
 
-func TestContainerdSandbox_Backend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t)
-	if got := sb.Backend(); got != BackendName {
-		t.Errorf("Backend() = %q, want %q", got, BackendName)
-	}
-}
-
-// TestContainerdSandbox_Capabilities pins the declared contract. These are the
-// values callers branch on, so a false here would make the operation unavailable
-// even though it is implemented.
-func TestContainerdSandbox_Capabilities(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t)
-	caps := sb.Capabilities()
-
-	if !caps.Lifecycle {
-		t.Error("Lifecycle must be true: Create and Destroy manage real resources")
-	}
-	if !caps.Exec {
-		t.Error("Exec must be true")
-	}
-	if !caps.FileIO {
-		t.Error("FileIO must be true")
-	}
-	if !caps.Isolated {
-		t.Error("Isolated must be true: the workspace is not the host filesystem")
-	}
-	if caps.Containment != ContainContained {
-		t.Errorf("Containment = %q, want %q (a container is not a VM boundary)",
-			caps.Containment, ContainContained)
-	}
-}
-
 func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
@@ -82,7 +50,7 @@ func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 func TestCreate_ProvisionsWorkdir(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -110,7 +78,7 @@ func TestCreate_ValidatesImage(t *testing.T) {
 	snap := newFakeSnapshotter(log)
 	sb := NewWithBackend(Config{}, snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
 
-	err := sb.Create(context.Background(), SandboxSpec{})
+	err := sb.Create(context.Background())
 	if err == nil {
 		t.Fatal("Create without Config.Image must fail")
 	}
@@ -131,7 +99,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	log.mu.Lock()
@@ -158,10 +126,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 	}
 
 	// The committed layer is read-only and still present.
-	key, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("stateSnapshotKey: %v", err)
-	}
+	key := state.SnapshotKey
 	if !snap.has(key) {
 		t.Errorf("committed layer %s should still exist", key)
 	}
@@ -173,7 +138,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 func TestCapture_RepeatedCapturesChain(t *testing.T) {
 	sb, snap, _, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -186,14 +151,14 @@ func TestCapture_RepeatedCapturesChain(t *testing.T) {
 		t.Fatalf("second Capture: %v", err)
 	}
 
-	k1, _ := stateSnapshotKey(first)
-	k2, _ := stateSnapshotKey(second)
+	k1 := first.SnapshotKey
+	k2 := second.SnapshotKey
 	if k1 == k2 {
 		t.Fatal("each capture must produce a distinct committed layer")
 	}
 	// The second capture's parent is the first committed layer, forming a chain.
-	if second.Data[StateKeyParentKey] != k1 {
-		t.Errorf("second parent = %v, want %v", second.Data[StateKeyParentKey], k1)
+	if second.ParentKey != k1 {
+		t.Errorf("second parent = %v, want %v", second.ParentKey, k1)
 	}
 	// Both committed layers survive, so either can be resumed.
 	if !snap.has(k1) || !snap.has(k2) {
@@ -216,7 +181,7 @@ func TestCapture_BeforeCreateFails(t *testing.T) {
 func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	first, err := sb.Capture(ctx)
@@ -227,14 +192,8 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	k1, err := stateSnapshotKey(first)
-	if err != nil {
-		t.Fatalf("first state: %v", err)
-	}
-	k2, err := stateSnapshotKey(second)
-	if err != nil {
-		t.Fatalf("second state: %v", err)
-	}
+	k1 := first.SnapshotKey
+	k2 := second.SnapshotKey
 	log.mu.Lock()
 	log.ops = nil
 	log.mu.Unlock()
@@ -282,7 +241,7 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 func TestDestroy_IsIdempotent(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := sb.Destroy(ctx); err != nil {
@@ -307,7 +266,7 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -319,14 +278,8 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Capture: %v", err)
 	}
-	k1, err := stateSnapshotKey(first)
-	if err != nil {
-		t.Fatalf("first state: %v", err)
-	}
-	k2, err := stateSnapshotKey(second)
-	if err != nil {
-		t.Fatalf("second state: %v", err)
-	}
+	k1 := first.SnapshotKey
+	k2 := second.SnapshotKey
 
 	// Resume the older state. The second committed layer is no longer an
 	// ancestor of anything this sandbox runs on, but it is still a state.
@@ -357,7 +310,7 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
 	sb, _, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -383,17 +336,6 @@ func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
 	}
 }
 
-func TestApply_RejectsForeignBackend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t)
-	err := sb.Apply(context.Background(), WorkspaceState{Backend: "git"})
-	if err == nil {
-		t.Fatal("Apply must reject a git workspace state")
-	}
-	if !strings.Contains(err.Error(), "git") {
-		t.Errorf("error should name the offending backend: %v", err)
-	}
-}
-
 func TestExec_BeforeCreateFails(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	if _, err := sb.Exec(context.Background(), ExecRequest{Command: "true"}); err == nil {
@@ -406,7 +348,7 @@ func TestExec_BeforeCreateFails(t *testing.T) {
 func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -448,7 +390,7 @@ func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 func TestWriteFile_EncodesContentInArgs(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -518,7 +460,7 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 	sb := NewWithBackend(Config{Image: "example/dev:latest", WriteChunkBytes: 4}, snap, tasks, images)
 
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -570,7 +512,7 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	before := len(tasks.allReqs)
@@ -593,25 +535,17 @@ func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 func TestSnapshotState_RoundTrip(t *testing.T) {
 	state := snapshotState("example/dev:latest", "layer-7", "layer-3")
 
-	if state.Backend != BackendName {
-		t.Errorf("Backend = %q, want %q", state.Backend, BackendName)
+	if state.SnapshotKey != "layer-7" {
+		t.Errorf("SnapshotKey = %q, want layer-7", state.SnapshotKey)
 	}
-	if state.Revision != "layer-7" {
-		t.Errorf("Revision = %q, want the snapshot key", state.Revision)
+	if state.ParentKey != "layer-3" {
+		t.Errorf("ParentKey = %q, want layer-3", state.ParentKey)
 	}
-	if state.Data[StateKeyParentKey] != "layer-3" {
-		t.Errorf("parent = %v, want layer-3", state.Data[StateKeyParentKey])
-	}
-
-	key, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("stateSnapshotKey: %v", err)
-	}
-	if key != "layer-7" {
-		t.Errorf("key = %q, want layer-7", key)
+	if state.Image != "example/dev:latest" {
+		t.Errorf("Image = %q, want example/dev:latest", state.Image)
 	}
 
-	// The state must digest stably, so trace records and drift detection work.
+	// The state must digest stably, so records and drift detection work.
 	d1, err := state.Digest()
 	if err != nil {
 		t.Fatalf("Digest: %v", err)
@@ -625,22 +559,19 @@ func TestSnapshotState_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestStateSnapshotKey_RejectsBadStates(t *testing.T) {
-	t.Run("foreign backend", func(t *testing.T) {
-		_, err := stateSnapshotKey(WorkspaceState{
-			Backend:  "git",
-			Revision: "abc123",
-			Data:     map[string]any{"head_sha": "abc123"},
-		})
-		if err == nil {
-			t.Fatal("a git state must be rejected")
+func TestZeroValueStatesAreRejected(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	t.Run("apply", func(t *testing.T) {
+		if err := sb.Apply(ctx, WorkspaceState{}); err == nil {
+			t.Fatal("Apply accepted a state with no snapshot key")
 		}
 	})
 
-	t.Run("missing snapshot key", func(t *testing.T) {
-		_, err := stateSnapshotKey(WorkspaceState{Backend: BackendName, Data: map[string]any{}})
-		if err == nil {
-			t.Fatal("a state without a snapshot key must be rejected")
+	t.Run("release", func(t *testing.T) {
+		if err := sb.ReleaseState(ctx, WorkspaceState{}); err == nil {
+			t.Fatal("ReleaseState accepted a state with no snapshot key")
 		}
 	})
 }
@@ -697,7 +628,7 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 func TestCapture_ConcurrentWithApply(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)

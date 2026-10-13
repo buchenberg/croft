@@ -17,10 +17,6 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
 
-// BackendName is the identifier reported by Backend and stored in
-// WorkspaceState.Backend.
-const BackendName = "containerd"
-
 // sandboxLeaseLabel marks leases this adapter owns.
 //
 // A lease is the only thing keeping a sandbox's snapshots alive between
@@ -43,23 +39,9 @@ const (
 	defaultWriteChunkBytes = 512 * 1024
 )
 
-// WorkspaceState.Data keys. Pinning the encoding here means a git backend's
-// states can never be mistaken for these, and vice versa: Apply rejects a state
-// whose Backend is not BackendName.
-const (
-	// StateKeySnapshotKey is the committed snapshot this state resumes from.
-	StateKeySnapshotKey = "snapshot_key"
-	// StateKeyParentKey is the committed snapshot this one was prepared from,
-	// recording the fork lineage.
-	StateKeyParentKey = "parent_key"
-	// StateKeyImage is the image the sandbox was provisioned from.
-	StateKeyImage = "image"
-)
-
 // ErrNotImplemented is returned when the containerd surface could not be
-// connected. It is deliberately distinct from ErrUnsupported:
-// Capabilities declares these operations supported, so reporting "unsupported"
-// would be false.
+// connected — the operation is supported, the daemon connection is what
+// failed, so reporting anything else would be false.
 var ErrNotImplemented = errors.New("containerd sandbox: not implemented")
 
 // Config configures the containerd backend.
@@ -216,28 +198,6 @@ type ContainerdSandbox struct {
 // changes a method, this package stops building until the adapter matches.
 var _ Sandbox = (*ContainerdSandbox)(nil)
 
-// StateReleaser is the optional state-discard surface this backend adds beyond
-// Sandbox. A WorkspaceState has no lifecycle — a state
-// outlives the sandbox that captured it — and the lease pin that makes that
-// true holds daemon disk. This is how a caller gives it back deliberately.
-//
-// Callers type-assert to it:
-//
-//	if r, ok := sb.(StateReleaser); ok { _ = r.ReleaseState(ctx, state) }
-//
-// Promoting it into core's Sandbox interface is a separate, deliberate
-// library-API decision (every backend would have to answer what discarding a
-// state means); the assertion above is the tripwire that forces that
-// conversation.
-type StateReleaser interface {
-	// ReleaseState drops the pin holding ws's snapshot. The daemon's garbage
-	// collector reclaims the layer once no other snapshot, container, or lease
-	// references it; until then the state stays valid.
-	ReleaseState(ctx context.Context, ws WorkspaceState) error
-}
-
-var _ StateReleaser = (*ContainerdSandbox)(nil)
-
 // New returns a sandbox bound to cfg, backed by a real containerd client. The
 // client is connected lazily on first use.
 func New(cfg Config) *ContainerdSandbox {
@@ -272,23 +232,6 @@ func WithLeases(mgr leases.Manager) BackendOption {
 	return func(s *ContainerdSandbox) { s.leases = mgr }
 }
 
-// Backend reports the backend identifier.
-func (s *ContainerdSandbox) Backend() string { return BackendName }
-
-// Capabilities reports the backend's support matrix.
-func (s *ContainerdSandbox) Capabilities() SandboxCapabilities {
-	return SandboxCapabilities{
-		Lifecycle: true,
-		Exec:      true,
-		FileIO:    true,
-		Diff:      false,
-		Isolated:  true,
-		// Namespaces plus a separate rootfs, but not a VM boundary: a kernel
-		// exploit escapes it, so this is not ContainFull.
-		Containment: ContainContained,
-	}
-}
-
 // ID returns the current container identity, or "" before Create. It changes
 // across Apply, so callers must not cache it.
 func (s *ContainerdSandbox) ID() string {
@@ -298,17 +241,11 @@ func (s *ContainerdSandbox) ID() string {
 }
 
 // Create provisions the base snapshot from Config.Image and starts the task.
-func (s *ContainerdSandbox) Create(ctx context.Context, spec SandboxSpec) error {
+// The caller sets its own deadline on the context; the whole operation —
+// daemon connection, lease acquisition, image resolution — runs under it.
+func (s *ContainerdSandbox) Create(ctx context.Context) error {
 	if s.cfg.Image == "" {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
-	}
-	// SandboxSpec.Timeout documents that it bounds the whole Create, so it has to
-	// be in force before the daemon connection and the lease RPC — not after
-	// them. A blocked lease service would otherwise hang past the caller's limit.
-	if spec.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
-		defer cancel()
 	}
 	if err := s.requireBackend(ctx); err != nil {
 		return err
@@ -536,10 +473,10 @@ func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n
 // layer, so applying a different state moves it again. This differs from the
 // git backend, whose states are freely reusable.
 func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error {
-	committed, err := stateSnapshotKey(ws)
-	if err != nil {
-		return err
+	if ws.SnapshotKey == "" {
+		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
+	committed := ws.SnapshotKey
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
@@ -617,10 +554,10 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 // state. A mismatched release reports success (the target resource is simply
 // not found) while the real pin persists.
 func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws WorkspaceState) error {
-	key, err := stateSnapshotKey(ws)
-	if err != nil {
-		return err
+	if ws.SnapshotKey == "" {
+		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
+	key := ws.SnapshotKey
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
@@ -856,29 +793,12 @@ func newSandboxID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// snapshotState encodes a committed snapshot as a backend-neutral workspace
-// state. Capture returns this shape and Apply consumes it.
+// snapshotState encodes a committed snapshot as a workspace state. Capture
+// returns this shape and Apply consumes it.
 func snapshotState(image, snapshotKey, parentKey string) WorkspaceState {
 	return WorkspaceState{
-		Backend:  BackendName,
-		Revision: snapshotKey,
-		Data: map[string]any{
-			StateKeySnapshotKey: snapshotKey,
-			StateKeyParentKey:   parentKey,
-			StateKeyImage:       image,
-		},
+		SnapshotKey: snapshotKey,
+		ParentKey:   parentKey,
+		Image:       image,
 	}
-}
-
-// stateSnapshotKey extracts the committed snapshot key from a state, rejecting
-// states produced by another backend so a git state can never be applied here.
-func stateSnapshotKey(ws WorkspaceState) (string, error) {
-	if ws.Backend != BackendName {
-		return "", fmt.Errorf("containerd sandbox: cannot use a %q workspace state", ws.Backend)
-	}
-	key, _ := ws.Data[StateKeySnapshotKey].(string)
-	if key == "" {
-		return "", fmt.Errorf("containerd sandbox: workspace state is missing %q", StateKeySnapshotKey)
-	}
-	return key, nil
 }

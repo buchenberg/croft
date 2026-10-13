@@ -322,7 +322,7 @@ func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
 	sb.leases = fl
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if len(fl.created) != 1 {
@@ -340,7 +340,7 @@ func TestCreate_Destroy_CreateAcquiresAFreshLease(t *testing.T) {
 		t.Fatalf("lease = %q after Destroy, want empty", got)
 	}
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create (second generation): %v", err)
 	}
 	if len(fl.created) != 2 {
@@ -427,9 +427,10 @@ func TestReleaseLease_FailedDeleteKeepsTheIDForRetry(t *testing.T) {
 	}
 }
 
-// TestCreate_TimeoutCoversLeaseAcquisition pins that SandboxSpec.Timeout bounds
-// the whole Create, including the lease RPC. Deriving the timeout after the
-// lease call would let a blocked lease service hang past the caller's limit.
+// TestCreate_TimeoutCoversLeaseAcquisition pins that the caller's context
+// deadline bounds the whole Create, including the lease RPC. Deriving the
+// deadline after the lease call would let a blocked lease service hang past
+// the caller's limit.
 //
 // Create runs in a goroutine so a regression fails on the deadline instead of
 // hanging the suite.
@@ -437,9 +438,12 @@ func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = &fakeLeases{createBlocks: true}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
 	done := make(chan error, 1)
 	go func() {
-		done <- sb.Create(context.Background(), SandboxSpec{Timeout: 200 * time.Millisecond})
+		done <- sb.Create(ctx)
 	}()
 
 	select {
@@ -467,7 +471,7 @@ func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	first, err := sb.Capture(ctx)
@@ -478,14 +482,7 @@ func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Capture: %v", err)
 	}
-	k1, err := stateSnapshotKey(first)
-	if err != nil {
-		t.Fatalf("first state: %v", err)
-	}
-	k2, err := stateSnapshotKey(second)
-	if err != nil {
-		t.Fatalf("second state: %v", err)
-	}
+	k1, k2 := first.SnapshotKey, second.SnapshotKey
 
 	// Exactly one states lease, labeled so an operator can find it, despite two
 	// captures having ensured it.
@@ -523,7 +520,7 @@ func TestCapture_PinFailureRollsForwardNotOut(t *testing.T) {
 	fl := &fakeLeases{addResErr: errors.New("lease service unavailable")}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	before := len(snap.keys())
@@ -553,10 +550,7 @@ func TestCapture_PinFailureRollsForwardNotOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture after recovery: %v", err)
 	}
-	key, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("state after recovery: %v", err)
-	}
+	key := state.SnapshotKey
 	if !fl.pinnedOn(statesLeaseID, key) {
 		t.Errorf("the post-recovery state %s is not pinned", key)
 	}
@@ -592,7 +586,7 @@ func TestCapture_RollForwardFailureLeavesCleanlyStoppedSandbox(t *testing.T) {
 	tasks := &failingStartTask{taskService: sb.tasks}
 	sb.tasks = tasks
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	tasks.armed = true
@@ -641,17 +635,14 @@ func TestReleaseState_DropsTheStatesLeasePin(t *testing.T) {
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	key, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("state: %v", err)
-	}
+	key := state.SnapshotKey
 
 	if err := sb.ReleaseState(ctx, state); err != nil {
 		t.Fatalf("ReleaseState: %v", err)
@@ -687,11 +678,7 @@ func TestReleaseState_RejectsForeignAndIncompleteStates(t *testing.T) {
 	sb.leases = fl
 	ctx := context.Background()
 
-	if err := sb.ReleaseState(ctx, WorkspaceState{Backend: "git", Revision: "abc123"}); err == nil {
-		t.Error("ReleaseState accepted a git state: it would have unpinned a key the " +
-			"git backend knows nothing about")
-	}
-	if err := sb.ReleaseState(ctx, WorkspaceState{Backend: BackendName}); err == nil {
+	if err := sb.ReleaseState(ctx, WorkspaceState{}); err == nil {
 		t.Error("ReleaseState accepted a state with no snapshot key")
 	}
 	if len(fl.removed) != 0 {
@@ -706,7 +693,7 @@ func TestReleaseState_NoManagerIsNoop(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	sb.leases = nil
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)

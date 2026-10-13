@@ -88,66 +88,12 @@ package croft
 
 import (
 	"context"
-	"errors"
 	"io/fs"
 	"time"
 )
 
 // ErrUnsupported is returned by an optional capability that a sandbox does not
 // implement. Callers should check Capabilities (or type-assert the optional
-// interface) before calling; the error exists so a misconfigured caller fails
-// loudly instead of silently doing nothing.
-var ErrUnsupported = errors.New("croft: capability not supported")
-
-// Containment classifies how strongly a workspace is contained. The string
-// values are a stable wire format, recorded by hosts in traces and state
-// metadata.
-type Containment string
-
-const (
-	// ContainFull is a boundary a kernel exploit cannot cross (a VM).
-	ContainFull Containment = "full"
-	// ContainContained is namespaces plus a separate rootfs: strong, but a
-	// kernel exploit escapes it.
-	ContainContained Containment = "contained"
-	// ContainBuffered is a mediated, non-executable copy of host content.
-	ContainBuffered Containment = "buffered"
-	// ContainUncontained is direct mutation of the host filesystem.
-	ContainUncontained Containment = "uncontained"
-)
-
-// SandboxCapabilities declares what a sandbox supports. Callers use it to
-// decide whether an optional operation is available before invoking it.
-type SandboxCapabilities struct {
-	// Lifecycle reports whether Create and Destroy manage real resources.
-	Lifecycle bool
-	// Exec reports whether Exec is implemented.
-	Exec bool
-	// FileIO reports whether ReadFile and WriteFile are implemented.
-	FileIO bool
-	// Diff reports whether Diff is implemented.
-	Diff bool
-	// Isolated reports whether the workspace is isolated from the host
-	// filesystem. A false value means the sandbox mutates the host tree in
-	// place.
-	Isolated bool
-	// Containment is the witness-level containment classification, for
-	// hosts that record it in traces and retained contexts.
-	Containment Containment
-}
-
-// SandboxSpec carries per-call runtime options for Create. Backend-specific
-// configuration (image, namespace, credentials) belongs on Config, not here.
-type SandboxSpec struct {
-	// Workdir is the workspace path for backends that mount or check out into
-	// a caller-chosen directory. Ignored by backends that infer their own.
-	Workdir string
-	// Env is the environment for commands run during Create (for example a
-	// bootstrap step). It is not the agent's execution environment.
-	Env map[string]string
-	// Timeout bounds the Create operation. Zero means the sandbox default.
-	Timeout time.Duration
-}
 
 // ExecRequest describes one command execution inside a sandbox.
 type ExecRequest struct {
@@ -168,31 +114,24 @@ type ExecResult struct {
 }
 
 // Sandbox is an isolated workspace: it owns a filesystem boundary and can
-// provision it, capture it, resume it, diff it, and execute in it.
+// provision it, capture it, resume it, and execute in it.
 //
 // The capture/apply pair is the state lifecycle: Capture returns a WorkspaceState
 // that outlives the sandbox (the snapshot is pinned against the daemon's
 // garbage collector), Apply rebinds a sandbox to a previously captured state,
 // and any sandbox configured the same way can apply it — that is how a state
-// crosses from one sandbox to another.
+// crosses from one sandbox to another. ReleaseState is the only discard verb.
 //
 // Every method takes a context so remote daemons honor cancellation and
 // deadlines.
 //
-// Non-mutating contract: Capture and Diff must leave the caller's workspace
-// metadata unchanged on return. For the in-container git repository that means
-// the index must be left as it was found.
+// Non-mutating contract: Capture must leave the caller's workspace metadata
+// unchanged on return.
 type Sandbox interface {
-	// Backend returns the backend identifier ("containerd" for this
-	// package's implementation).
-	Backend() string
-
-	// Capabilities reports what this sandbox supports.
-	Capabilities() SandboxCapabilities
-
 	// Create provisions the workspace: resolves the image rootfs, prepares
-	// the base active snapshot, and starts the task.
-	Create(ctx context.Context, spec SandboxSpec) error
+	// the base active snapshot, and starts the task. The caller bounds the
+	// operation with the context.
+	Create(ctx context.Context) error
 
 	// Destroy releases resources this sandbox provisioned. It must never
 	// destroy resources it did not create.
@@ -213,6 +152,11 @@ type Sandbox interface {
 	// this sandbox. Layers created after the applied state survive as
 	// states; reclaim them with ReleaseState.
 	Apply(ctx context.Context, ws WorkspaceState) error
+
+	// ReleaseState drops the pin holding a captured state's snapshot. The
+	// daemon's garbage collector reclaims the layer once nothing references
+	// it; until then the state stays valid. Idempotent.
+	ReleaseState(ctx context.Context, ws WorkspaceState) error
 
 	// Exec runs a command in the sandbox and returns its result.
 	Exec(ctx context.Context, req ExecRequest) (ExecResult, error)
