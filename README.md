@@ -75,18 +75,14 @@ each field.
 Croft was extracted from the `sandbox/containerd` nested module of
 [shepherd-kernel-go](https://github.com/buchenberg/shepherd-kernel-go) (its
 v0.1.x–v0.2.x history is preserved here) and now defines its own interface,
-types, and state format:
-
-- `WorkspaceState` data keys (`snapshot_key`, `parent_key`, `image`, `git_head`,
-  `delta_base`, `delta_patch`) are unchanged, and `WorkspaceState.Digest` is
-  byte-identical, so states captured by either library digest equally.
-- Daemon-visible identifiers are inherited verbatim — the snapshot key prefix
-  (`shepherd/...`), the sandbox lease label (`shepherd.lease`), the states
-  lease id (`shepherd-states`), and the container label — so states, leases,
-  and containers created by the old code remain resolvable and releasable on
-  the same daemon. They are wire format, not branding.
-- The backend identifier remains `"containerd"`, so host configuration keys
-  and recorded states are unchanged across the swap.
+types, and state format. It is a clean break: croft uses its own snapshot key
+prefix (`croft/…`), lease and container labels (`croft.*`), states lease
+(`croft-states`), and digest version (`croft.state.canonical.v1`). States,
+leases, and snapshots created by the old module are not interchangeable with
+croft's, and its digests are not comparable with other ecosystems'
+workspace-state formats. `WorkspaceState` data keys (`snapshot_key`,
+`parent_key`, `image`, `git_head`, `delta_base`, `delta_patch`) and the
+backend identifier (`"containerd"`) are unchanged in shape and meaning.
 
 Known gap, inherited and recorded: a state's identity is its sequence-derived
 snapshot key, so two captures of identical content produce different digests.
@@ -104,9 +100,7 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
      go test -count=1 -v -run TestLive_ ./...
 ```
 
-The library has no dependency on shepherd-kernel-go; the live integration test
-does, to exercise a consumer host's full materialize path end to end
-(`go.mod` marks it test-only).
+Croft has no dependencies beyond containerd and the Go standard library.
 
 ## License
 

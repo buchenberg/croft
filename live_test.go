@@ -90,7 +90,7 @@ const (
 // require a glibc image).
 const (
 	defaultImage     = "docker.io/alpine/git:latest"
-	defaultNamespace = "shepherd-live"
+	defaultNamespace = "croft-live"
 	defaultWorkdir   = "/workspace"
 	// Deliberately well under `go test`'s own 10m default, so a hang surfaces as
 	// a context-deadline error from the code under test rather than as a testing
@@ -313,8 +313,8 @@ func bootstrapGit(t *testing.T, ctx context.Context, sb *ContainerdSandbox, work
 	t.Helper()
 
 	mustExec(t, ctx, sb, workdir, "git", "init", "-q", ".")
-	mustExec(t, ctx, sb, workdir, "git", "config", "user.email", "shepherd-live@test.invalid")
-	mustExec(t, ctx, sb, workdir, "git", "config", "user.name", "shepherd-live")
+	mustExec(t, ctx, sb, workdir, "git", "config", "user.email", "croft-live@test.invalid")
+	mustExec(t, ctx, sb, workdir, "git", "config", "user.name", "croft-live")
 	mustExec(t, ctx, sb, workdir, "sh", "-c", "printf 'baseline\\n' > base.txt")
 	mustExec(t, ctx, sb, workdir, "git", "add", "-A")
 	mustExec(t, ctx, sb, workdir, "git", "commit", "-q", "-m", "baseline")
@@ -805,7 +805,7 @@ func TestLive_LeaseHoldsSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list resources of lease %s: %v", found[0].ID, err)
 	}
-	prefix := "shepherd/" + id + "/"
+	prefix := "croft/" + id + "/"
 	var held []string
 	for _, r := range res {
 		if strings.HasPrefix(r.Type, "snapshots/") && strings.HasPrefix(r.ID, prefix) {

@@ -14,11 +14,10 @@ import (
 
 // canonicalDigestVersion is the version prefix of the digest wire format.
 //
-// It is inherited verbatim from the format this library was extracted from so
-// that states digested here match states digested there: it is part of the
-// hashed bytes, so changing it silently changes every digest. Treat it as a
-// stable format identifier, not branding.
-const canonicalDigestVersion = "shepherd.kernel.canonical.v2"
+// It is part of the hashed bytes, so changing it silently changes every digest:
+// treat it as a stable format identifier. Digests are not comparable with those
+// of other ecosystems' workspace-state formats.
+const canonicalDigestVersion = "croft.state.canonical.v1"
 
 var canonicalPrefix = []byte(canonicalDigestVersion + "\n")
 
@@ -37,8 +36,8 @@ func sha256Sum(b []byte) []byte {
 //	json.dumps(value, sort_keys=True, separators=(",", ":"),
 //	           ensure_ascii=False, allow_nan=False).encode("utf-8")
 //
-// which is what `canonical_json_bytes` does in shepherd2. That identity is the
-// point: digests over these bytes are compared across implementations.
+// That identity is the point: digests over these bytes are reproducible in any
+// implementation that matches CPython, so test vectors can be shared.
 //
 // Two things Go's encoding/json gets wrong here, both of which produce a
 // different digest silently rather than failing:
@@ -57,40 +56,17 @@ func sha256Sum(b []byte) []byte {
 // by rendering integral float64s without a decimal point, which happened to fix
 // integers and silently corrupted real float values.
 func CanonicalJSONBytes(v any) ([]byte, error) {
-	return canonicalJSON(v, false)
-}
-
-// CanonicalJSONASCIIBytes encodes with CPython's json.dumps *default*
-// (ensure_ascii=True), which is a different escaping flavour from the one the
-// record digest uses.
-//
-// The store needs both, and that is not an artefact of the Go port: shepherd2's
-// trace_store.py runs two encoders in the same append path. Record and witness ids
-// go through kernel.canonical.canonical_json_bytes (ensure_ascii=False), while its
-// `_json_dumps` helper omits the argument, so the context id, the batch digest and
-// the stored body/receipt JSON all use ensure_ascii=True. With an ASCII-only
-// payload the two agree, which is why this is invisible in the existing tests.
-func CanonicalJSONASCIIBytes(v any) ([]byte, error) {
-	return canonicalJSON(v, true)
-}
-
-// canonicalJSON encodes v canonically, choosing the string-escaping flavour.
-func canonicalJSON(v any, ascii bool) ([]byte, error) {
-	buf := &canonicalBuf{ascii: ascii}
+	buf := &canonicalBuf{}
 	if err := writeCanonicalValue(buf, v, make(map[canonicalVisit]bool)); err != nil {
 		return nil, err
 	}
 	return []byte(buf.String()), nil
 }
 
-// canonicalBuf is the output buffer for one encoding pass. It carries the escape
-// flavour so the writer need not thread a flag through every case; the embedded
+// canonicalBuf is the output buffer for one encoding pass. The embedded
 // Builder promotes WriteByte, WriteString and Write, so the writer body is
 // unchanged.
-type canonicalBuf struct {
-	strings.Builder
-	ascii bool
-}
+type canonicalBuf struct{ strings.Builder }
 
 // formatCanonicalFloat renders f the way CPython's repr does, which is what
 // json.dumps emits for a float.
@@ -170,9 +146,6 @@ func writeCanonicalString(buf *canonicalBuf, s string) error {
 		// encoding/json does and digest a string the caller never held.
 		return fmt.Errorf("canonical JSON: string is not valid UTF-8: %q", s)
 	}
-	if buf.ascii {
-		return writeCanonicalStringASCII(buf, s)
-	}
 
 	buf.WriteByte('"')
 	for i := 0; i < len(s); i++ {
@@ -198,50 +171,6 @@ func writeCanonicalString(buf *canonicalBuf, s string) error {
 				continue
 			}
 			buf.WriteByte(c)
-		}
-	}
-	buf.WriteByte('"')
-	return nil
-}
-
-// writeCanonicalStringASCII escapes as CPython's json.dumps does with
-// ensure_ascii=True — its default, and what the store's context-id and
-// batch-digest helpers use.
-//
-// Every non-ASCII rune becomes \uXXXX with lowercase hex, and above U+FFFF a
-// surrogate pair, exactly as CPython emits. DEL is escaped too. Note it does NOT
-// HTML-escape <, > or & : Python never does, at either setting, which is a
-// different behaviour from Go's encoding/json and the reason this is hand-written.
-func writeCanonicalStringASCII(buf *canonicalBuf, s string) error {
-	buf.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			buf.WriteString(`\"`)
-		case '\\':
-			buf.WriteString(`\\`)
-		case '\b':
-			buf.WriteString(`\b`)
-		case '\f':
-			buf.WriteString(`\f`)
-		case '\n':
-			buf.WriteString(`\n`)
-		case '\r':
-			buf.WriteString(`\r`)
-		case '\t':
-			buf.WriteString(`\t`)
-		default:
-			switch {
-			case r < 0x20 || r == 0x7f:
-				fmt.Fprintf(buf, `\u%04x`, r)
-			case r < utf8.RuneSelf:
-				buf.WriteByte(byte(r))
-			case r > 0xFFFF:
-				r -= 0x10000
-				fmt.Fprintf(buf, `\u%04x\u%04x`, 0xD800+(r>>10), 0xDC00+(r&0x3FF))
-			default:
-				fmt.Fprintf(buf, `\u%04x`, r)
-			}
 		}
 	}
 	buf.WriteByte('"')

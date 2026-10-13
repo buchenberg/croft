@@ -27,11 +27,7 @@ const BackendName = "containerd"
 // generations, so an orphaned one — left by a process that died before Destroy —
 // has to be findable without in-process bookkeeping. `ctr leases ls` filters on
 // labels, and the snapshot keys the lease holds carry the sandbox id.
-//
-// The label value is an inherited identifier, kept verbatim so a daemon that
-// ran this code's ancestors keeps working: leases they created are still
-// findable and releasable. Treat it as a wire format, not branding.
-const sandboxLeaseLabel = "shepherd.lease"
+const sandboxLeaseLabel = "croft.lease"
 
 const (
 	// maxArgPayload is the largest base64 piece WriteFile puts in a single
@@ -1182,13 +1178,8 @@ func (s *ContainerdSandbox) backendReady() bool {
 
 // key builds a snapshot key for this sandbox. Keys are namespaced by sandbox id
 // and ordered by seq so the lineage is readable in `ctr snapshot ls`.
-//
-// The "shepherd/" prefix is an inherited identifier, kept verbatim because keys
-// travel: they are recorded in WorkspaceState.Data, so states captured before
-// the rename must keep resolving on the same daemon. Treat it as a wire
-// format, not branding.
 func (s *ContainerdSandbox) key(id, kind string, n uint64) string {
-	return fmt.Sprintf("shepherd/%s/%s/%d", id, kind, n)
+	return fmt.Sprintf("croft/%s/%s/%d", id, kind, n)
 }
 
 // newSandboxID returns a short random identifier. Identity comes from crypto/rand

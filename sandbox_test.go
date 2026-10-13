@@ -816,7 +816,7 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 	// A filesystem path that cannot be a containerd socket makes connection
 	// fail deterministically instead of depending on whether a daemon is running
 	// on the test host.
-	sb := New(Config{Address: "unix:///nonexistent/shepherd-test.sock"})
+	sb := New(Config{Address: "unix:///nonexistent/croft-test.sock"})
 
 	_, err := sb.Exec(context.Background(), ExecRequest{Command: "true"})
 	if err == nil {

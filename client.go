@@ -33,11 +33,7 @@ import (
 // be found again without in-process bookkeeping. That matters because Capture and
 // Apply replace the container on every generation, and because a crashed process
 // must not leave containers only it can find.
-//
-// The label value is an inherited identifier, kept verbatim so containers
-// created by this code's ancestors remain findable on the same daemon. Treat
-// it as a wire format, not branding.
-const sandboxLabel = "shepherd.sandbox"
+const sandboxLabel = "croft.sandbox"
 
 // defaultSnapshotter is containerd's overlayfs snapshotter. Other snapshotters
 // (native/btrfs/zfs, erofs) differ in commit semantics, so this is configurable
@@ -117,7 +113,7 @@ func (s *ContainerdSandbox) leaseManager() leases.Manager {
 // that container before preparing its successor, so in that window the
 // just-committed layer is unreferenced and containerd's GC may reclaim it:
 //
-//	prepare successor snapshot: parent snapshot shepherd/<id>/committed/1 does
+//	prepare successor snapshot: parent snapshot croft/<id>/committed/1 does
 //	not exist
 //
 // That was observed on 3 of 5 consecutive live runs, a different test failing
@@ -205,12 +201,7 @@ func (s *ContainerdSandbox) releaseLease(ctx context.Context) error {
 // captured state with it, so states need a pin with a different lifetime. A
 // resource on this lease is exactly that: the daemon's GC treats a leased
 // snapshot as a root, the same mechanism the sandbox lease already relies on.
-//
-// The lease id is an inherited identifier, kept verbatim so states pinned by
-// this code's ancestors stay releasable: the pin lives on the lease this id
-// names, and a different id would orphan every one of them. Treat it as a
-// wire format, not branding.
-const statesLeaseID = "shepherd-states"
+const statesLeaseID = "croft-states"
 
 // snapshotterName resolves the configured snapshotter plugin name, matching
 // connect's resolution so lease resources name the same plugin the sandbox

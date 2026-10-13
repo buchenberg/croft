@@ -62,7 +62,7 @@ func generateInitSpec(t *testing.T, cfg v1.ImageConfig) (*oci.Spec, error) {
 	t.Helper()
 	// GenerateSpec requires a containerd namespace (the default spec's
 	// cgroup path resolves against it).
-	ctx := namespaces.WithNamespace(context.Background(), "shepherd-test")
+	ctx := namespaces.WithNamespace(context.Background(), "croft-test")
 	img := newConfigImage(t, cfg)
 	tasks := &containerdTasks{}
 	opts, err := tasks.initSpecOpts(ctx, img)

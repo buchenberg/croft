@@ -162,13 +162,13 @@ func (f *fakeLeases) ListResources(context.Context, leases.Lease) ([]leases.Reso
 // never reaches this context protects nothing and the flake would return.
 func TestNamespaceSnapshotter_InjectsLeaseOnlyWhenHeld(t *testing.T) {
 	var ref leaseRef
-	n := namespaceSnapshotter{ns: "shepherd-test", lease: &ref}
+	n := namespaceSnapshotter{ns: "croft-test", lease: &ref}
 
 	// No lease held: the namespace is still injected, and nothing is registered
 	// under a lease that does not exist (addSnapshotLease errors when it does).
 	got := n.ctx(context.Background())
-	if ns, ok := namespaces.Namespace(got); !ok || ns != "shepherd-test" {
-		t.Fatalf("namespace = %q (present %v), want shepherd-test", ns, ok)
+	if ns, ok := namespaces.Namespace(got); !ok || ns != "croft-test" {
+		t.Fatalf("namespace = %q (present %v), want croft-test", ns, ok)
 	}
 	if id, ok := leases.FromContext(got); ok {
 		t.Fatalf("lease = %q present with none held, want absent", id)
@@ -181,15 +181,15 @@ func TestNamespaceSnapshotter_InjectsLeaseOnlyWhenHeld(t *testing.T) {
 	if id, ok := leases.FromContext(got); !ok || id != "lease-1" {
 		t.Fatalf("lease = %q (present %v), want lease-1", id, ok)
 	}
-	if ns, ok := namespaces.Namespace(got); !ok || ns != "shepherd-test" {
-		t.Fatalf("namespace = %q (present %v) alongside a lease, want shepherd-test", ns, ok)
+	if ns, ok := namespaces.Namespace(got); !ok || ns != "croft-test" {
+		t.Fatalf("namespace = %q (present %v) alongside a lease, want croft-test", ns, ok)
 	}
 }
 
 // TestNamespaceSnapshotter_NilRefIsSafe covers a sandbox whose wrapper was built
 // without a lease reference, which is how the substituted backends behave.
 func TestNamespaceSnapshotter_NilRefIsSafe(t *testing.T) {
-	n := namespaceSnapshotter{ns: "shepherd-test"}
+	n := namespaceSnapshotter{ns: "croft-test"}
 	if _, ok := leases.FromContext(n.ctx(context.Background())); ok {
 		t.Fatal("lease present from a wrapper with no lease reference")
 	}
