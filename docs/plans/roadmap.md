@@ -11,7 +11,8 @@ boundaries.
 | 1 — Lean core | [lean-clean-break.md](lean-clean-break.md) | croft v0.4.0 |
 | 2 — Snapshot-native diff | [snapshot-native-diff.md](snapshot-native-diff.md) | croft v0.4.0 |
 | 3 — Snapshot-native delta | [snapshot-native-delta.md](snapshot-native-delta.md) | croft v0.4.0 |
-| 4 — MCP broker | [multi-tenant-sandbox-broker.md](multi-tenant-sandbox-broker.md) | croft-broker v0.1.0+ |
+| 4 — Exec I/O | [exec-io.md](exec-io.md) | croft v0.5.0 |
+| 5 — MCP broker | [multi-tenant-sandbox-broker.md](multi-tenant-sandbox-broker.md) | croft-broker v0.1.0+ |
 
 The architectural-review remediation plan is superseded by phase 1; its
 surviving items are folded in there and the original is archived in
@@ -91,16 +92,23 @@ the broker recorded (D3).
 ## Sequencing and parallelism
 
 ```
-Phase 1 lean ──► Phase 2 diff ──► Phase 3 delta ──────────► croft v0.4.0 tag
-      │                │
+Phase 1 lean ──► Phase 2 diff ──► Phase 3 delta ──► croft v0.4.0 tag
+      │                                                 │
+      │                                                 └──► Phase 4 exec I/O ──► croft v0.5.0 tag
+      │
       └──► broker Phase 0 spike (MCP over lean surface)     [croft-broker repo]
       └──► Config.Limits upstream PR (D2) ─► broker Phases 1–3
                                             broker tools for diff/delta
-                                            unlock as phases 2–3 land
+                                            unlock as phases 2–3 land;
+                                            broker v0.1.0 pins croft v0.5.0
+                                            and drops its output-cap shim
+                                            for Config.MaxOutputBytes
 ```
 
 - Phases 1→2→3 are strictly sequential in the library (each plan's Part 0
-  assumes exactly this order).
+  assumes exactly this order); phase 4 (exec I/O) follows the v0.4.0 tag and
+  touches none of the diff/delta machinery, so it could also run in parallel
+  with phase 2 or 3 if that is ever worth the merge traffic.
 - The broker Phase 0 spike (one sandbox over MCP, in-memory registry) needs
   only the lean surface and can start the moment phase 1 lands.
 - `Config.Limits` (D2) and the other upstream extensions (state enumeration,
@@ -146,6 +154,9 @@ yaah, not here. Long term, an open question below.
 - **v0.4.0 tag**: the full live suite against a real daemon, including the
   diff plan's `TestLive_Changes*` set and the delta plan's
   `TestLive_ApplyDelta*` set; the `release verify` job green.
+- **v0.5.0 tag**: the exec I/O plan's live set — stdin-as-data, the
+  truncation marker, and both background-process tests (survives-exec and
+  dies-at-Capture) — green against a real daemon.
 - **Broker v0.1.0**: its plan's §11 phase-2 exit criteria (parked sandbox
   resumes with an identical workspace; cross-tenant apply/apply_delta/release
   rejected in tests; the reaper survives broker restart), plus the chaos test
@@ -169,3 +180,8 @@ yaah, not here. Long term, an open question below.
    likely first) hits divergent same-file edits in practice.
 4. **Scale knob** — `MaxDiffBytes`/`MaxDeltaBytes` stay documented risks, not
    config, until a host actually hits the blob-cost ceiling.
+5. **Interactive exec sessions** — deferred by the exec I/O plan's decision
+   (upstream runc-v2 stdin-EOF behavior; use cases covered by stdin-as-data
+   and the background-process recipe). Revisit when a consumer needs a TTY.
+   Process-preserving capture is not an open question: it is a permanent
+   scope boundary recorded there.
