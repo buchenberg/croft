@@ -580,7 +580,6 @@ func TestLive_ApplyAfterDestroyRecyclesState(t *testing.T) {
 // Layer-removal ordering is no longer Destroy's concern: committed layers can
 // have children (later captures, sibling forks), so reaping them children-first
 // is the daemon GC's job once ReleaseState drops the pins.
-
 func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
