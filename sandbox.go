@@ -518,6 +518,18 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 	}
 	_ = mounts
 	if err := s.tasks.StartTask(ctx, id, next); err != nil {
+		// The prepared successor leaks otherwise — Destroy removes only the
+		// current activeKey — so it is removed here, cancel-free. The old
+		// active layer still exists at this point (its removal happens only on
+		// success below), so the task restarts on it and the sandbox is left
+		// usable rather than stopped; the restart error is ignored, consistent
+		// with the Prepare-failure branch above. With no prior active (the
+		// first Apply before Create) there is no task to restart and the
+		// sandbox stays cleanly stopped.
+		_ = s.snap.Remove(context.WithoutCancel(ctx), next)
+		if active != "" {
+			_ = s.restart(ctx, id, active)
+		}
 		return fmt.Errorf("containerd sandbox: start task after apply: %w", err)
 	}
 
@@ -542,9 +554,7 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 //
 // This is the state-discard half of the "a WorkspaceState has no lifecycle"
 // contract: the state stays valid for exactly as long as the caller
-// wants it, and disk comes back when the caller says so. It is deliberately not
-// part of Sandbox — see StateReleaser — because promoting a discard
-// operation into the Sandbox interface is a library-level API decision.
+// wants it, and disk comes back when the caller says so.
 //
 // Idempotent: releasing an already-released state is a no-op.
 //

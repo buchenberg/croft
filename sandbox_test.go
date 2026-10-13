@@ -652,3 +652,41 @@ func TestCapture_ConcurrentWithApply(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers pins the failure
+// path after Prepare succeeds: the prepared successor must be removed (Destroy
+// would otherwise leak it — it removes only the current activeKey), the task
+// must restart on the old active layer, and the sandbox must stay usable.
+func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
+	sb, snap, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	before := len(snap.keys())
+
+	// Wrap the task service so the next StartTask fails, and hand it to the
+	// sandbox through the same seam Capture's roll-forward test uses.
+	fail := &failingStartTask{taskService: sb.tasks, armed: true}
+	sb.tasks = fail
+
+	if err := sb.Apply(ctx, state); err == nil {
+		t.Fatal("Apply succeeded although the successor task could not start")
+	}
+	if len(snap.keys()) != before {
+		t.Errorf("snapshot count = %d after the failed Apply, want %d: the prepared successor must not leak",
+			len(snap.keys()), before)
+	}
+
+	// Disarm: the sandbox recovered on the old active layer, so a subsequent
+	// Capture must succeed (StopTask is idempotent, Commit works on the old
+	// active), and a later Apply must work too.
+	fail.armed = false
+	if _, err := sb.Capture(ctx); err != nil {
+		t.Fatalf("Capture after a recovered Apply: %v", err)
+	}
+}
