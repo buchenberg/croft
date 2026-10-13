@@ -230,21 +230,3 @@ type Sandbox interface {
 	// WriteFile writes a file inside the sandbox workspace.
 	WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error
 }
-
-// DeltaApplier is an optional Sandbox capability: applying a captured state's
-// changes onto a workspace that has moved past the state's base, without
-// resetting it. Apply is a full reset and is wrong for that case.
-//
-// The delta payload is recorded at Capture (a git binary patch from the
-// delta's recorded base to the captured working tree), so one argument is
-// enough. A conflicting delta fails the call and leaves the workspace
-// untouched; a delta with no changes is a no-op. A state captured without a
-// git base cannot be merged and reports ErrUnsupported rather than pretending.
-//
-// Callers detect the capability with a type assertion, so adding it is an
-// implementation decision, not a breaking change.
-type DeltaApplier interface {
-	// ApplyDelta merges the changes captured in delta onto the current
-	// workspace.
-	ApplyDelta(ctx context.Context, delta WorkspaceState) error
-}
