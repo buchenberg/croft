@@ -46,6 +46,12 @@ const (
 // failed, so reporting anything else would be false.
 var ErrNotImplemented = errors.New("containerd sandbox: not implemented")
 
+// ErrStateUnavailable is returned when a WorkspaceState's snapshot layer has
+// been released: the state's pin is gone and the daemon's garbage collector
+// may reclaim (or already has reclaimed) the layer. Retrying with a fresh
+// Capture is the only recovery.
+var ErrStateUnavailable = errors.New("croft: state is no longer available")
+
 // Config configures the containerd backend.
 type Config struct {
 	// Address is the containerd socket or endpoint. Empty uses containerd's
@@ -143,6 +149,11 @@ type diffService interface {
 	// Read returns the bytes of a blob Compare produced. Callers pin the
 	// blob for the duration (the daemon's GC may collect unpinned content).
 	Read(ctx context.Context, desc ocispec.Descriptor) ([]byte, error)
+
+	// Delete removes a blob Compare produced from the daemon's content
+	// store. Best-effort: a blob already collected by the daemon's GC is
+	// success.
+	Delete(ctx context.Context, desc ocispec.Descriptor) error
 }
 
 // ContainerdSandbox is a workspace backed by containerd.
@@ -232,6 +243,10 @@ type ContainerdSandbox struct {
 	committedChain []string
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
+	// diffSeq orders diff-view snapshot keys within this sandbox. Separate
+	// from seq: state identity is sequence-derived, and diff views must not
+	// move the capture sequence.
+	diffSeq uint64
 }
 
 // The compile-time assertion is load-bearing: if Sandbox gains or

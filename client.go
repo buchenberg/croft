@@ -404,6 +404,15 @@ func (d *containerdDiff) Read(ctx context.Context, desc v1.Descriptor) ([]byte, 
 	return b, nil
 }
 
+func (d *containerdDiff) Delete(ctx context.Context, desc v1.Descriptor) error {
+	ctx = namespaces.WithNamespace(ctx, d.ns)
+	err := d.client.ContentStore().Delete(ctx, desc.Digest)
+	if err != nil && errdefs.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 // Each StartTask creates a *new* container generation, because a container's
 // rootfs snapshot is fixed at creation and Capture/Apply change it. Previous
 // generations are found through the sandbox label rather than an in-process map,

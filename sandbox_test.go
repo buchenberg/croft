@@ -788,6 +788,8 @@ func (stubDiff) Compare(_ context.Context, lower, upper []mount.Mount) (ocispec.
 
 func (stubDiff) Read(_ context.Context, _ ocispec.Descriptor) ([]byte, error) { return nil, nil }
 
+func (stubDiff) Delete(_ context.Context, _ ocispec.Descriptor) error { return nil }
+
 // TestWithDiffServiceWiresTheCollaborator pins the option's contract: a
 // NewWithBackend sandbox has no diff service unless the option supplies one,
 // and the option supplies exactly the collaborator it is given. The

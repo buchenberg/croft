@@ -9,6 +9,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/errdefs"
 )
 
 // opLog records the order of lifecycle operations. The ordering is the thing
@@ -122,7 +123,21 @@ func (f *fakeSnapshotter) Prepare(_ context.Context, key, parent string, _ ...sn
 }
 
 func (f *fakeSnapshotter) View(_ context.Context, key, parent string, _ ...snapshots.Opt) ([]mount.Mount, error) {
-	return f.Mounts(context.Background(), parent)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.ls[key]; exists {
+		return nil, fmt.Errorf("view %s: snapshot already exists", key)
+	}
+	p, ok := f.ls[parent]
+	if !ok {
+		return nil, fmt.Errorf("snapshot %s: %w", parent, errdefs.ErrNotFound)
+	}
+	if p.kind != snapshots.KindCommitted {
+		return nil, fmt.Errorf("view %s: parent %s is not committed", key, parent)
+	}
+	f.ls[key] = &fakeLayer{kind: snapshots.KindView, parent: parent, writable: false}
+	f.log.add("view:%s<-%s", key, parent)
+	return []mount.Mount{{Type: "overlay", Source: "overlay", Target: "/mnt/" + key}}, nil
 }
 
 func (f *fakeSnapshotter) Commit(_ context.Context, name, key string, _ ...snapshots.Opt) error {
