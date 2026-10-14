@@ -129,7 +129,16 @@ type imageService interface {
 
 // ContainerdSandbox is a workspace substrate backed by containerd.
 //
-// One instance corresponds to one workspace. Safe for concurrent use.
+// One instance corresponds to one workspace. Safe for concurrent use:
+// lifecycle operations (Create, Destroy, Capture, Apply) hold an
+// exclusive op-level lock, workspace operations (Exec, ReadFile,
+// WriteFile, ReleaseState) a shared one — an in-flight Exec finishes
+// before a Capture can commit the layer it is writing to, by
+// construction rather than by luck. Lock ordering is opMu, then mu,
+// then leaseMu; opMu guards only the public API surface, so tests may
+// drive the impls directly where a lock would be noise. Waiting for
+// opMu does not honor context cancellation: a hung Exec delays a
+// waiting Destroy until it returns, the standard Go trade.
 // leaseRef carries the sandbox's current containerd lease id.
 //
 // It is written by Create and Destroy and read on every snapshotter call, so it
@@ -159,6 +168,11 @@ type ContainerdSandbox struct {
 	snap   snapshots.Snapshotter
 	tasks  taskService
 	images imageService
+
+	// opMu serializes the public API: exclusive for lifecycle operations
+	// (Create, Destroy, Capture, Apply), shared for workspace operations
+	// (Exec, ReadFile, WriteFile, ReleaseState). See the struct doc.
+	opMu sync.RWMutex
 	// leases is the daemon's lease manager. Nil when the collaborators were
 	// substituted (tests): a fake snapshotter has no garbage collector to hold
 	// anything back from, so there is nothing to lease.
@@ -244,6 +258,13 @@ func (s *ContainerdSandbox) ID() string {
 // The caller sets its own deadline on the context; the whole operation —
 // daemon connection, lease acquisition, image resolution — runs under it.
 func (s *ContainerdSandbox) Create(ctx context.Context) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.createImpl(ctx)
+}
+
+// createImpl is Create's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	if s.cfg.Image == "" {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
 	}
@@ -323,6 +344,13 @@ func (s *ContainerdSandbox) Create(ctx context.Context) error {
 // than a wave of not-found errors. The image rootfs snapshot is never removed —
 // it belongs to the image.
 func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.destroyImpl(ctx)
+}
+
+// destroyImpl is Destroy's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) destroyImpl(ctx context.Context) error {
 	if s.snap == nil || s.tasks == nil {
 		return nil
 	}
@@ -370,6 +398,13 @@ func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
 // Stopping the task loses in-container process state. That is the price of a
 // coherent snapshot with this API.
 func (s *ContainerdSandbox) Capture(ctx context.Context) (WorkspaceState, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.captureImpl(ctx)
+}
+
+// captureImpl is Capture's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, error) {
 	if err := s.requireBackend(ctx); err != nil {
 		return WorkspaceState{}, err
 	}
@@ -473,6 +508,13 @@ func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n
 // layer, so applying a different state moves it again. This differs from the
 // git backend, whose states are freely reusable.
 func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.applyImpl(ctx, ws)
+}
+
+// applyImpl is Apply's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) error {
 	if ws.SnapshotKey == "" {
 		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
@@ -583,6 +625,13 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 // state. A mismatched release reports success (the target resource is simply
 // not found) while the real pin persists.
 func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws WorkspaceState) error {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.releaseStateImpl(ctx, ws)
+}
+
+// releaseStateImpl is ReleaseState's body; opMu is already held (shared).
+func (s *ContainerdSandbox) releaseStateImpl(ctx context.Context, ws WorkspaceState) error {
 	if ws.SnapshotKey == "" {
 		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
@@ -610,6 +659,13 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 
 // Exec runs a command inside the sandbox.
 func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResult, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.execImpl(ctx, req)
+}
+
+// execImpl is Exec's body; opMu is already held (shared).
+func (s *ContainerdSandbox) execImpl(ctx context.Context, req ExecRequest) (ExecResult, error) {
 	if err := s.requireBackend(ctx); err != nil {
 		return ExecResult{}, err
 	}
@@ -631,6 +687,13 @@ func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResu
 // the read runs in-container. The path is passed as a positional argument rather
 // than interpolated into the script so it cannot alter the command.
 func (s *ContainerdSandbox) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.readFileImpl(ctx, path)
+}
+
+// readFileImpl is ReadFile's body; opMu is already held (shared).
+func (s *ContainerdSandbox) readFileImpl(ctx context.Context, path string) ([]byte, error) {
 	if err := s.requireBackend(ctx); err != nil {
 		return nil, err
 	}
@@ -666,6 +729,13 @@ func (s *ContainerdSandbox) ReadFile(ctx context.Context, path string) ([]byte, 
 // first exec truncates, so retrying after a partial failure cannot append to
 // stale content.
 func (s *ContainerdSandbox) WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.writeFileImpl(ctx, path, data, perm)
+}
+
+// writeFileImpl is WriteFile's body; opMu is already held (shared).
+func (s *ContainerdSandbox) writeFileImpl(ctx context.Context, path string, data []byte, perm fs.FileMode) error {
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}

@@ -622,10 +622,12 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 	}
 }
 
-// TestCapture_ConcurrentWithApply drives the data race the base field's
-// locked read exists for: Capture snapshots baseGitHead while Apply reassigns
-// it. Errors are expected and ignored — the point is that -race sees the
-// unsynchronized read, not lifecycle success.
+// TestCapture_ConcurrentWithApply drives concurrent lifecycle operations:
+// both hold the exclusive op-level lock, so they serialize — an in-flight
+// Capture finishes before an Apply rebinding the sandbox starts, by
+// construction rather than by luck. Errors are expected and ignored; the
+// point is that the lock makes the interleaving safe, not lifecycle
+// success.
 func TestCapture_ConcurrentWithApply(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
