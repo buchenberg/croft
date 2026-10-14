@@ -2,9 +2,13 @@ package croft
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // This file is the snapshot-native delta: a tree-level three-way merge of two
@@ -230,4 +234,124 @@ func planDelta(apply []Change, theirsContent map[string][]byte) ([]deltaOp, erro
 	ops = append(ops, writes...)
 	ops = append(ops, symlinks...)
 	return ops, nil
+}
+
+// ErrDeltaConflict is returned by ApplyDelta when the incoming state's
+// changes conflict with the workspace's own changes since their common base:
+// both sides touched the same path incompatibly (divergent edits, mode
+// disagreement, modify vs delete, type change), or one side deleted a
+// directory the other wrote into. The refusal is atomic — the workspace is
+// untouched — and the error names the conflicting paths.
+var ErrDeltaConflict = errors.New("croft: delta conflicts with the workspace's own changes")
+
+// ApplyDelta merges ws's changes — everything since ws.BaseKey — onto the
+// current workspace at the tree level: a three-way merge of two daemon-side
+// diffs (base→ws, base→active) computed fully before anything is written.
+//
+// Mutating on success; the workspace is untouched when it refuses. Errors:
+// ErrDeltaConflict (conflicting paths named), ErrStateUnavailable (the base
+// or the state's layer has been released). The merge is tree-level, not
+// line-level: two divergent edits to the same file conflict even when they
+// touch different lines.
+//
+// A state with an empty BaseKey was captured from a sandbox that never
+// Applied — it has no merge base and cannot be merged.
+//
+// Like WriteFile, ApplyDelta takes the shared operation lock: it mutates
+// through the running task and never stops it, so exclusive lifecycle ops
+// (Capture/Apply/Destroy) serialize it away. Consistency under concurrent
+// Exec equals Diff's: the merge reflects the workspace as of some moment
+// during the call. The application phase itself is not transactional — the
+// refusal is the atomic part — matching the git-era version's clean-merge
+// path.
+func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, ws WorkspaceState) error {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.applyDeltaImpl(ctx, ws)
+}
+
+// applyDeltaImpl is ApplyDelta's body; opMu is already held (shared).
+func (s *ContainerdSandbox) applyDeltaImpl(ctx context.Context, ws WorkspaceState) error {
+	if ws.SnapshotKey == "" {
+		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
+	}
+	if ws.BaseKey == "" {
+		return fmt.Errorf("containerd sandbox: state %s has no base key: it was captured "+
+			"from a sandbox that never Applied a state, so there is no merge base to delta against",
+			ws.SnapshotKey)
+	}
+	if err := s.requireBackend(ctx); err != nil {
+		return err
+	}
+	if s.diff == nil {
+		return fmt.Errorf("containerd sandbox: diff service not configured")
+	}
+
+	s.mu.Lock()
+	id, active := s.id, s.activeKey
+	s.mu.Unlock()
+	if id == "" || active == "" {
+		return fmt.Errorf("containerd sandbox: ApplyDelta before Create")
+	}
+
+	// Both legs of the three-way merge, each a daemon-side diff computed,
+	// read, parsed (with post-images), and unpinned before the next step —
+	// the house blob-lease hygiene, on both calls.
+	theirs, theirsContent, err := s.computeChangesBetween(ctx, ws.BaseKey, ws.SnapshotKey, true)
+	if err != nil {
+		return fmt.Errorf("delta theirs (base to state): %w", err)
+	}
+	ours, oursContent, err := s.computeChangesBetween(ctx, ws.BaseKey, active, true)
+	if err != nil {
+		return fmt.Errorf("delta ours (base to workspace): %w", err)
+	}
+
+	// The merge is pure and complete before the first mutation: a non-empty
+	// conflict list means the workspace was never touched.
+	apply, conflicts := mergeChanges(theirs, ours, theirsContent, oursContent)
+	if len(conflicts) > 0 {
+		paths := make([]string, len(conflicts))
+		for i, c := range conflicts {
+			paths[i] = c.Path
+		}
+		return fmt.Errorf("%w: %s", ErrDeltaConflict, strings.Join(paths, ", "))
+	}
+	if len(apply) == 0 {
+		return nil // nothing changed on their side, or both sides moved identically
+	}
+
+	// Plan (and validate applicability) before the first write.
+	ops, err := planDelta(apply, theirsContent)
+	if err != nil {
+		return fmt.Errorf("containerd sandbox: plan delta: %w", err)
+	}
+
+	// Application: removes, dirs, writes, symlinks — planDelta's order. The
+	// impls, not the public methods: opMu is already held, and re-RLocking
+	// would queue behind any waiting lifecycle op.
+	for _, op := range ops {
+		resolved := s.resolve(op.path)
+		switch op.kind {
+		case opRemove:
+			if _, err := s.shell(ctx, `rm -rf -- "$1"`, resolved); err != nil {
+				return fmt.Errorf("containerd sandbox: delta remove %s: %w", op.path, err)
+			}
+		case opMkdir:
+			mode := strconv.FormatUint(uint64(effectivePerm(op.mode)), 8)
+			if _, err := s.shell(ctx, `mkdir -p -- "$1" && chmod "$2" "$1"`, resolved, mode); err != nil {
+				return fmt.Errorf("containerd sandbox: delta mkdir %s: %w", op.path, err)
+			}
+		case opWrite:
+			if err := s.writeFileImpl(ctx, op.path, op.content, op.mode); err != nil {
+				return fmt.Errorf("containerd sandbox: delta write: %w", err)
+			}
+		case opSymlink:
+			// rm-then-ln: the path may hold the base's regular file (a
+			// type replacement), and ln -s refuses to replace it.
+			if _, err := s.shell(ctx, `rm -rf -- "$2" && ln -s -- "$1" "$2"`, op.target, resolved); err != nil {
+				return fmt.Errorf("containerd sandbox: delta symlink %s: %w", op.path, err)
+			}
+		}
+	}
+	return nil
 }

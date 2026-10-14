@@ -813,7 +813,13 @@ func (s *ContainerdSandbox) writeFileImpl(ctx context.Context, path string, data
 		return err
 	}
 	path = s.resolve(path)
-	mode := strconv.FormatUint(uint64(perm.Perm()), 8)
+	// effectivePerm, not perm.Perm(): Perm() masks to 0777 and would drop
+	// setuid/setgid/sticky, silently changing the file's identity. ApplyDelta
+	// relies on this to preserve a state's special bits, and its merge rules
+	// compare full modes — applying a merge that loses setuid would make the
+	// next diff against the merged state report a change that was just
+	// "applied".
+	mode := strconv.FormatUint(uint64(effectivePerm(perm)), 8)
 
 	chunk := s.cfg.WriteChunkBytes
 	if chunk <= 0 {

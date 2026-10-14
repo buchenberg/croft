@@ -206,4 +206,18 @@ type Sandbox interface {
 	//
 	// Like Changes, Diff is read-only and takes the shared operation lock.
 	Diff(ctx context.Context, ws WorkspaceState) (string, error)
+
+	// ApplyDelta merges ws's changes — everything since ws.BaseKey — onto
+	// the current workspace at the tree level. Mutating on success; the
+	// workspace is untouched when it refuses. Errors: ErrDeltaConflict
+	// (conflicting paths named in the error), ErrStateUnavailable (the base
+	// or the state's layer has been released). A state with an empty
+	// BaseKey was captured from a sandbox that never Applied and cannot be
+	// merged.
+	//
+	// The merge is tree-level, not line-level: two divergent edits to the
+	// same file conflict even when they touch different lines. Like
+	// WriteFile, ApplyDelta takes the shared operation lock: it mutates
+	// through the running task and never stops it.
+	ApplyDelta(ctx context.Context, ws WorkspaceState) error
 }

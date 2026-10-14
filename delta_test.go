@@ -1,6 +1,8 @@
 package croft
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"reflect"
@@ -394,4 +396,138 @@ func TestPlanDelta(t *testing.T) {
 			t.Errorf("ops = %+v, want empty", ops)
 		}
 	})
+}
+
+// TestApplyDelta_RejectsZeroState pins the zero-value guard, matching
+// Apply/ReleaseState.
+func TestApplyDelta_RejectsZeroState(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	err := sb.ApplyDelta(context.Background(), WorkspaceState{})
+	if err == nil || !strings.Contains(err.Error(), "no snapshot key") {
+		t.Fatalf("err = %v, want a no-snapshot-key error", err)
+	}
+}
+
+// TestApplyDelta_RejectsStateWithoutBaseKey pins the fresh-lineage refusal:
+// a state captured from a sandbox that never Applied has no merge base, and
+// ApplyDelta says so instead of guessing one.
+func TestApplyDelta_RejectsStateWithoutBaseKey(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if state.BaseKey != "" {
+		t.Fatalf("precondition: BaseKey = %q, want empty", state.BaseKey)
+	}
+
+	err = sb.ApplyDelta(ctx, state)
+	if err == nil || !strings.Contains(err.Error(), "no base key") {
+		t.Fatalf("err = %v, want a no-base-key error", err)
+	}
+}
+
+// TestApplyDelta_BeforeCreate pins the guard: no active layer to merge onto.
+func TestApplyDelta_BeforeCreate(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ws := WorkspaceState{SnapshotKey: "croft/x/committed/1", BaseKey: "croft/x/committed/0"}
+	err := sb.ApplyDelta(context.Background(), ws)
+	if err == nil || !strings.Contains(err.Error(), "ApplyDelta before Create") {
+		t.Fatalf("err = %v, want an ApplyDelta-before-Create error", err)
+	}
+}
+
+// TestApplyDelta_NoDiffService pins the nil-collaborator error, the same
+// fail-loud convention as Changes.
+func TestApplyDelta_NoDiffService(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	ws := WorkspaceState{SnapshotKey: "croft/x/committed/1", BaseKey: "croft/x/committed/0"}
+	err := sb.ApplyDelta(ctx, ws)
+	if err == nil || !strings.Contains(err.Error(), "diff service not configured") {
+		t.Fatalf("err = %v, want a diff-service-not-configured error", err)
+	}
+}
+
+// TestApplyDelta_ReleasedBaseIsUnavailable pins the base-side half of the
+// ErrStateUnavailable contract: a base layer the snapshotter no longer has
+// (released and GC'd) fails the merge before any mutation, and the diff
+// machinery leaves no view or lease behind.
+func TestApplyDelta_ReleasedBaseIsUnavailable(t *testing.T) {
+	sb, snap, _, fl, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	ws := WorkspaceState{SnapshotKey: state.SnapshotKey, BaseKey: "croft/ghost/committed/1"}
+	err = sb.ApplyDelta(ctx, ws)
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("err = %v, want ErrStateUnavailable", err)
+	}
+	if keys := viewKeys(snap); len(keys) != 0 {
+		t.Errorf("diff views leaked: %v", keys)
+	}
+	// The per-call diff lease was deleted on the failure path (the sandbox's
+	// own lease is outlived by design — count only croft-diff- leases).
+	diffIDs := diffLeaseIDs(fl)
+	if len(diffIDs) == 0 {
+		t.Fatal("no diff lease was created")
+	}
+	fl.mu.Lock()
+	deleted := append([]string(nil), fl.deleted...)
+	fl.mu.Unlock()
+	for _, id := range diffIDs {
+		found := false
+		for _, d := range deleted {
+			if d == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("diff lease %s was not deleted after the failed merge", id)
+		}
+	}
+}
+
+// TestApplyDelta_ReleasedStateIsUnavailable pins the state-side half: the
+// base exists, the state's layer does not.
+func TestApplyDelta_ReleasedStateIsUnavailable(t *testing.T) {
+	sb, snap, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	base, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if err := sb.Apply(ctx, base); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	ws := WorkspaceState{SnapshotKey: "croft/ghost/committed/9", BaseKey: base.SnapshotKey}
+	err = sb.ApplyDelta(ctx, ws)
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("err = %v, want ErrStateUnavailable", err)
+	}
+	if keys := viewKeys(snap); len(keys) != 0 {
+		t.Errorf("diff views leaked: %v", keys)
+	}
 }

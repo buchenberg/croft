@@ -14,6 +14,8 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -285,21 +287,7 @@ func changeMode(hdr *tar.Header) fs.FileMode {
 // diffBlob computes the change set between ws and the sandbox's current
 // active layer, returning the daemon-produced blob's descriptor and a
 // cancel-free drop function that releases every resource the call pinned.
-//
-// The blob is unreferenced content the daemon's GC may collect at any time,
-// so the call pins it under a short-lived per-call lease (labeled
-// croft.lease:"diff", findable by a future reclaim sweep) for exactly the
-// caller's read window. drop removes the pin and deletes the lease — it runs
-// on every failure path, cancel-free, exactly like Capture's unpin-on-failure
-// branches. The blob itself is NOT deleted eagerly: concurrent calls may
-// compute the same blob (same state + workspace → same digest), and eager
-// deletion would break the other call's Read. The lease deletion unpins the
-// blob; the daemon's GC reclaims it once nothing references it.
-//
-// The lower side mounts through a View: committed snapshots refuse Mounts
-// ("not active or view: failed precondition", Task 0 finding), and the view
-// is removed before returning — Compare is the only consumer of the mounts.
-// A state whose layer has been released surfaces as ErrStateUnavailable.
+// It is the ws-vs-active case of diffBlobBetween.
 func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (ocispec.Descriptor, func(), error) {
 	if s.diff == nil {
 		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: diff service not configured")
@@ -308,18 +296,46 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 	s.mu.Lock()
 	id := s.id
 	active := s.activeKey
-	s.diffSeq++
-	viewKey := s.key(id, "diffview", s.diffSeq)
 	s.mu.Unlock()
 
 	if id == "" || active == "" {
 		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: diff before Create")
 	}
 
+	return s.diffBlobBetween(ctx, ws.SnapshotKey, active)
+}
+
+// diffBlobBetween computes the change set between any two snapshot keys —
+// lower (the older side) and upper — returning the daemon-produced blob's
+// descriptor and a cancel-free drop function that releases every resource
+// the call pinned. ApplyDelta uses it for both legs of the three-way merge
+// (base→theirs over two committed layers, base→ours against the active
+// layer); Changes/Diff use it through diffBlob.
+//
+// The blob is unreferenced content the daemon's GC may collect at any time,
+// so the call pins it under a short-lived per-call lease (labeled
+// croft.lease:"diff", findable by a future reclaim sweep) for exactly the
+// caller's read window. drop removes the pin and deletes the lease — it runs
+// on every failure path, cancel-free, exactly like Capture's unpin-on-failure
+// branches. The blob itself is NOT deleted eagerly: concurrent calls may
+// compute the same blob (same sides → same digest), and eager deletion would
+// break the other call's Read. The lease deletion unpins the blob; the
+// daemon's GC reclaims it once nothing references it.
+//
+// Each side mounts through mountSide: committed snapshots refuse Mounts
+// ("not active or view: failed precondition", Task 0 finding) and get a
+// throwaway View, removed before returning — Compare is the only consumer
+// of the mounts. A side whose layer has been released surfaces as
+// ErrStateUnavailable.
+func (s *ContainerdSandbox) diffBlobBetween(ctx context.Context, lowerKey, upperKey string) (ocispec.Descriptor, func(), error) {
+	if s.diff == nil {
+		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: diff service not configured")
+	}
+
 	mgr := s.leaseManager()
 
-	// Create the per-call lease first: the View below creates a snapshot that
-	// needs GC protection for the duration, and the Compare's blob needs a
+	// Create the per-call lease first: the Views below create snapshots that
+	// need GC protection for the duration, and the Compare's blob needs a
 	// pin. Nil manager means test fakes — no daemon, no GC, nothing to pin.
 	var leaseID string
 	if mgr != nil {
@@ -350,34 +366,24 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 		}
 	}
 
-	// View the committed state's layer: Mounts refuses committed snapshots
-	// ("not active or view: failed precondition", Task 0 finding).
-	if _, err := s.snap.View(ctx, viewKey, ws.SnapshotKey); err != nil {
+	lower, lowerDrop, err := s.mountSide(ctx, lowerKey)
+	if err != nil {
 		drop()
-		if errdefs.IsNotFound(err) {
-			return ocispec.Descriptor{}, nil, fmt.Errorf("%w: %s", ErrStateUnavailable, ws.SnapshotKey)
-		}
-		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: view state %s: %w", ws.SnapshotKey, err)
+		return ocispec.Descriptor{}, nil, err
 	}
 
-	lower, err := s.snap.Mounts(ctx, viewKey)
+	upper, upperDrop, err := s.mountSide(ctx, upperKey)
 	if err != nil {
-		_ = s.snap.Remove(context.WithoutCancel(ctx), viewKey)
+		lowerDrop()
 		drop()
-		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: mount state view %s: %w", viewKey, err)
-	}
-
-	upper, err := s.snap.Mounts(ctx, active)
-	if err != nil {
-		_ = s.snap.Remove(context.WithoutCancel(ctx), viewKey)
-		drop()
-		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: mount active %s: %w", active, err)
+		return ocispec.Descriptor{}, nil, err
 	}
 
 	desc, err := s.diff.Compare(ctx, lower, upper)
-	// The view is removed on every path: Compare is the only consumer of the
-	// mounts, and a leaked view holds disk until namespace teardown.
-	_ = s.snap.Remove(context.WithoutCancel(ctx), viewKey)
+	// The views are removed on every path: Compare is the only consumer of
+	// the mounts, and a leaked view holds disk until namespace teardown.
+	upperDrop()
+	lowerDrop()
 	if err != nil {
 		drop()
 		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: compare snapshots: %w", err)
@@ -388,10 +394,9 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 	// serves as the lease resource id.
 	//
 	// The blob is NOT deleted eagerly in drop: concurrent calls may compute
-	// the same blob (same state + workspace → same digest), and eager
-	// deletion would break the other call's Read. The lease deletion in
-	// drop unpins the blob; the daemon's GC reclaims it once nothing
-	// references it.
+	// the same blob (same sides → same digest), and eager deletion would
+	// break the other call's Read. The lease deletion in drop unpins the
+	// blob; the daemon's GC reclaims it once nothing references it.
 	if mgr != nil {
 		res := leases.Resource{ID: desc.Digest.String(), Type: "content"}
 		if err := mgr.AddResource(ctx, leases.Lease{ID: leaseID}, res); err != nil {
@@ -407,6 +412,59 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 	}
 
 	return desc, drop, nil
+}
+
+// mountSide resolves one side of a comparison to its mounts, plus a
+// cancel-free cleanup that removes any view created for it.
+//
+// An active snapshot serves Mounts directly. A committed snapshot refuses
+// Mounts ("not active or view: failed precondition", Task 0 finding), so it
+// gets a throwaway View first — keyed off diffSeq so concurrent calls never
+// collide, and never off seq, because state identity is sequence-derived and
+// views must not move the capture sequence. A key the snapshotter does not
+// have — a released state's layer — surfaces as ErrStateUnavailable.
+func (s *ContainerdSandbox) mountSide(ctx context.Context, key string) ([]mount.Mount, func(), error) {
+	info, err := s.snap.Stat(ctx, key)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrStateUnavailable, key)
+		}
+		return nil, nil, fmt.Errorf("containerd sandbox: stat snapshot %s: %w", key, err)
+	}
+	if info.Kind == snapshots.KindActive {
+		mounts, err := s.snap.Mounts(ctx, key)
+		if err != nil {
+			return nil, nil, fmt.Errorf("containerd sandbox: mount active %s: %w", key, err)
+		}
+		return mounts, func() {}, nil
+	}
+
+	s.mu.Lock()
+	id := s.id
+	if id == "" {
+		// No sandbox identity (a call path that validated nothing): views
+		// still need a unique key, and an ephemeral id cannot collide with
+		// real state keys.
+		id = newSandboxID()
+	}
+	s.diffSeq++
+	viewKey := s.key(id, "diffview", s.diffSeq)
+	s.mu.Unlock()
+
+	if _, err := s.snap.View(ctx, viewKey, key); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrStateUnavailable, key)
+		}
+		return nil, nil, fmt.Errorf("containerd sandbox: view state %s: %w", key, err)
+	}
+	cleanup := func() { _ = s.snap.Remove(context.WithoutCancel(ctx), viewKey) }
+
+	mounts, err := s.snap.Mounts(ctx, viewKey)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("containerd sandbox: mount state view %s: %w", viewKey, err)
+	}
+	return mounts, cleanup, nil
 }
 
 // withReaderTask prepares a throwaway reader snapshot from ws's committed
@@ -668,7 +726,7 @@ func (s *ContainerdSandbox) Changes(ctx context.Context, ws WorkspaceState) ([]C
 // opaque dirs. When withContent is true, ordinary entries' content is
 // buffered into the returned postImages map (Diff uses it for post-images
 // without re-reading the workspace). Changes passes false — it does not
-// need the content.
+// need the content. It is the ws-vs-active case of computeChangesBetween.
 func (s *ContainerdSandbox) computeChanges(ctx context.Context, ws WorkspaceState, withContent bool) ([]Change, map[string][]byte, error) {
 	if ws.SnapshotKey == "" {
 		return nil, nil, fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
@@ -685,9 +743,25 @@ func (s *ContainerdSandbox) computeChanges(ctx context.Context, ws WorkspaceStat
 		return nil, nil, fmt.Errorf("containerd sandbox: Changes before Create")
 	}
 
+	return s.computeChangesBetween(ctx, ws.SnapshotKey, active, withContent)
+}
+
+// computeChangesBetween computes and parses the change set between any two
+// snapshot keys — lower (the older side) and upper — without add/modify
+// classification (that is the caller's job: Changes and Diff classify via a
+// reader task; ApplyDelta's merge algebra does not need it). Opaque
+// directories resolve against the LOWER layer: its contents are what the
+// marker hides. ApplyDelta uses this for both legs of the three-way merge;
+// the per-call blob pins are dropped before returning, as in the ws-vs-active
+// case.
+func (s *ContainerdSandbox) computeChangesBetween(ctx context.Context, lowerKey, upperKey string, withContent bool) ([]Change, map[string][]byte, error) {
+	if err := s.requireBackend(ctx); err != nil {
+		return nil, nil, err
+	}
+
 	// Compute the daemon-side diff blob, read it, and drop the pin. drop is
 	// cancel-free, so it runs even if Read fails or the context is cancelled.
-	desc, drop, err := s.diffBlob(ctx, ws)
+	desc, drop, err := s.diffBlobBetween(ctx, lowerKey, upperKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -710,18 +784,19 @@ func (s *ContainerdSandbox) computeChanges(ctx context.Context, ws WorkspaceStat
 		return nil, nil, err
 	}
 
-	// Resolve opaque dirs (defensive .wh..wh..opq path): enumerate the state's
-	// contents and emit a ChangeDelete for each file the opaque dir hid.
-	// Paths already represented in the change list — modified or explicitly
-	// whiteouted by the upper tree — are skipped: an opaque marker hides the
-	// lower entries, but the upper tar can replace the same names, and a
-	// synthesized delete alongside a modify would be contradictory.
+	// Resolve opaque dirs (defensive .wh..wh..opq path): enumerate the lower
+	// layer's contents and emit a ChangeDelete for each file the opaque dir
+	// hid. Paths already represented in the change list — modified or
+	// explicitly whiteouted by the upper tree — are skipped: an opaque marker
+	// hides the lower entries, but the upper tar can replace the same names,
+	// and a synthesized delete alongside a modify would be contradictory.
 	existing := make(map[string]bool, len(changes))
 	for _, c := range changes {
 		existing[c.Path] = true
 	}
+	lowerState := WorkspaceState{SnapshotKey: lowerKey}
 	for _, op := range opaques {
-		names, err := s.readDirAt(ctx, ws, op.path)
+		names, err := s.readDirAt(ctx, lowerState, op.path)
 		if err != nil {
 			return nil, nil, err
 		}

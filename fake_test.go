@@ -74,7 +74,9 @@ func (f *fakeSnapshotter) Stat(_ context.Context, key string) (snapshots.Info, e
 	defer f.mu.Unlock()
 	l, ok := f.ls[key]
 	if !ok {
-		return snapshots.Info{}, fmt.Errorf("snapshot %s: not found", key)
+		// errdefs-wrapped, like the real snapshotter's gRPC NotFound: the
+		// diff machinery maps a missing layer to ErrStateUnavailable.
+		return snapshots.Info{}, fmt.Errorf("snapshot %s: %w", key, errdefs.ErrNotFound)
 	}
 	return snapshots.Info{Kind: l.kind, Name: key, Parent: l.parent}, nil
 }
