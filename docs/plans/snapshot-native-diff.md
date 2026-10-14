@@ -178,9 +178,16 @@ goldens, not off memory of containerd internals.
   to whatever Task 0 found.
 - Wire it in `connect` (client.go:86-93 block) with namespace injection;
   add `WithDiffService` option; document the nil-collaborator error.
-- Extend the test fake to a `fakeDiffService` that computes the change set
-  from the fake snapshotter's in-memory trees and emits a tar in the golden
-  format.
+- The test fake: **discovery while implementing (2026-10-14) — the fake
+  snapshotter has no filesystem model** (layers are `{kind, parent,
+  writable, writes}` and the fake's exec answers canned strings), so the
+  original "compute from the fake's in-memory trees" is impossible as
+  written. The fake becomes a programmable file tree instead: croft's
+  WriteFile records into it, `cat` serves from it, and tests drive
+  deletions/mode changes/symlinks through small fake helpers; the
+  `fakeDiffService` walks two recorded trees and emits a tar in the golden
+  format. Real differ semantics stay live-tested — the fake pins croft's
+  orchestration, not the daemon's walker.
 
 ### Task 2 — Blob lifecycle
 - `diffBlob(ctx, ws) (descriptor, drop func(), error)`: mount both sides

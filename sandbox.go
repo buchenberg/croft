@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 
 	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // sandboxLeaseLabel marks leases this adapter owns.
@@ -125,6 +127,24 @@ type imageService interface {
 	RootfsSnapshot(ctx context.Context, ref string) (string, error)
 }
 
+// diffService is the daemon-side diff half of containerd this sandbox needs:
+// it compares two mount sets and returns the produced change-set blob.
+//
+// Compare runs daemon-side — the client never mounts anything — and returns a
+// descriptor for content the daemon wrote to its own content store. Read
+// returns those bytes; the descriptor's digest also serves as the lease
+// resource id for pinning the blob against the daemon's garbage collector
+// (the "content" resource type, per the Task 0 spike).
+type diffService interface {
+	// Compare computes the change set between lower and upper mounts and
+	// returns the descriptor of the produced blob.
+	Compare(ctx context.Context, lower, upper []mount.Mount) (ocispec.Descriptor, error)
+
+	// Read returns the bytes of a blob Compare produced. Callers pin the
+	// blob for the duration (the daemon's GC may collect unpinned content).
+	Read(ctx context.Context, desc ocispec.Descriptor) ([]byte, error)
+}
+
 // ContainerdSandbox is a workspace backed by containerd.
 //
 // One instance corresponds to one workspace. Safe for concurrent use:
@@ -172,6 +192,13 @@ type ContainerdSandbox struct {
 	// (Create, Destroy, Capture, Apply), shared for workspace operations
 	// (Exec, ReadFile, WriteFile, ReleaseState). See the struct doc.
 	opMu sync.RWMutex
+
+	// diff compares snapshot layers daemon-side. Nil until connect wires
+	// the real adapter, and nil forever on a NewWithBackend sandbox built
+	// without WithDiffService — the change-set operations report that as a
+	// configuration error, the same fail-loud convention as a nil lease
+	// manager.
+	diff diffService
 	// leases is the daemon's lease manager. Nil when the collaborators were
 	// substituted (tests): a fake snapshotter has no garbage collector to hold
 	// anything back from, so there is nothing to lease.
@@ -243,6 +270,15 @@ type BackendOption func(*ContainerdSandbox)
 // durable (see NewWithBackend).
 func WithLeases(mgr leases.Manager) BackendOption {
 	return func(s *ContainerdSandbox) { s.leases = mgr }
+}
+
+// WithDiffService supplies the daemon-side diff collaborator for hosts
+// embedding the sandbox over an existing containerd client — pass the
+// sandbox's own adapter or an equivalent namespace-wrapped
+// client.DiffService(). Without it, a NewWithBackend sandbox has no
+// change-set operations.
+func WithDiffService(ds diffService) BackendOption {
+	return func(s *ContainerdSandbox) { s.diff = ds }
 }
 
 // ID returns the current container identity, or "" before Create. It changes

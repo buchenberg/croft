@@ -9,6 +9,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/containerd/containerd/v2/core/mount"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -773,5 +776,30 @@ func TestWorkspaceOpDelaysLifecycle(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("Capture did not complete after the shared holder released")
 		}
+	}
+}
+
+// stubDiff stands in for the daemon-side diff collaborator in wiring tests.
+type stubDiff struct{}
+
+func (stubDiff) Compare(_ context.Context, lower, upper []mount.Mount) (ocispec.Descriptor, error) {
+	return ocispec.Descriptor{}, nil
+}
+
+func (stubDiff) Read(_ context.Context, _ ocispec.Descriptor) ([]byte, error) { return nil, nil }
+
+// TestWithDiffServiceWiresTheCollaborator pins the option's contract: a
+// NewWithBackend sandbox has no diff service unless the option supplies one,
+// and the option supplies exactly the collaborator it is given. The
+// change-set operations' nil check rides on this.
+func TestWithDiffServiceWiresTheCollaborator(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	if sb.diff != nil {
+		t.Error("a NewWithBackend sandbox built without WithDiffService must have no diff service")
+	}
+
+	wired := NewWithBackend(Config{Image: "example/dev:latest"}, nil, nil, nil, WithDiffService(stubDiff{}))
+	if wired.diff == nil {
+		t.Error("WithDiffService must wire the diff collaborator")
 	}
 }
