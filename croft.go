@@ -50,12 +50,13 @@
 //
 // # Status
 //
-// The snapshot lifecycle, teardown ordering, layer pruning, file I/O, and diff
-// are implemented and unit-tested against containerd's real
+// The snapshot lifecycle, teardown ordering, layer pruning, and file I/O are
+// implemented and unit-tested against containerd's real
 // snapshots.Snapshotter interface, using an in-memory fake that enforces the
 // same invariants as the overlayfs snapshotter: a key cannot be prepared twice,
-// a parent must be committed, only a committed layer can be committed once, a
-// committed layer is read-only, and a layer with children cannot be removed.
+// a parent must be committed, only an active layer can be committed (exactly
+// once — an already committed layer is rejected), a committed layer is
+// read-only, and a layer with children cannot be removed.
 //
 // The daemon adapter (client.go) compiles but has not been exercised on every
 // supported daemon configuration; the live test suite runs it against a real
