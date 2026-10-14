@@ -177,8 +177,8 @@ func TestCapture_BeforeCreateFails(t *testing.T) {
 // TestDestroy_RemovesActiveLayerKeepsStates pins the state-durability half of
 // the teardown contract: the active layer is the sandbox's private writable
 // layer and dies with it, while committed layers are states handed to callers
-// and must survive — a caller may Apply one long after Destroy, and the kernel
-// contract says states have no lifecycle.
+// and must survive — a caller may Apply one long after Destroy, and states
+// have no lifecycle.
 func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
@@ -237,8 +237,8 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	}
 }
 
-// TestDestroy_IsIdempotent pins the contract the kernel relies on: Discard,
-// Merge, and Halt may all call Destroy, and a second call must not error.
+// TestDestroy_IsIdempotent pins the contract the host relies on: discard,
+// merge, and halt paths may all call Destroy, and a second call must not error.
 func TestDestroy_IsIdempotent(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()

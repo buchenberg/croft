@@ -2,7 +2,7 @@
 
 package croft
 
-// Live-daemon acceptance test for the containerd backend (plan 05 §3, T0.5).
+// Live-daemon acceptance test for the containerd backend.
 //
 // Everything else in this package runs against fakeSnapshotter and fakeTasks.
 // Those fakes enforce the overlayfs snapshotter's invariants, so they cover the
@@ -46,8 +46,8 @@ package croft
 // mkdir -p on the workdir and tears the sandbox back down if that fails.
 //
 // F2 — FIXED. The FIFO directory was hardcoded to containerd's root-owned
-// default with no knob, making the backend root-client-only; yaah is a developer
-// CLI running as an ordinary user and could not have driven it. Config.FIFODir
+// default with no knob, making the backend root-client-only; an unprivileged
+// client could not have driven it. Config.FIFODir
 // now threads into cio.WithFIFODir, and these tests set it to a t.TempDir() so
 // the knob is exercised on every run. requireRoot remains, but for the daemon's
 // socket permissions rather than anything the client creates.
@@ -86,8 +86,7 @@ const (
 // The image needs both sh and git in-container: sandbox.go shells out to
 // cat/mkdir/dirname/chmod for file I/O and to git for Diff. alpine/git carries
 // both at ~15MB. Its BusyBox userland supports every command this backend uses
-// (unlike yaah's sandboxWorkspace, which needs GNU find -printf and would
-// require a glibc image).
+// BusyBox userland supports every command croft's file operations use.
 const (
 	defaultImage     = "docker.io/alpine/git:latest"
 	defaultNamespace = "croft-live"
@@ -124,7 +123,7 @@ func loadLiveConfig(t *testing.T) liveConfig {
 
 	addr := strings.TrimSpace(os.Getenv(envAddr))
 	if addr == "" {
-		t.Skipf("%s not set: skipping live containerd verification (plan 05 §3)", envAddr)
+		t.Skipf("%s not set: skipping live containerd verification", envAddr)
 	}
 	requireRoot(t)
 
@@ -281,9 +280,9 @@ func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, com
 //
 // States outlive sandboxes by design now, and the live suite runs against a
 // persistent namespace: without this, every run would leave another pinned
-// snapshot behind. States captured *inside* Materialize (the substrate's own
-// captures) have no test-side handle and intentionally keep their pins —
-// releasing them is the kernel's state-expiry business, not the test's.
+// snapshot behind. States the library captured for its own bookkeeping have
+// no test-side handle and intentionally keep their pins — expiry is the pin
+// holder's business, not the test's.
 func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) WorkspaceState {
 	t.Helper()
 	state, err := sb.Capture(ctx)
@@ -300,9 +299,8 @@ func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) Works
 	return state
 }
 
-// TestLive_FullLifecycle is the acceptance sequence from plan 05 §3: create
-// from a public image, write, capture, mutate, apply, verify the rollback,
-// exec, diff, destroy.
+// TestLive_FullLifecycle is the acceptance sequence: create from a public
+// image, write, capture, mutate, apply, verify the rollback, exec, destroy.
 //
 // The rollback step is the point of the whole backend. Everything before it is
 // setup; if Apply does not restore the pre-mutation content across a real
@@ -396,10 +394,10 @@ func TestLive_FullLifecycle(t *testing.T) {
 	if strings.Contains(res.Stdout, "to-stderr") {
 		t.Error("stderr leaked into stdout: the streams are not separated")
 	}
-	// Plan 05 §5 item 4: the git backend leaves Duration unset, the containerd
-	// backend must populate it.
+	// Duration is the caller's only signal of a command's cost; it must be
+	// populated.
 	if res.Duration <= 0 {
-		t.Errorf("Exec Duration = %v, want > 0 (plan 05 §5 item 4)", res.Duration)
+		t.Errorf("Exec Duration = %v, want > 0", res.Duration)
 	}
 
 	// A non-zero exit is a result, not an error: Exec returns the code with a
@@ -477,10 +475,10 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 }
 
 // TestLive_ApplyAfterDestroyRecyclesState pins the recycle path: a captured
-// state re-provisions a sandbox after the capturing sandbox's Destroy. This is
-// the acceptance sequence the substrate integration used to carry (write,
-// capture, destroy, apply, verify) — the durability contract made observable:
-// states outlive sandboxes, and an Apply after Destroy proves it end to end.
+// state re-provisions a sandbox after the capturing sandbox's Destroy. The
+// sequence (write, capture, destroy, apply, verify) is the durability contract
+// made observable: states outlive sandboxes, and an Apply after Destroy proves
+// it end to end.
 func TestLive_ApplyAfterDestroyRecyclesState(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)

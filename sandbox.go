@@ -54,7 +54,7 @@ type Config struct {
 	// containerd users on the same host.
 	Namespace string
 
-	// Image is the base image provisioned for the root scope. Required: a
+	// Image is the base image provisioned for the workspace. Required: a
 	// sandbox with no base filesystem has nothing to run.
 	Image string
 
@@ -127,7 +127,7 @@ type imageService interface {
 	RootfsSnapshot(ctx context.Context, ref string) (string, error)
 }
 
-// ContainerdSandbox is a workspace substrate backed by containerd.
+// ContainerdSandbox is a workspace backed by containerd.
 //
 // One instance corresponds to one workspace. Safe for concurrent use:
 // lifecycle operations (Create, Destroy, Capture, Apply) hold an
@@ -504,9 +504,9 @@ func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n
 // sandbox's active layer, but they survive: each was handed to a caller as a
 // WorkspaceState, and states outlive sandboxes. Reclaim them with ReleaseState
 // when the caller is done with them. Only the abandoned active layer is
-// removed. Single-use per state: the sandbox now runs on the given committed
-// layer, so applying a different state moves it again. This differs from the
-// git backend, whose states are freely reusable.
+// removed. Applying a different state moves the sandbox again: a state's
+// layer becomes whatever runs next, and callers must not assume two sandboxes
+// applying the same state share identity.
 func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()

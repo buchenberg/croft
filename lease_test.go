@@ -461,7 +461,7 @@ func TestCreate_TimeoutCoversLeaseAcquisition(t *testing.T) {
 }
 
 // TestCapture_PinsCommittedStatesUnderStatesLease is the load-bearing unit test
-// for state durability. The kernel's contract is that a WorkspaceState outlives
+// for state durability. The contract is that a WorkspaceState outlives
 // the sandbox, and the sandbox lease cannot provide that: Destroy releases it.
 // Every Capture must therefore pin its committed layer under the namespace's
 // shared states lease, and that lease must be adopted (not duplicated) by later
@@ -669,10 +669,10 @@ func TestReleaseState_DropsTheStatesLeasePin(t *testing.T) {
 	}
 }
 
-// TestReleaseState_RejectsForeignAndIncompleteStates pins the guard rails: a
-// git backend's state must never reach the containerd lease manager, and a
-// containerd state without a snapshot key is a bug, not a no-op.
-func TestReleaseState_RejectsForeignAndIncompleteStates(t *testing.T) {
+// TestReleaseState_RejectsIncompleteStates pins the guard rail: a state
+// without a snapshot key is a bug, not a no-op, and must never touch the
+// lease manager.
+func TestReleaseState_RejectsIncompleteStates(t *testing.T) {
 	sb, _, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
