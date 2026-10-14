@@ -495,23 +495,48 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 	return fn(ctx, readerID)
 }
 
-// readerTest runs a shell test expression against one resolved path in the
-// reader task, returning true when it exits 0. A shell usage error (exit > 1
-// from test) is distinguished from a false result and surfaces as an error —
-// a broken test expression must not silently classify every path as absent.
-func (s *ContainerdSandbox) readerTest(ctx context.Context, readerID, test, resolved string) (bool, error) {
-	res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-		Command: "sh",
-		Args:    []string{"-c", test, "croft", resolved},
-		Cwd:     s.cfg.workdir(),
-	})
+// Type characters reported by readerType's probe.
+const (
+	typeAbsent  = "x" // not present in the state's layer
+	typeRegular = "f" // regular file
+	typeDir     = "d" // directory
+	typeSymlink = "l" // symlink, including a dangling one
+	typeSpecial = "s" // exists but is not regular/dir/link: FIFO, socket, device
+)
+
+// specialFileMode masks the fs.FileMode type bits that identify a special
+// file — a FIFO, socket, or device node. Directories (ModeDir) and symlinks
+// (ModeSymlink) have their own rendering paths and are not included.
+const specialFileMode = fs.ModeNamedPipe | fs.ModeSocket | fs.ModeDevice | fs.ModeIrregular
+
+// readerTypeScript is the single-exec type probe run against the state's
+// layer. One POSIX sh command reports the path's type as one character:
+// "l" symlink (checked first, so a dangling link is still a link), "d"
+// directory, "f" regular file, "s" special file (exists but is not a
+// regular file, directory, or link — FIFO, socket, device), "x" absent.
+//
+// It consolidates the existence check (test -e || test -L) and the old-side
+// type classification (test -d, test -L) into ONE exec per changed path, and
+// it identifies special files so the pre-image cat never runs on them:
+// open(2) on a FIFO blocks until a writer appears, which would hang the
+// exec until the context deadline.
+const readerTypeScript = `if [ -L "$1" ]; then printf l; elif [ -d "$1" ]; then printf d; elif [ -f "$1" ]; then printf f; elif [ -e "$1" ]; then printf s; else printf x; fi`
+
+// readerType runs the type probe against one resolved path in the reader
+// task and returns one of the type* constants. Unexpected probe output is
+// an error, not a classification — a broken shell must not silently report
+// every path as absent (which would misrender modifies as adds).
+func (s *ContainerdSandbox) readerType(ctx context.Context, readerID, resolved string) (string, error) {
+	out, err := s.readerExecOut(ctx, readerID, readerTypeScript, resolved)
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	if res.ExitCode > 1 {
-		return false, fmt.Errorf("exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	switch t := strings.TrimSpace(out); t {
+	case typeAbsent, typeRegular, typeDir, typeSymlink, typeSpecial:
+		return t, nil
+	default:
+		return "", fmt.Errorf("type probe: unexpected output %q", out)
 	}
-	return res.ExitCode == 0, nil
 }
 
 // readerExecOut runs a shell command against one resolved path in the reader
@@ -719,10 +744,13 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 		return nil, err
 	}
 
-	// Classify in the lower tree: ChangeModify → ChangeAdd if absent
-	// (test -e || test -L, so dangling symlinks are not misclassified);
+	// Classify in the lower tree with one type-probe exec per path
+	// (readerTypeScript): ChangeModify → ChangeAdd when the old side is
+	// absent (a dangling symlink probes "l", so it stays a modify);
 	// ChangeDelete → set IsDir / ModeSymlink from the old type so consumers
-	// know what was deleted (permission bits stay 0 for deletes).
+	// know what was deleted (permission bits stay 0 for deletes; a deleted
+	// special file stays untyped — the Change contract distinguishes only
+	// directories and symlinks for deletes).
 	hasWork := false
 	for _, c := range changes {
 		if c.Kind == ChangeModify || c.Kind == ChangeDelete {
@@ -737,42 +765,22 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 				resolved := s.resolve(c.Path)
 				switch c.Kind {
 				case ChangeModify:
-					// test -e follows symlinks and returns false for a
-					// dangling link. || test -L catches the link itself.
-					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-						Command: "sh",
-						Args:    []string{"-c", `test -e "$1" || test -L "$1"`, "croft", resolved},
-						Cwd:     s.cfg.workdir(),
-					})
+					old, err := s.readerType(ctx, readerID, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: check %s at state: %w", c.Path, err)
 					}
-					if res.ExitCode != 0 {
+					if old == typeAbsent {
 						c.Kind = ChangeAdd
 					}
 				case ChangeDelete:
-					// Classify the deleted path's old type.
-					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-						Command: "sh",
-						Args:    []string{"-c", `test -L "$1"`, "croft", resolved},
-						Cwd:     s.cfg.workdir(),
-					})
+					old, err := s.readerType(ctx, readerID, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
 					}
-					if res.ExitCode == 0 {
+					switch old {
+					case typeSymlink:
 						c.Mode |= fs.ModeSymlink
-						continue
-					}
-					res, err = s.tasks.Exec(ctx, readerID, ExecRequest{
-						Command: "sh",
-						Args:    []string{"-c", `test -d "$1"`, "croft", resolved},
-						Cwd:     s.cfg.workdir(),
-					})
-					if err != nil {
-						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
-					}
-					if res.ExitCode == 0 {
+					case typeDir:
 						c.IsDir = true
 					}
 				}
@@ -805,13 +813,16 @@ func (s *ContainerdSandbox) Diff(ctx context.Context, ws WorkspaceState) (string
 //
 // Efficiency notes: this does NOT call changesImpl. Instead it shares
 // computeChanges (which parses the tar with content), then runs ONE reader
-// task that does all three kinds of state-layer work — add/modify existence
-// checks (test -e), delete-type classification (test -L/test -d), and
-// pre-image reads (cat). The old flow created up to three separate reader
-// tasks (one per concern), each paying Prepare+StartTask+StopTask+Remove.
-// Post-images come from the tar itself (parseChangeTarWithContent), not from
-// re-reading the workspace — saving one exec per add/modify file and
-// eliminating the race between the diff computation and the post-image read.
+// task that does all three kinds of state-layer work — old-side type probes
+// (one exec classifying existence and type: link/dir/regular/special),
+// delete-type classification (same probe), and pre-image reads (cat, only
+// ever on a probed regular file). The old flow created up to three separate
+// reader tasks (one per concern), each paying Prepare+StartTask+StopTask+
+// Remove, and later iterations paid two-to-four separate test execs per
+// changed path. Post-images come from the tar itself
+// (parseChangeTarWithContent), not from re-reading the workspace — saving
+// one exec per add/modify file and eliminating the race between the diff
+// computation and the post-image read.
 func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (string, error) {
 	// Compute the change list and extract post-images from the blob.
 	changes, postImages, err := s.computeChanges(ctx, ws, true)
@@ -837,33 +848,31 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 
 				switch c.Kind {
 				case ChangeModify:
-					// Existence check: absent from the lower tree → add.
-					// test -e follows symlinks and returns false for a
-					// dangling link; || test -L catches the link itself.
-					exists, err := s.readerTest(ctx, readerID, `test -e "$1" || test -L "$1"`, resolved)
+					// One probe classifies the old side: existence AND type
+					// in a single exec. Absent from the state's layer → add.
+					// A dangling symlink probes "l" (the probe checks -L
+					// first), so it stays a modify.
+					old, err := s.readerType(ctx, readerID, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: check %s at state: %w", c.Path, err)
 					}
-					if !exists {
+					if old == typeAbsent {
 						c.Kind = ChangeAdd
 						continue // adds have no pre-image
 					}
-					// Directories have no content to read — they render
-					// as markers (or nothing, for modifies).
-					if c.IsDir {
-						continue
-					}
 
-					if c.Mode&fs.ModeSymlink != 0 {
+					switch {
+					case c.IsDir:
+						// Directories have no content to read — they render
+						// as markers (or nothing, for modifies).
+						continue
+
+					case c.Mode&fs.ModeSymlink != 0:
 						// New side is a symlink. The old target comes from
 						// the state's layer — but only if the old side was
 						// also a symlink (file→symlink replacements have no
-						// old target; they render as add-like).
-						isLink, err := s.readerTest(ctx, readerID, `test -L "$1"`, resolved)
-						if err != nil {
-							return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
-						}
-						if isLink {
+						// old target; they render add-like).
+						if old == typeSymlink {
 							target, err := s.readerExecOut(ctx, readerID, `readlink -- "$1"`, resolved)
 							if err != nil {
 								return fmt.Errorf("containerd sandbox: readlink %s at state: %w", c.Path, err)
@@ -872,40 +881,39 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 							preImages[c.Path] = []byte(strings.TrimSuffix(target, "\n"))
 						}
 						continue
-					}
 
-					// New side is a regular file. Classify the OLD side: a
-					// directory (dir→file replacement) would make cat fail
-					// ("Is a directory"), and a symlink (symlink→file
-					// replacement) would make cat read the referent — which
-					// is not the file's old content, and fails outright for
-					// a dangling link. Both are type replacements: skip the
-					// read and render with no pre-image (add-like).
-					oldIsDir, err := s.readerTest(ctx, readerID, `test -d "$1"`, resolved)
-					if err != nil {
-						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
-					}
-					if oldIsDir {
+					case c.Mode&specialFileMode != 0:
+						// New side is a special file (FIFO or device —
+						// sockets do not survive on overlayfs): neither
+						// side has readable content, and cat on the old
+						// side could block (FIFO) or lie (device). It
+						// renders as a type marker.
 						continue
-					}
-					oldIsLink, err := s.readerTest(ctx, readerID, `test -L "$1"`, resolved)
-					if err != nil {
-						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
-					}
-					if oldIsLink {
+
+					case old != typeRegular:
+						// Type replacement (old side directory, symlink, or
+						// special file → new side regular file): no
+						// pre-image is readable — cat would fail (directory),
+						// read the referent instead of the link (symlink),
+						// or block in open(2) (FIFO/device). The pre-image
+						// stays absent and renderFileChange renders the
+						// replacement add-like.
 						continue
 					}
 					// Old side is a regular file: fall through to the read.
 
 				case ChangeDelete:
-					// Classify the deleted path's old type so rendering
-					// can route it: symlink → target line, directory →
-					// marker, regular file → content diff.
-					isLink, err := s.readerTest(ctx, readerID, `test -L "$1"`, resolved)
+					// One probe classifies the deleted path's old type so
+					// rendering can route it: symlink → target line,
+					// directory → marker, special file → delete-like with
+					// no content (cat on a FIFO would block), regular file
+					// → content diff.
+					old, err := s.readerType(ctx, readerID, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
 					}
-					if isLink {
+					switch old {
+					case typeSymlink:
 						c.Mode |= fs.ModeSymlink
 						target, err := s.readerExecOut(ctx, readerID, `readlink -- "$1"`, resolved)
 						if err != nil {
@@ -914,24 +922,25 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 						// Strip only the newline readlink appends.
 						preImages[c.Path] = []byte(strings.TrimSuffix(target, "\n"))
 						continue
-					}
-					isDir, err := s.readerTest(ctx, readerID, `test -d "$1"`, resolved)
-					if err != nil {
-						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
-					}
-					if isDir {
+					case typeDir:
 						c.IsDir = true
 						continue // directories render markers, no content read
+					case typeSpecial:
+						continue // no content to read; renders delete-like
 					}
-					// Regular file: fall through to the pre-image read.
+					// Regular file — or, defensively, absent: the cat below
+					// fails loudly, the documented missing-path contract.
+					// Fall through to the pre-image read.
 				}
 
-				// Pre-image read (ChangeModify of a regular file that
-				// exists, or ChangeDelete of a regular file). One cat per
-				// file. A read failure fails the whole call — the plan's
-				// documented race contract (Task 4's missing-path rule):
-				// retryable, and one silent empty pre-image would render a
-				// delete-as-nothing or a modify-as-add, which is worse.
+				// Pre-image read — only ever on a path the probe reported as a
+				// regular file (or, for deletes, defensively on an absent path,
+				// where the cat failure below is the documented missing-path
+				// contract). One cat per file. A read failure fails the whole
+				// call — the plan's documented race contract (Task 4's
+				// missing-path rule): retryable, and one silent empty pre-image
+				// would render a delete-as-nothing or a modify-as-add, which is
+				// worse.
 				content, err := s.readerExecOut(ctx, readerID, `cat -- "$1"`, resolved)
 				if err != nil {
 					return fmt.Errorf("containerd sandbox: read %s at state: %w", c.Path, err)
@@ -983,6 +992,17 @@ func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Build
 		renderSymlinkChange(out, c, preImages, postImages)
 		return nil
 
+	case c.Mode&specialFileMode != 0:
+		// Special file (FIFO, device, socket): no content to diff on
+		// either side. Render a type marker, the way directories do.
+		// Deletes never carry these bits (delete classification sets
+		// only ModeSymlink/IsDir), so this covers adds and modifies.
+		switch c.Kind {
+		case ChangeAdd, ChangeModify:
+			fmt.Fprintf(out, "new special file: %s\n", c.Path)
+		}
+		return nil
+
 	default:
 		// Regular file: unified diff with binary and mode-only handling.
 		return s.renderFileChange(ctx, out, c, ws, preImages, postImages)
@@ -1003,14 +1023,27 @@ func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.B
 		isDelete = true
 		pre = preImages[c.Path]
 	case ChangeModify:
-		pre = preImages[c.Path]
 		post = postImages[c.Path]
+		var hadPre bool
+		pre, hadPre = preImages[c.Path]
+		if !hadPre {
+			// Type replacement: the old side was a directory, symlink, or
+			// special file whose pre-image the reader task deliberately did
+			// not read, so the new side is rendered add-like (/dev/null on
+			// the old side). Without this, a replacement by an EMPTY
+			// regular file leaves both pre and post nil: bytes.Equal would
+			// treat the change as content-identical and the mode-only
+			// branch below would silently drop it (modes equal) or render
+			// a bogus mode pair with no content (modes differ).
+			isAdd = true
+		}
 	}
 
 	// Mode-only check: content identical, mode differs. Check BEFORE the
 	// binary check — a chmod-only change on a binary file should render as
-	// a mode pair, not "Binary files differ".
-	if c.Kind == ChangeModify && bytes.Equal(pre, post) {
+	// a mode pair, not "Binary files differ". Type replacements (isAdd set
+	// above) never take this branch: their pre-image is absent, not empty.
+	if c.Kind == ChangeModify && !isAdd && bytes.Equal(pre, post) {
 		oldMode, err := s.readModeAt(ctx, ws, c.Path)
 		if err != nil {
 			return err
