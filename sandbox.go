@@ -132,9 +132,10 @@ type imageService interface {
 // exclusive op-level lock, workspace operations (Exec, ReadFile,
 // WriteFile, ReleaseState) a shared one — an in-flight Exec finishes
 // before a Capture can commit the layer it is writing to, by
-// construction rather than by luck. Lock ordering is opMu, then mu,
-// then leaseMu; opMu guards only the public API surface, so tests may
-// drive the impls directly where a lock would be noise. Waiting for
+// construction rather than by luck. opMu is the outermost lock, and where
+// the inner locks nest, leaseMu precedes mu (see client.go's lease
+// lifecycle); opMu guards only the public API surface, so tests may drive
+// the impls directly where a lock would be noise. Waiting for
 // opMu does not honor context cancellation: a hung Exec delays a
 // waiting Destroy until it returns, the standard Go trade.
 // leaseRef carries the sandbox's current containerd lease id.

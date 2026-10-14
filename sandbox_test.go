@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -732,5 +733,45 @@ func TestApply_PreservesForeignLineageInCapture(t *testing.T) {
 	if after.ParentKey != state.SnapshotKey {
 		t.Errorf("ParentKey after a cross-sandbox Apply = %q, want the applied state's %q",
 			after.ParentKey, state.SnapshotKey)
+	}
+}
+
+// TestWorkspaceOpDelaysLifecycle pins the lock wiring the serialization
+// contract rests on: workspace operations hold the shared op-level lock, so
+// an in-flight one delays a waiting lifecycle operation until it returns —
+// and the reverse path completes once the shared holder lets go. A regression
+// that put Exec under the exclusive lock, or Capture under the shared one,
+// fails here rather than in a tenant's workload.
+func TestWorkspaceOpDelaysLifecycle(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Simulate an in-flight workspace operation by holding the shared lock
+	// the way Exec does — no fake collaboration needed; the point is the
+	// lock, not the exec.
+	sb.opMu.RLock()
+
+	captured := make(chan error, 1)
+	go func() { _, err := sb.Capture(ctx); captured <- err }()
+
+	select {
+	case <-captured:
+		sb.opMu.RUnlock()
+		t.Fatal("Capture completed while a workspace operation held the shared lock")
+	case <-time.After(50 * time.Millisecond):
+		// Still blocked: the exclusive lock is waiting. Let it through and
+		// confirm it completes.
+		sb.opMu.RUnlock()
+		select {
+		case err := <-captured:
+			if err != nil {
+				t.Fatalf("Capture after the shared holder released: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Capture did not complete after the shared holder released")
+		}
 	}
 }

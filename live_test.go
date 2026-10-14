@@ -83,10 +83,9 @@ const (
 // Defaults for the knobs above. defaultSnapshotter is client.go's own constant
 // rather than a copy, so the test cannot drift from the value the adapter uses.
 //
-// The image needs both sh and git in-container: sandbox.go shells out to
-// cat/mkdir/dirname/chmod for file I/O and to git for Diff. alpine/git carries
-// both at ~15MB. Its BusyBox userland supports every command this backend uses
-// BusyBox userland supports every command croft's file operations use.
+// The image needs sh plus the coreutils croft's own file I/O shells out to:
+// cat, mkdir, dirname, printf, base64, chmod. alpine/git carries them at
+// ~15MB, and its BusyBox userland supports every command croft uses.
 const (
 	defaultImage     = "docker.io/alpine/git:latest"
 	defaultNamespace = "croft-live"
