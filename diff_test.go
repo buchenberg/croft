@@ -1497,9 +1497,8 @@ func TestDiff_Modify(t *testing.T) {
 	fds.blob = buildTar(t,
 		tarEntry{name: "workspace/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\n")},
 	)
-	// Pre-image (state) and post-image (current workspace) differ.
+	// Pre-image (state) is "old"; post-image comes from the tar ("new").
 	tasks.preFiles["/workspace/file.txt"] = "old\n"
-	tasks.catFiles["/workspace/file.txt"] = "new\n"
 	// file.txt exists in the lower tree (not in missingPaths) → ChangeModify.
 
 	got, err := sb.Diff(ctx, state)
@@ -1535,7 +1534,6 @@ func TestDiff_Add(t *testing.T) {
 		tarEntry{name: "workspace/new.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("hello\n")},
 	)
 	tasks.missingPaths["/workspace/new.txt"] = true // absent from lower → ChangeAdd
-	tasks.catFiles["/workspace/new.txt"] = "hello\n"
 
 	got, err := sb.Diff(ctx, state)
 	if err != nil {
@@ -1604,9 +1602,8 @@ func TestDiff_ModeOnly(t *testing.T) {
 	fds.blob = buildTar(t,
 		tarEntry{name: "workspace/modeonly.txt", mode: 0o600, typeflag: tar.TypeReg, content: []byte("same\n")},
 	)
-	// Pre-image and post-image have identical content.
+	// Pre-image and post-image (from the tar) have identical content.
 	tasks.preFiles["/workspace/modeonly.txt"] = "same\n"
-	tasks.catFiles["/workspace/modeonly.txt"] = "same\n"
 	// The state's layer had mode 0644.
 	tasks.modes["/workspace/modeonly.txt"] = "-rw-r--r--"
 
@@ -1639,7 +1636,6 @@ func TestDiff_Binary(t *testing.T) {
 		tarEntry{name: "workspace/blob.bin", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\x00data")},
 	)
 	tasks.preFiles["/workspace/blob.bin"] = "old\x00data"
-	tasks.catFiles["/workspace/blob.bin"] = "new\x00data"
 
 	got, err := sb.Diff(ctx, state)
 	if err != nil {
@@ -1822,9 +1818,7 @@ func TestDiff_MultiFile(t *testing.T) {
 		tarEntry{name: "workspace/.wh.deleted.txt", mode: 0, typeflag: tar.TypeReg},
 	)
 	tasks.missingPaths["/workspace/added.txt"] = true
-	tasks.catFiles["/workspace/added.txt"] = "a\n"
 	tasks.preFiles["/workspace/modified.txt"] = "old\n"
-	tasks.catFiles["/workspace/modified.txt"] = "new\n"
 	tasks.preFiles["/workspace/deleted.txt"] = "bye\n"
 
 	got, err := sb.Diff(ctx, state)
@@ -1944,7 +1938,6 @@ func TestDiff_EmptyFileAdd(t *testing.T) {
 		tarEntry{name: "workspace/empty.txt", mode: 0o644, typeflag: tar.TypeReg, content: nil},
 	)
 	tasks.missingPaths["/workspace/empty.txt"] = true // absent from lower → ChangeAdd
-	tasks.catFiles["/workspace/empty.txt"] = ""       // post-image is empty
 
 	got, err := sb.Diff(ctx, state)
 	if err != nil {
@@ -1954,6 +1947,48 @@ func TestDiff_EmptyFileAdd(t *testing.T) {
 	want := "--- /dev/null\n+++ b/empty.txt\n@@ -0,0 +0,0 @@\n"
 	if got != want {
 		t.Errorf("Diff empty add:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_PostImagesComeFromTheBlob pins that Diff's post-images are
+// extracted from the diff blob's tar, not re-read from the workspace. The
+// tar says "from-tar", catFiles says "from-workspace" — the diff must show
+// "from-tar". This also proves the race is gone: the workspace content is
+// irrelevant to the rendered diff.
+func TestDiff_PostImagesComeFromTheBlob(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The tar (the diff blob) says the post-image is "from-tar".
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("from-tar\n")},
+	)
+	// The workspace (catFiles) says "from-workspace" — must be ignored.
+	tasks.catFiles["/workspace/file.txt"] = "from-workspace\n"
+	// The pre-image (state's layer) is "old".
+	tasks.preFiles["/workspace/file.txt"] = "old\n"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/file.txt
++++ b/file.txt
+@@ -1 +1 @@
+-old
++from-tar
+`
+	if got != want {
+		t.Errorf("Diff post-images from blob:\n got: %q\nwant: %q", got, want)
 	}
 }
 
@@ -1974,7 +2009,6 @@ func TestDiff_NoNewlineMarker(t *testing.T) {
 		tarEntry{name: "workspace/f.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new")},
 	)
 	tasks.preFiles["/workspace/f.txt"] = "old" // no trailing newline
-	tasks.catFiles["/workspace/f.txt"] = "new" // no trailing newline
 
 	got, err := sb.Diff(ctx, state)
 	if err != nil {

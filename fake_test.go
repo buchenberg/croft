@@ -263,10 +263,11 @@ type fakeTasks struct {
 	stopped int
 
 	// catFiles maps resolved path → content for main-task `cat -- "$1"`
-	// execs (post-images in Diff).
+	// execs (ReadFile tests, and the proof test that Diff's post-images come
+	// from the tar, not the workspace).
 	// preFiles maps resolved path → content for reader-task `cat -- "$1"`
-	// execs (pre-images in Diff). Separate from catFiles so tests can give
-	// a file different old and new content.
+	// execs (pre-images in Diff and ReadFilesAt). Separate from catFiles so
+	// tests can give a file different old and new content.
 	// missingPaths is a set of resolved paths that do not exist in the
 	// fake's filesystem model: cat reports them absent (exit 1), and
 	// test -e reports them missing (exit 1). By default every path exists.

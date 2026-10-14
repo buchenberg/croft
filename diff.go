@@ -91,9 +91,25 @@ type opaqueDir struct {
 // entries. Changes (Task 5) determines ChangeAdd by consulting the lower
 // tree.
 func parseChangeTar(r io.Reader, workdir string) ([]Change, []opaqueDir, error) {
+	changes, opaques, _, err := parseChangeTarInternal(r, workdir, false)
+	return changes, opaques, err
+}
+
+// parseChangeTarWithContent is parseChangeTar that also reads the content of
+// ordinary entries (adds/modifies) into a map keyed by workspace-relative
+// path. Diff uses this to get post-images directly from the diff blob,
+// without re-reading the workspace — saving one exec per changed file and
+// eliminating the race between the diff computation and the post-image read.
+func parseChangeTarWithContent(r io.Reader, workdir string) ([]Change, []opaqueDir, map[string][]byte, error) {
+	return parseChangeTarInternal(r, workdir, true)
+}
+
+// parseChangeTarInternal is the shared parser. When withContent is true,
+// ordinary entries' content is buffered into the returned map.
+func parseChangeTarInternal(r io.Reader, workdir string, withContent bool) ([]Change, []opaqueDir, map[string][]byte, error) {
 	src, err := sniffGunzip(r)
 	if err != nil {
-		return nil, nil, fmt.Errorf("containerd sandbox: sniff diff blob: %w", err)
+		return nil, nil, nil, fmt.Errorf("containerd sandbox: sniff diff blob: %w", err)
 	}
 
 	// The tar prefix is the workdir without the leading slash: entries
@@ -107,6 +123,10 @@ func parseChangeTar(r io.Reader, workdir string) ([]Change, []opaqueDir, error) 
 
 	var changes []Change
 	var opaques []opaqueDir
+	var contents map[string][]byte
+	if withContent {
+		contents = make(map[string][]byte)
+	}
 
 	tr := tar.NewReader(src)
 	for {
@@ -115,7 +135,7 @@ func parseChangeTar(r io.Reader, workdir string) ([]Change, []opaqueDir, error) 
 			break
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("containerd sandbox: read change tar: %w", err)
+			return nil, nil, nil, fmt.Errorf("containerd sandbox: read change tar: %w", err)
 		}
 
 		name := hdr.Name
@@ -156,19 +176,31 @@ func parseChangeTar(r io.Reader, workdir string) ([]Change, []opaqueDir, error) 
 		// Changes determines ChangeAdd by consulting the lower tree).
 		// Directory entries carry a trailing slash in the tar name; the
 		// change path is slash-separated without it.
+		changePath := strings.TrimSuffix(rel, "/")
 		changes = append(changes, Change{
-			Path:  strings.TrimSuffix(rel, "/"),
+			Path:  changePath,
 			Kind:  ChangeModify,
 			IsDir: hdr.Typeflag == tar.TypeDir,
 			Mode:  changeMode(hdr),
 			Size:  hdr.Size,
 		})
+
+		// Buffer the content for Diff's post-images. Directories and
+		// symlinks have no meaningful content here (symlink targets ride
+		// in Linkname, not in the entry body).
+		if withContent && hdr.Typeflag == tar.TypeReg && hdr.Size > 0 {
+			content, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("containerd sandbox: read content for %s: %w", changePath, err)
+			}
+			contents[changePath] = content
+		}
 	}
 
 	// Sort by path (Task 0 finding: entries arrive in walk order, not sorted).
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 
-	return changes, opaques, nil
+	return changes, opaques, contents, nil
 }
 
 // sniffGunzip wraps r with a gzip reader when the stream starts with the
@@ -479,13 +511,18 @@ func (s *ContainerdSandbox) Changes(ctx context.Context, ws WorkspaceState) ([]C
 	return s.changesImpl(ctx, ws)
 }
 
-// changesImpl is Changes without the lock.
-func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) ([]Change, error) {
+// computeChanges is the shared first half of Changes and Diff: validate,
+// compute the daemon-side diff blob, read it, parse the tar, and resolve
+// opaque dirs. When withContent is true, ordinary entries' content is
+// buffered into the returned postImages map (Diff uses it for post-images
+// without re-reading the workspace). Changes passes false — it does not
+// need the content.
+func (s *ContainerdSandbox) computeChanges(ctx context.Context, ws WorkspaceState, withContent bool) ([]Change, map[string][]byte, error) {
 	if ws.SnapshotKey == "" {
-		return nil, fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
+		return nil, nil, fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
 	if err := s.requireBackend(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	s.mu.Lock()
@@ -493,25 +530,32 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 	active := s.activeKey
 	s.mu.Unlock()
 	if id == "" || active == "" {
-		return nil, fmt.Errorf("containerd sandbox: Changes before Create")
+		return nil, nil, fmt.Errorf("containerd sandbox: Changes before Create")
 	}
 
 	// Compute the daemon-side diff blob, read it, and drop the pin. drop is
 	// cancel-free, so it runs even if Read fails or the context is cancelled.
 	desc, drop, err := s.diffBlob(ctx, ws)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	blob, readErr := s.diff.Read(ctx, desc)
 	drop()
 	if readErr != nil {
-		return nil, fmt.Errorf("containerd sandbox: read diff blob: %w", readErr)
+		return nil, nil, fmt.Errorf("containerd sandbox: read diff blob: %w", readErr)
 	}
 
-	// Parse the blob into changes and opaque dirs.
-	changes, opaques, err := parseChangeTar(bytes.NewReader(blob), s.cfg.workdir())
+	// Parse the blob into changes and opaque dirs (with content if requested).
+	var changes []Change
+	var opaques []opaqueDir
+	var postImages map[string][]byte
+	if withContent {
+		changes, opaques, postImages, err = parseChangeTarWithContent(bytes.NewReader(blob), s.cfg.workdir())
+	} else {
+		changes, opaques, err = parseChangeTar(bytes.NewReader(blob), s.cfg.workdir())
+	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Resolve opaque dirs (defensive .wh..wh..opq path): enumerate the state's
@@ -519,7 +563,7 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 	for _, op := range opaques {
 		names, err := s.readDirAt(ctx, ws, op.path)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, name := range names {
 			changes = append(changes, Change{
@@ -527,6 +571,16 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 				Kind: ChangeDelete,
 			})
 		}
+	}
+
+	return changes, postImages, nil
+}
+
+// changesImpl is Changes without the lock.
+func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) ([]Change, error) {
+	changes, _, err := s.computeChanges(ctx, ws, false)
+	if err != nil {
+		return nil, err
 	}
 
 	// Determine ChangeAdd vs ChangeModify: the parser reports ChangeModify
@@ -584,47 +638,118 @@ func (s *ContainerdSandbox) Diff(ctx context.Context, ws WorkspaceState) (string
 }
 
 // diffImpl is Diff without the lock.
+//
+// Efficiency notes: this does NOT call changesImpl. Instead it shares
+// computeChanges (which parses the tar with content), then runs ONE reader
+// task that does all three kinds of state-layer work — add/modify existence
+// checks (test -e), delete-type classification (test -L/test -d), and
+// pre-image reads (cat). The old flow created up to three separate reader
+// tasks (one per concern), each paying Prepare+StartTask+StopTask+Remove.
+// Post-images come from the tar itself (parseChangeTarWithContent), not from
+// re-reading the workspace — saving one exec per add/modify file and
+// eliminating the race between the diff computation and the post-image read.
 func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (string, error) {
-	// Get the change list.
-	changes, err := s.changesImpl(ctx, ws)
+	// Compute the change list and extract post-images from the blob.
+	changes, postImages, err := s.computeChanges(ctx, ws, true)
 	if err != nil {
 		return "", err
 	}
 
-	// Determine the type of each ChangeDelete in the lower tree. Whiteouts
-	// carry no type information (Change.Mode is 0 for deletes), so without
-	// this a deleted symlink would render its target's content (cat follows
-	// the link) and a deleted directory would fail the pre-image read (cat
-	// on a directory errors). One reader task, two test execs per delete.
-	if err := s.classifyDeletes(ctx, ws, changes); err != nil {
-		return "", err
-	}
-
-	// Collect pre-image paths: ChangeModify and ChangeDelete need pre-images.
-	// Directories have no content to read — they render as markers.
-	var prePaths []string
+	// One reader task: add/modify checks, delete-type classification, and
+	// pre-image reads, all against the state's committed layer.
+	preImages := make(map[string][]byte)
+	needsReader := false
 	for _, c := range changes {
-		if c.IsDir {
-			continue
-		}
 		if c.Kind == ChangeModify || c.Kind == ChangeDelete {
-			prePaths = append(prePaths, c.Path)
+			needsReader = true
+			break
 		}
 	}
+	if needsReader {
+		err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+			for i := range changes {
+				c := &changes[i]
+				resolved := s.resolve(c.Path)
 
-	// Read pre-images from the state's layer.
-	var preImages map[string][]byte
-	if len(prePaths) > 0 {
-		preImages, err = s.readFilesAt(ctx, ws, prePaths)
+				switch c.Kind {
+				case ChangeModify:
+					// Existence check: absent from the lower tree → add.
+					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+						Command: "sh",
+						Args:    []string{"-c", `test -e "$1"`, "croft", resolved},
+						Cwd:     s.cfg.workdir(),
+					})
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: check %s at state: %w", c.Path, err)
+					}
+					if res.ExitCode != 0 {
+						c.Kind = ChangeAdd
+						continue // adds have no pre-image
+					}
+					// Fall through to the pre-image read below.
+
+				case ChangeDelete:
+					// Type classification: symlink → target rendering,
+					// directory → marker (no pre-image read).
+					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+						Command: "sh",
+						Args:    []string{"-c", `test -L "$1"`, "croft", resolved},
+						Cwd:     s.cfg.workdir(),
+					})
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+					}
+					if res.ExitCode == 0 {
+						c.Mode |= fs.ModeSymlink
+						continue // symlinks render targets, no content read
+					}
+					res, err = s.tasks.Exec(ctx, readerID, ExecRequest{
+						Command: "sh",
+						Args:    []string{"-c", `test -d "$1"`, "croft", resolved},
+						Cwd:     s.cfg.workdir(),
+					})
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+					}
+					if res.ExitCode == 0 {
+						c.IsDir = true
+						continue // directories render markers, no content read
+					}
+					// Fall through to the pre-image read below.
+				}
+
+				// Pre-image read (ChangeModify that exists, or ChangeDelete
+				// of a regular file). One cat per file.
+				res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+					Command: "sh",
+					Args:    []string{"-c", `cat -- "$1"`, "croft", resolved},
+					Cwd:     s.cfg.workdir(),
+				})
+				if err != nil {
+					return fmt.Errorf("containerd sandbox: read %s at state: %w", c.Path, err)
+				}
+				if res.ExitCode != 0 {
+					return fmt.Errorf("containerd sandbox: read %s at state: exit %d: %s",
+						c.Path, res.ExitCode, strings.TrimSpace(res.Stderr))
+				}
+				preImages[c.Path] = []byte(res.Stdout)
+			}
+			return nil
+		})
 		if err != nil {
 			return "", err
 		}
 	}
 
-	// Render each change.
+	// Re-sort: opaque-dir deletes and add/modify reclassification may have
+	// changed the order.
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+
+	// Render each change. Post-images come from the tar (postImages map);
+	// pre-images from the reader task above.
 	var out strings.Builder
 	for _, c := range changes {
-		if err := s.renderChange(ctx, &out, c, ws, preImages); err != nil {
+		if err := s.renderChange(ctx, &out, c, ws, preImages, postImages); err != nil {
 			return "", err
 		}
 	}
@@ -632,63 +757,10 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 	return out.String(), nil
 }
 
-// classifyDeletes determines the type of each ChangeDelete in the lower
-// tree, setting IsDir and the ModeSymlink type bit on the change so
-// renderChange can route correctly. Directories render as markers; symlinks
-// render as target lines. Without this, a deleted symlink would render its
-// target's content and a deleted directory would fail the pre-image read.
-func (s *ContainerdSandbox) classifyDeletes(ctx context.Context, ws WorkspaceState, changes []Change) error {
-	hasDeletes := false
-	for _, c := range changes {
-		if c.Kind == ChangeDelete {
-			hasDeletes = true
-			break
-		}
-	}
-	if !hasDeletes {
-		return nil
-	}
-
-	return s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
-		for i := range changes {
-			if changes[i].Kind != ChangeDelete {
-				continue
-			}
-			resolved := s.resolve(changes[i].Path)
-
-			// Symlink? Render as a target line.
-			res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-				Command: "sh",
-				Args:    []string{"-c", `test -L "$1"`, "croft", resolved},
-				Cwd:     s.cfg.workdir(),
-			})
-			if err != nil {
-				return fmt.Errorf("containerd sandbox: classify %s at state: %w", changes[i].Path, err)
-			}
-			if res.ExitCode == 0 {
-				changes[i].Mode |= fs.ModeSymlink
-				continue
-			}
-
-			// Directory? Render as a marker, skip the pre-image read.
-			res, err = s.tasks.Exec(ctx, readerID, ExecRequest{
-				Command: "sh",
-				Args:    []string{"-c", `test -d "$1"`, "croft", resolved},
-				Cwd:     s.cfg.workdir(),
-			})
-			if err != nil {
-				return fmt.Errorf("containerd sandbox: classify %s at state: %w", changes[i].Path, err)
-			}
-			if res.ExitCode == 0 {
-				changes[i].IsDir = true
-			}
-		}
-		return nil
-	})
-}
-
-// renderChange renders one change's diff section.
-func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, preImages map[string][]byte) error {
+// renderChange renders one change's diff section. postImages holds the
+// post-image content extracted from the diff blob's tar (adds/modifies);
+// preImages holds pre-images read from the state's layer.
+func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, preImages, postImages map[string][]byte) error {
 	switch {
 	case c.IsDir:
 		// Directory: render a marker. Content diffs are per-file.
@@ -706,33 +778,26 @@ func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Build
 
 	default:
 		// Regular file: unified diff with binary and mode-only handling.
-		return s.renderFileChange(ctx, out, c, ws, preImages)
+		return s.renderFileChange(ctx, out, c, ws, preImages, postImages)
 	}
 }
 
-// renderFileChange renders a regular file's diff section.
-func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, preImages map[string][]byte) error {
+// renderFileChange renders a regular file's diff section. Post-images come
+// from the diff blob's tar (postImages), not from re-reading the workspace.
+func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, preImages, postImages map[string][]byte) error {
 	var pre, post []byte
 	var isAdd, isDelete bool
 
 	switch c.Kind {
 	case ChangeAdd:
 		isAdd = true
-		var err error
-		post, err = s.readFileImpl(ctx, c.Path)
-		if err != nil {
-			return fmt.Errorf("containerd sandbox: read %s for diff: %w", c.Path, err)
-		}
+		post = postImages[c.Path]
 	case ChangeDelete:
 		isDelete = true
 		pre = preImages[c.Path]
 	case ChangeModify:
 		pre = preImages[c.Path]
-		var err error
-		post, err = s.readFileImpl(ctx, c.Path)
-		if err != nil {
-			return fmt.Errorf("containerd sandbox: read %s for diff: %w", c.Path, err)
-		}
+		post = postImages[c.Path]
 	}
 
 	// Binary check: NUL in the first 8 KiB of either side.
