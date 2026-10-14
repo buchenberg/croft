@@ -1287,8 +1287,11 @@ func TestChanges_OpaqueDirResolution(t *testing.T) {
 		tarEntry{name: "workspace/opaque-dir/.wh..wh..opq", mode: 0, typeflag: tar.TypeReg},
 		tarEntry{name: "workspace/opaque-dir/new.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\n")},
 	)
-	// The state's opaque-dir had two files, now hidden by the opaque marker.
-	tasks.lsDirs["/workspace/opaque-dir"] = []string{"old-a.txt", "old-b.txt"}
+	// The state's opaque-dir had two files, now hidden by the opaque
+	// marker — plus new.txt, which the upper tree also reports as an
+	// ordinary entry. The synthesized delete for new.txt must be skipped
+	// (it is already represented), while old-a/old-b become deletes.
+	tasks.lsDirs["/workspace/opaque-dir"] = []string{"old-a.txt", "old-b.txt", "new.txt"}
 	// new.txt does not exist in the lower tree — it is an add.
 	tasks.missingPaths["/workspace/opaque-dir/new.txt"] = true
 
