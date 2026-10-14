@@ -295,7 +295,14 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 			return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: create diff lease: %w", err)
 		}
 		leaseID = l.ID
-		ctx = leases.WithLease(ctx, leaseID)
+		// Wrap with the namespace (via stateLeaseCtx) AND the diff lease.
+		// Without the namespace, the lease manager's AddResource/Delete/
+		// DeleteResource calls fail with 'namespace is required'. The
+		// stateLeaseCtx adds the sandbox lease, but leases.WithLease
+		// overrides it with the diff lease — exactly what we want: the
+		// diff view and blob are pinned by the diff lease, not the
+		// sandbox lease.
+		ctx = leases.WithLease(s.stateLeaseCtx(ctx), leaseID)
 	}
 
 	// drop releases everything the call pinned, cancel-free. It is extended
