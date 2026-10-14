@@ -61,36 +61,57 @@ func TestLive_ChangesReportsAddModifyDelete(t *testing.T) {
 
 	m := changeMap(changes)
 
-	// Adds: new files absent from the lower tree.
+	// Adds: new files absent from the lower tree. Check presence (not just
+	// Kind) because ChangeAdd is the zero value — a missing map entry
+	// would also have Kind == ChangeAdd.
 	for _, path := range []string{"added.txt", "new-dir/n.txt", "opaque-dir/c.txt", "symlink.txt"} {
-		if got := m[path].Kind; got != ChangeAdd {
-			t.Errorf("%s: kind = %v, want add", path, got)
+		c, ok := m[path]
+		if !ok {
+			t.Errorf("%s: not in change list, want add", path)
+			continue
+		}
+		if c.Kind != ChangeAdd {
+			t.Errorf("%s: kind = %v, want add", path, c.Kind)
 		}
 	}
 
 	// Deletes: whiteouts for files present in the lower tree, absent in upper.
 	for _, path := range []string{"base-deleted.txt", "opaque-dir/a.txt", "opaque-dir/b.txt"} {
-		if got := m[path].Kind; got != ChangeDelete {
-			t.Errorf("%s: kind = %v, want delete", path, got)
+		c, ok := m[path]
+		if !ok {
+			t.Errorf("%s: not in change list, want delete", path)
+			continue
+		}
+		if c.Kind != ChangeDelete {
+			t.Errorf("%s: kind = %v, want delete", path, c.Kind)
 		}
 	}
 
 	// Modifies: present in both, content or mode differs.
 	for _, path := range []string{"base-modified.txt", "base-modeonly.txt"} {
-		if got := m[path].Kind; got != ChangeModify {
-			t.Errorf("%s: kind = %v, want modify", path, got)
+		c, ok := m[path]
+		if !ok {
+			t.Errorf("%s: not in change list, want modify", path)
+			continue
+		}
+		if c.Kind != ChangeModify {
+			t.Errorf("%s: kind = %v, want modify", path, c.Kind)
 		}
 	}
 
 	// New directory: an add with IsDir.
-	if got := m["new-dir"]; got.Kind != ChangeAdd || !got.IsDir {
-		t.Errorf("new-dir: kind = %v isDir = %v, want add + dir", got.Kind, got.IsDir)
+	if c, ok := m["new-dir"]; !ok {
+		t.Error("new-dir: not in change list, want add + dir")
+	} else if c.Kind != ChangeAdd || !c.IsDir {
+		t.Errorf("new-dir: kind = %v isDir = %v, want add + dir", c.Kind, c.IsDir)
 	}
 
 	// The opaque directory itself exists in both trees: a modify (its
 	// contents were replaced wholesale, reported via per-file whiteouts).
-	if got := m["opaque-dir"]; got.Kind != ChangeModify || !got.IsDir {
-		t.Errorf("opaque-dir: kind = %v isDir = %v, want modify + dir", got.Kind, got.IsDir)
+	if c, ok := m["opaque-dir"]; !ok {
+		t.Error("opaque-dir: not in change list, want modify + dir")
+	} else if c.Kind != ChangeModify || !c.IsDir {
+		t.Errorf("opaque-dir: kind = %v isDir = %v, want modify + dir", c.Kind, c.IsDir)
 	}
 
 	// The unchanged file must not appear.
@@ -161,14 +182,16 @@ func TestLive_DiffRendersUnifiedText(t *testing.T) {
 	t.Logf("Diff rendered %d bytes of unified output", len(diff))
 }
 
-// TestLive_ChangesOnReleasedStateFailsWithErrStateUnavailable pins the
-// released-state contract: once a state's layer is gone, Changes and Diff
+// TestLive_ChangesOnUnavailableStateFailsWithErrStateUnavailable pins the
+// unavailable-state contract: once a state's layer is gone, Changes and Diff
 // fail with ErrStateUnavailable. ReleaseState drops the pin; the daemon's GC
 // eventually reclaims the layer. To test the post-GC contract
 // deterministically (without waiting for GC or fighting snapshot children),
 // a ghost state — a snapshot key the daemon has never seen — is exactly what
-// a released-and-GC'd state looks like to Changes/Diff.
-func TestLive_ChangesOnReleasedStateFailsWithErrStateUnavailable(t *testing.T) {
+// a released-and-GC'd state looks like to Changes/Diff. ReleaseState is
+// still exercised (its return is checked); the assertions use the ghost
+// state because a released layer still exists until GC runs.
+func TestLive_ChangesOnUnavailableStateFailsWithErrStateUnavailable(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()

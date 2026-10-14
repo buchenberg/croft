@@ -155,7 +155,11 @@ type hunk struct {
 }
 
 // computeHunks converts change groups into unified-diff hunks with context.
-func computeHunks(oldLines, newLines []string, groups []changeGroup) []hunk {
+// It walks the original edit steps (not just the group boundaries) so that
+// unchanged lines INSIDE a merged group — between two nearby changes that
+// mergeGroups joined — render as context (' '), not as deletions+insertions.
+// Without this, merged hunks are non-minimal and diverge from `git diff`.
+func computeHunks(oldLines, newLines []string, groups []changeGroup, steps []editStep) []hunk {
 	var hunks []hunk
 	for _, g := range groups {
 		oldStart := g.oldStart - contextLines
@@ -175,30 +179,24 @@ func computeHunks(oldLines, newLines []string, groups []changeGroup) []hunk {
 			newEnd = len(newLines)
 		}
 
+		// Walk the edit steps, rendering those within this hunk's span.
+		// Matches render as context, deletes as '-', inserts as '+'.
+		// Interior matches within a merged group are preserved as context.
 		var hl []hunkLine
-		oi, ni := oldStart, newStart
-
-		// Context before the change (matches).
-		for oi < g.oldStart && ni < g.newStart {
-			hl = append(hl, hunkLine{prefix: ' ', line: oldLines[oi]})
-			oi++
-			ni++
-		}
-		// Deleted lines.
-		for oi < g.oldEnd {
-			hl = append(hl, hunkLine{prefix: '-', line: oldLines[oi]})
-			oi++
-		}
-		// Added lines.
-		for ni < g.newEnd {
-			hl = append(hl, hunkLine{prefix: '+', line: newLines[ni]})
-			ni++
-		}
-		// Context after the change (matches).
-		for oi < oldEnd && ni < newEnd {
-			hl = append(hl, hunkLine{prefix: ' ', line: oldLines[oi]})
-			oi++
-			ni++
+		for _, step := range steps {
+			inOld := step.oldLine >= oldStart && step.oldLine < oldEnd
+			inNew := step.newLine >= newStart && step.newLine < newEnd
+			if !inOld && !inNew {
+				continue
+			}
+			switch step.op {
+			case opMatch:
+				hl = append(hl, hunkLine{prefix: ' ', line: step.line})
+			case opDelete:
+				hl = append(hl, hunkLine{prefix: '-', line: step.line})
+			case opInsert:
+				hl = append(hl, hunkLine{prefix: '+', line: step.line})
+			}
 		}
 
 		hunks = append(hunks, hunk{
@@ -266,7 +264,7 @@ func renderUnified(path string, oldContent, newContent []byte, isAdd, isDelete b
 	newLines := splitLines(newContent)
 	steps := diffLines(oldLines, newLines)
 	groups := mergeGroups(computeChangeGroups(steps))
-	hunks := computeHunks(oldLines, newLines, groups)
+	hunks := computeHunks(oldLines, newLines, groups, steps)
 
 	if len(hunks) == 0 {
 		// No line-level changes. For an add or delete of an empty file, the
@@ -387,8 +385,26 @@ func parseSymbolicMode(s string) fs.FileMode {
 	return mode
 }
 
-// formatMode renders an fs.FileMode as a 4-digit octal string (e.g. "0644"),
-// matching the `old mode`/`new mode` lines in unified diffs.
+// effectivePerm returns the permission bits including setuid/setgid/sticky,
+// mapped onto Unix octal bits (04000/02000/01000). fs.FileMode.Perm() masks
+// to 0777 and drops these; mode-only detection must compare them.
+func effectivePerm(m fs.FileMode) fs.FileMode {
+	perm := m.Perm()
+	if m&fs.ModeSetuid != 0 {
+		perm |= 0o4000
+	}
+	if m&fs.ModeSetgid != 0 {
+		perm |= 0o2000
+	}
+	if m&fs.ModeSticky != 0 {
+		perm |= 0o1000
+	}
+	return perm
+}
+
+// formatMode renders an fs.FileMode as a 4-digit octal string (e.g. "0644",
+// "4755" for setuid+0755), matching the `old mode`/`new mode` lines in
+// unified diffs. Special bits are included.
 func formatMode(m fs.FileMode) string {
-	return fmt.Sprintf("%04o", m.Perm())
+	return fmt.Sprintf("%04o", effectivePerm(m))
 }

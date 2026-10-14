@@ -464,6 +464,12 @@ func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent s
 			return ExecResult{ExitCode: 1}
 		}
 		return ExecResult{ExitCode: 0}
+	case `test -e "$1" || test -L "$1"`:
+		// Exists or is a symlink (even dangling) → not an add.
+		if pathGone && !isSymlink {
+			return ExecResult{ExitCode: 1}
+		}
+		return ExecResult{ExitCode: 0}
 	case `test -L "$1"`:
 		if isSymlink {
 			return ExecResult{ExitCode: 0}

@@ -1619,7 +1619,11 @@ func TestDiff_ModeOnly(t *testing.T) {
 		t.Fatalf("Diff: %v", err)
 	}
 
-	want := "old mode 0644\nnew mode 0600\n"
+	want := `--- a/modeonly.txt
++++ b/modeonly.txt
+old mode 0644
+new mode 0600
+`
 	if got != want {
 		t.Errorf("Diff mode-only:\n got: %q\nwant: %q", got, want)
 	}
@@ -1672,9 +1676,9 @@ func TestDiff_SymlinkModify(t *testing.T) {
 	fds.blob = buildTar(t,
 		tarEntry{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "newtarget"},
 	)
-	// Old target (state, reader task) and new target (current, main task).
+	// Old target (state, reader task). New target comes from the tar's
+	// Linkname (captured during parsing), not from the workspace.
 	tasks.preReadlinkTargets["/workspace/link"] = "oldtarget"
-	tasks.readlinkTargets["/workspace/link"] = "newtarget"
 
 	got, err := sb.Diff(ctx, state)
 	if err != nil {

@@ -106,7 +106,7 @@ func TestComputeHunks_SingleChange(t *testing.T) {
 	new := []string{"a\n", "b\n", "c\n", "X\n", "e\n", "f\n", "g\n"}
 	steps := diffLines(old, new)
 	groups := mergeGroups(computeChangeGroups(steps))
-	hunks := computeHunks(old, new, groups)
+	hunks := computeHunks(old, new, groups, steps)
 
 	if len(hunks) != 1 {
 		t.Fatalf("hunks = %d, want 1", len(hunks))
@@ -137,7 +137,7 @@ func TestComputeHunks_TwoSeparateChanges(t *testing.T) {
 	new := []string{"A\n", "b\n", "c\n", "d\n", "e\n", "f\n", "g\n", "h\n", "i\n", "J\n"}
 	steps := diffLines(old, new)
 	groups := mergeGroups(computeChangeGroups(steps))
-	hunks := computeHunks(old, new, groups)
+	hunks := computeHunks(old, new, groups, steps)
 
 	if len(hunks) != 2 {
 		t.Fatalf("hunks = %d, want 2 (changes too far apart to merge)", len(hunks))
@@ -145,15 +145,28 @@ func TestComputeHunks_TwoSeparateChanges(t *testing.T) {
 }
 
 func TestComputeHunks_CloseChangesMerge(t *testing.T) {
-	// Changes within 2*contextLines → one hunk.
+	// Changes within 2*contextLines → one hunk. The interior unchanged
+	// lines (b through f) must render as context (' '), not as -/+ pairs.
 	old := []string{"a\n", "b\n", "c\n", "d\n", "e\n", "f\n", "g\n"}
 	new := []string{"A\n", "b\n", "c\n", "d\n", "e\n", "f\n", "G\n"}
 	steps := diffLines(old, new)
 	groups := mergeGroups(computeChangeGroups(steps))
-	hunks := computeHunks(old, new, groups)
+	hunks := computeHunks(old, new, groups, steps)
 
 	if len(hunks) != 1 {
 		t.Fatalf("hunks = %d, want 1 (changes close enough to merge)", len(hunks))
+	}
+
+	// The merged hunk must preserve the interior matches as context.
+	// Expected: -a +A, then b c d e f as context, then -g +G.
+	wantPrefixes := []byte{'-', '+', ' ', ' ', ' ', ' ', ' ', '-', '+'}
+	if len(hunks[0].lines) != len(wantPrefixes) {
+		t.Fatalf("hunk lines = %d, want %d: %v", len(hunks[0].lines), len(wantPrefixes), hunks[0].lines)
+	}
+	for i, w := range wantPrefixes {
+		if hunks[0].lines[i].prefix != w {
+			t.Errorf("line[%d].prefix = %c, want %c (full hunk: %v)", i, hunks[0].lines[i].prefix, w, hunks[0].lines)
+		}
 	}
 }
 
@@ -344,10 +357,36 @@ func TestFormatMode(t *testing.T) {
 		// Type bits are not rendered; only the permission bits.
 		{0o755 | fs.ModeDir, "0755"},
 		{0o777 | fs.ModeSymlink, "0777"},
+		// Special bits are rendered as Unix octal (04000/02000/01000).
+		{0o755 | fs.ModeSetuid, "4755"},
+		{0o755 | fs.ModeSetgid, "2755"},
+		{0o755 | fs.ModeSticky, "1755"},
+		{0o777 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky, "7777"},
 	}
 	for _, tt := range tests {
 		if got := formatMode(tt.mode); got != tt.want {
 			t.Errorf("formatMode(%o) = %q, want %q", tt.mode, got, tt.want)
+		}
+	}
+}
+
+func TestEffectivePerm(t *testing.T) {
+	tests := []struct {
+		mode fs.FileMode
+		want fs.FileMode
+	}{
+		{0o644, 0o644},
+		{0o755 | fs.ModeSetuid, 0o4755},
+		{0o755 | fs.ModeSetgid, 0o2755},
+		{0o755 | fs.ModeSticky, 0o1755},
+		{0o777 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky, 0o7777},
+		// Type bits don't affect effectivePerm.
+		{0o755 | fs.ModeDir, 0o755},
+		{0o777 | fs.ModeSymlink, 0o777},
+	}
+	for _, tt := range tests {
+		if got := effectivePerm(tt.mode); got != tt.want {
+			t.Errorf("effectivePerm(%o) = %o, want %o", tt.mode, got, tt.want)
 		}
 	}
 }

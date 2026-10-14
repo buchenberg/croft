@@ -112,10 +112,11 @@ func parseChangeTarInternal(r io.Reader, workdir string, withContent bool) ([]Ch
 		return nil, nil, nil, fmt.Errorf("containerd sandbox: sniff diff blob: %w", err)
 	}
 
-	// The tar prefix is the workdir without the leading slash: entries
-	// arrive as "workspace/added.txt" for Config.Workdir "/workspace"
-	// (Task 0 finding).
-	trimmed := strings.TrimPrefix(workdir, "/")
+	// The tar prefix is the workdir without leading/trailing slashes:
+	// entries arrive as "workspace/added.txt" for Config.Workdir
+	// "/workspace" (Task 0 finding). Trim both sides so a configured
+	// "/workspace/" does not produce the prefix "workspace//".
+	trimmed := strings.Trim(workdir, "/")
 	prefix := ""
 	if trimmed != "" {
 		prefix = trimmed + "/"
@@ -185,15 +186,23 @@ func parseChangeTarInternal(r io.Reader, workdir string, withContent bool) ([]Ch
 			Size:  hdr.Size,
 		})
 
-		// Buffer the content for Diff's post-images. Directories and
-		// symlinks have no meaningful content here (symlink targets ride
-		// in Linkname, not in the entry body).
-		if withContent && hdr.Typeflag == tar.TypeReg && hdr.Size > 0 {
-			content, err := io.ReadAll(tr)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("containerd sandbox: read content for %s: %w", changePath, err)
+		// Buffer the content for Diff's post-images. Regular files carry
+		// their content in the entry body; symlinks carry their target in
+		// Linkname (no body). Both are stored so Diff can render post-images
+		// without re-reading the workspace.
+		if withContent {
+			switch hdr.Typeflag {
+			case tar.TypeReg:
+				if hdr.Size > 0 {
+					content, err := io.ReadAll(tr)
+					if err != nil {
+						return nil, nil, nil, fmt.Errorf("containerd sandbox: read content for %s: %w", changePath, err)
+					}
+					contents[changePath] = content
+				}
+			case tar.TypeSymlink:
+				contents[changePath] = []byte(hdr.Linkname)
 			}
-			contents[changePath] = content
 		}
 	}
 
@@ -298,13 +307,13 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 			return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: create diff lease: %w", err)
 		}
 		leaseID = l.ID
-		// Wrap with the namespace (via stateLeaseCtx) AND the diff lease.
-		// Without the namespace, the lease manager's AddResource/Delete/
-		// DeleteResource calls fail with 'namespace is required'. The
-		// stateLeaseCtx adds the sandbox lease, but leases.WithLease
-		// overrides it with the diff lease — exactly what we want: the
-		// diff view and blob are pinned by the diff lease, not the
-		// sandbox lease.
+		// Wrap with the namespace AND the diff lease. Without the
+		// namespace, the lease manager's AddResource/DeleteResource/Delete
+		// calls fail with 'namespace is required'. stateLeaseCtx only adds
+		// the namespace (client.go:219); leases.WithLease then adds the
+		// diff lease. The namespaceSnapshotter injects the sandbox lease
+		// for snapshot operations, but the lease manager (s.leases) is the
+		// raw c.LeasesService() — it needs the namespace in the context.
 		ctx = leases.WithLease(s.stateLeaseCtx(ctx), leaseID)
 	}
 
@@ -598,34 +607,62 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 		return nil, err
 	}
 
-	// Determine ChangeAdd vs ChangeModify: the parser reports ChangeModify
-	// for all ordinary entries (both adds and modifies arrive as ordinary
-	// tar entries). Check existence in the lower tree — a path absent from
-	// the state is an add.
-	hasModifies := false
+	// Classify in the lower tree: ChangeModify → ChangeAdd if absent
+	// (test -e || test -L, so dangling symlinks are not misclassified);
+	// ChangeDelete → set IsDir / ModeSymlink from the old type so consumers
+	// know what was deleted (permission bits stay 0 for deletes).
+	hasWork := false
 	for _, c := range changes {
-		if c.Kind == ChangeModify {
-			hasModifies = true
+		if c.Kind == ChangeModify || c.Kind == ChangeDelete {
+			hasWork = true
 			break
 		}
 	}
-	if hasModifies {
+	if hasWork {
 		err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
 			for i := range changes {
-				if changes[i].Kind != ChangeModify {
-					continue
-				}
-				resolved := s.resolve(changes[i].Path)
-				res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-					Command: "sh",
-					Args:    []string{"-c", `test -e "$1"`, "croft", resolved},
-					Cwd:     s.cfg.workdir(),
-				})
-				if err != nil {
-					return fmt.Errorf("containerd sandbox: check %s at state: %w", changes[i].Path, err)
-				}
-				if res.ExitCode != 0 {
-					changes[i].Kind = ChangeAdd
+				c := &changes[i]
+				resolved := s.resolve(c.Path)
+				switch c.Kind {
+				case ChangeModify:
+					// test -e follows symlinks and returns false for a
+					// dangling link. || test -L catches the link itself.
+					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+						Command: "sh",
+						Args:    []string{"-c", `test -e "$1" || test -L "$1"`, "croft", resolved},
+						Cwd:     s.cfg.workdir(),
+					})
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: check %s at state: %w", c.Path, err)
+					}
+					if res.ExitCode != 0 {
+						c.Kind = ChangeAdd
+					}
+				case ChangeDelete:
+					// Classify the deleted path's old type.
+					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+						Command: "sh",
+						Args:    []string{"-c", `test -L "$1"`, "croft", resolved},
+						Cwd:     s.cfg.workdir(),
+					})
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+					}
+					if res.ExitCode == 0 {
+						c.Mode |= fs.ModeSymlink
+						continue
+					}
+					res, err = s.tasks.Exec(ctx, readerID, ExecRequest{
+						Command: "sh",
+						Args:    []string{"-c", `test -d "$1"`, "croft", resolved},
+						Cwd:     s.cfg.workdir(),
+					})
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+					}
+					if res.ExitCode == 0 {
+						c.IsDir = true
+					}
 				}
 			}
 			return nil
@@ -691,8 +728,10 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 					// Existence check: absent from the lower tree → add.
 					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
 						Command: "sh",
-						Args:    []string{"-c", `test -e "$1"`, "croft", resolved},
-						Cwd:     s.cfg.workdir(),
+						// test -e follows symlinks; || test -L catches
+						// dangling links so they are not misclassified as adds.
+						Args: []string{"-c", `test -e "$1" || test -L "$1"`, "croft", resolved},
+						Cwd:  s.cfg.workdir(),
 					})
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: check %s at state: %w", c.Path, err)
@@ -794,7 +833,7 @@ func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Build
 
 	case c.Mode&fs.ModeSymlink != 0:
 		// Symlink: render the target as a one-line diff.
-		return s.renderSymlinkChange(ctx, out, c, ws)
+		return s.renderSymlinkChange(ctx, out, c, ws, postImages)
 
 	default:
 		// Regular file: unified diff with binary and mode-only handling.
@@ -820,6 +859,23 @@ func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.B
 		post = postImages[c.Path]
 	}
 
+	// Mode-only check: content identical, mode differs. Check BEFORE the
+	// binary check — a chmod-only change on a binary file should render as
+	// a mode pair, not "Binary files differ".
+	if c.Kind == ChangeModify && bytes.Equal(pre, post) {
+		oldMode, err := s.readModeAt(ctx, ws, c.Path)
+		if err != nil {
+			return err
+		}
+		if effectivePerm(oldMode) != effectivePerm(c.Mode) {
+			writeUnifiedHeaders(out, c.Path, false, false)
+			fmt.Fprintf(out, "old mode %s\nnew mode %s\n", formatMode(oldMode), formatMode(c.Mode))
+			return nil
+		}
+		// Content and mode both identical: no output (shouldn't happen).
+		return nil
+	}
+
 	// Binary check: NUL in the first 8 KiB of either side.
 	if isBinary(pre) || isBinary(post) {
 		oldSide, newSide := "a/"+c.Path, "b/"+c.Path
@@ -833,38 +889,24 @@ func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.B
 		return nil
 	}
 
-	// Mode-only check: content identical, mode differs.
-	if c.Kind == ChangeModify && bytes.Equal(pre, post) {
-		oldMode, err := s.readModeAt(ctx, ws, c.Path)
-		if err != nil {
-			return err
-		}
-		if oldMode.Perm() != c.Mode.Perm() {
-			fmt.Fprintf(out, "old mode %s\nnew mode %s\n", formatMode(oldMode), formatMode(c.Mode))
-			return nil
-		}
-		// Content and mode both identical: no output (shouldn't happen).
-		return nil
-	}
-
 	// Unified diff.
 	out.WriteString(renderUnified(c.Path, pre, post, isAdd, isDelete))
 	return nil
 }
 
 // renderSymlinkChange renders a symlink's target as a one-line unified diff.
-func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState) error {
+// Post-image targets come from the diff blob's tar (postImages, captured from
+// Linkname during parsing), not from re-reading the workspace — saving an
+// exec and eliminating the race where a concurrent Exec retargets the link.
+// Pre-image targets come from the state's layer via readlinkAt.
+func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, postImages map[string][]byte) error {
 	var oldTarget, newTarget string
 	var isAdd, isDelete bool
 
 	switch c.Kind {
 	case ChangeAdd:
 		isAdd = true
-		target, err := s.readlinkCurrent(ctx, c.Path)
-		if err != nil {
-			return err
-		}
-		newTarget = target
+		newTarget = string(postImages[c.Path])
 	case ChangeDelete:
 		isDelete = true
 		target, err := s.readlinkAt(ctx, ws, c.Path)
@@ -878,10 +920,7 @@ func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *string
 		if err != nil {
 			return err
 		}
-		newTarget, err = s.readlinkCurrent(ctx, c.Path)
-		if err != nil {
-			return err
-		}
+		newTarget = string(postImages[c.Path])
 	}
 
 	// Build the content slices: a side with no target (delete has no new
@@ -945,21 +984,13 @@ func (s *ContainerdSandbox) readlinkAt(ctx context.Context, ws WorkspaceState, p
 			return fmt.Errorf("containerd sandbox: readlink %s at state: exit %d: %s",
 				path, res.ExitCode, strings.TrimSpace(res.Stderr))
 		}
-		target = strings.TrimSpace(res.Stdout)
+		// Strip only the trailing newline readlink appends; preserve all
+		// other bytes (whitespace is part of a symlink target).
+		target = strings.TrimSuffix(res.Stdout, "\n")
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
 	return target, nil
-}
-
-// readlinkCurrent reads a symlink's target from the current workspace.
-func (s *ContainerdSandbox) readlinkCurrent(ctx context.Context, path string) (string, error) {
-	resolved := s.resolve(path)
-	res, err := s.execShell(ctx, nil, `readlink -- "$1"`, resolved)
-	if err != nil {
-		return "", fmt.Errorf("containerd sandbox: readlink %s: %w", path, err)
-	}
-	return strings.TrimSpace(res.Stdout), nil
 }
