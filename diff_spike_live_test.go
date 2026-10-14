@@ -14,6 +14,7 @@ package croft
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -210,7 +211,27 @@ func TestLive_DiffSpike(t *testing.T) {
 		t.Logf("wrote golden %s (%d bytes)", goldenPath, len(blob))
 	}
 
-	tr := tar.NewReader(newByteSliceReader(blob))
+	// Finding two: the default diff blob is a gzipped OCI layer
+	// (application/vnd.oci.image.layer.v1.tar+gzip), not a plain tar. The
+	// wire golden stays as-is (what the daemon actually emits); the parser
+	// sniffs the gzip magic and decompresses, and a plain-tar fixture is
+	// dumped beside it for inspection and parser tests.
+	plain, err := gunzipIfCompressed(blob)
+	if err != nil {
+		t.Fatalf("decompress diff blob: %v", err)
+	}
+	plainPath := filepath.Join(goldenDir, "live-changes.plain.tar")
+	if existing, rerr := os.ReadFile(plainPath); rerr == nil {
+		if string(existing) != string(plain) {
+			t.Fatalf("plain-tar golden %s changed; regenerate deliberately", plainPath)
+		}
+	} else {
+		if err := os.WriteFile(plainPath, plain, 0o644); err != nil {
+			t.Fatalf("write plain golden: %v", err)
+		}
+	}
+
+	tr := tar.NewReader(newByteSliceReader(plain))
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -220,14 +241,28 @@ func TestLive_DiffSpike(t *testing.T) {
 			t.Fatalf("tar walk: %v", err)
 		}
 		kind := fmt.Sprintf("typeflag=%c", hdr.Typeflag)
-		switch {
-		case hdr.Typeflag == tar.TypeChar && (hdr.Devmajor == 0 && hdr.Devminor == 0):
-			kind = "whiteout-char-dev"
-		case hdr.Name != filepath.Clean(hdr.Name):
-			kind = "opaque-or-wh-dot"
+		if hdr.Typeflag == tar.TypeChar && hdr.Devmajor == 0 && hdr.Devminor == 0 {
+			kind = fmt.Sprintf("whiteout-char-dev (dev %d/%d)", hdr.Devmajor, hdr.Devminor)
+		}
+		if hdr.PAXRecords != nil {
+			kind += fmt.Sprintf(" pax=%v", hdr.PAXRecords)
 		}
 		t.Logf("entry: name=%q mode=%o size=%d %s", hdr.Name, hdr.Mode, hdr.Size, kind)
 	}
+}
+
+// gunzipIfCompressed decompresses a gzip payload and passes anything else
+// through unchanged: the parser consumes whatever media type the daemon chose.
+func gunzipIfCompressed(b []byte) ([]byte, error) {
+	if len(b) < 2 || b[0] != 0x1f || b[1] != 0x8b {
+		return b, nil
+	}
+	zr, err := gzip.NewReader(newByteSliceReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	return io.ReadAll(zr)
 }
 
 type byteSliceReader struct {
