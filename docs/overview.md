@@ -28,7 +28,7 @@ define it:
 ```mermaid
 flowchart TB
     subgraph host["Host program"]
-        API["Sandbox interface<br/>Create · Exec · ReadFile · WriteFile<br/>Capture · Apply · ReleaseState · Destroy"]
+        API["Sandbox interface<br/>Create · Exec · ReadFile · WriteFile<br/>Capture · Apply · ReleaseState · Destroy<br/>Changes · Diff"]
         OP["opMu — exclusive: lifecycle<br/>shared: workspace operations"]
         SB["ContainerdSandbox<br/>lifecycle · lineage · lease pinning · state encoding"]
         API --> OP --> SB
