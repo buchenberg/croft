@@ -538,7 +538,7 @@ func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 }
 
 func TestSnapshotState_RoundTrip(t *testing.T) {
-	state := snapshotState("example/dev:latest", "layer-7", "layer-3")
+	state := snapshotState("example/dev:latest", "layer-7", "layer-3", "layer-1")
 
 	if state.SnapshotKey != "layer-7" {
 		t.Errorf("SnapshotKey = %q, want layer-7", state.SnapshotKey)
@@ -546,10 +546,90 @@ func TestSnapshotState_RoundTrip(t *testing.T) {
 	if state.ParentKey != "layer-3" {
 		t.Errorf("ParentKey = %q, want layer-3", state.ParentKey)
 	}
+	if state.BaseKey != "layer-1" {
+		t.Errorf("BaseKey = %q, want layer-1", state.BaseKey)
+	}
 	if state.Image != "example/dev:latest" {
 		t.Errorf("Image = %q, want example/dev:latest", state.Image)
 	}
 
+}
+
+// TestBaseKey_FreshCaptureHasNoBase pins that a sandbox which never Applied
+// captures states with an empty BaseKey: a fresh lineage has no merge base,
+// and ApplyDelta must reject such states rather than guess one.
+func TestBaseKey_FreshCaptureHasNoBase(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if state.BaseKey != "" {
+		t.Errorf("BaseKey = %q, want empty for a sandbox that never Applied", state.BaseKey)
+	}
+}
+
+// TestBaseKey_ApplyRecordsBaseForLaterCaptures pins the base lineage rules:
+// Apply makes the applied state's layer the merge base; every Capture records
+// it verbatim; repeated captures advance ParentKey while BaseKey stays put
+// (the delta spans every layer since the base, not just the last capture);
+// Create clears it.
+func TestBaseKey_ApplyRecordsBaseForLaterCaptures(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	applied, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture (state to apply): %v", err)
+	}
+	if err := sb.Apply(ctx, applied); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// First capture after the Apply: base and parent are the applied layer.
+	first, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("first Capture: %v", err)
+	}
+	if first.BaseKey != applied.SnapshotKey {
+		t.Errorf("first BaseKey = %q, want the applied layer %q", first.BaseKey, applied.SnapshotKey)
+	}
+	if first.ParentKey != applied.SnapshotKey {
+		t.Errorf("first ParentKey = %q, want the applied layer %q", first.ParentKey, applied.SnapshotKey)
+	}
+
+	// Second capture: the parent advances to the first capture while the
+	// base stays the last applied state — the two keys diverge.
+	second, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("second Capture: %v", err)
+	}
+	if second.BaseKey != applied.SnapshotKey {
+		t.Errorf("second BaseKey = %q, want the applied layer %q", second.BaseKey, applied.SnapshotKey)
+	}
+	if second.ParentKey != first.SnapshotKey {
+		t.Errorf("second ParentKey = %q, want the first capture %q", second.ParentKey, first.SnapshotKey)
+	}
+
+	// Create clears the base: the fresh lineage has no merge base again.
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create (reset): %v", err)
+	}
+	fresh, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture after Create: %v", err)
+	}
+	if fresh.BaseKey != "" {
+		t.Errorf("BaseKey after Create = %q, want empty", fresh.BaseKey)
+	}
 }
 
 func TestZeroValueStatesAreRejected(t *testing.T) {
