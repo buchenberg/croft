@@ -115,8 +115,6 @@ type taskService interface {
 	// StopTask stops and deletes task id. It must be idempotent so Destroy and
 	// Capture are safe to retry.
 	StopTask(ctx context.Context, id string) error
-	// Running reports whether task id exists and is running.
-	Running(ctx context.Context, id string) (bool, error)
 	// Exec runs a command inside task id.
 	Exec(ctx context.Context, id string, req ExecRequest) (ExecResult, error)
 }
@@ -856,7 +854,7 @@ func (s *ContainerdSandbox) requireBackend(ctx context.Context) error {
 	if s.backendReady() {
 		return nil
 	}
-	s.connectOnce.Do(func() { s.connectErr = s.connect(ctx) })
+	s.connectOnce.Do(func() { s.connectErr = s.connect() })
 	if s.connectErr != nil {
 		return s.connectErr
 	}

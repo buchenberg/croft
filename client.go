@@ -51,9 +51,6 @@ const defaultSnapshotter = "overlayfs"
 // context expires, which for a caller-supplied timeout can be minutes.
 var ErrStdinUnsupported = errors.New("containerd sandbox: exec stdin is unsupported")
 
-// execSeq numbers exec IDs within the process.
-var execSeq atomic.Uint64
-
 // namespaceOrDefault resolves the namespace this backend operates in.
 func namespaceOrDefault(cfg Config) string {
 	if cfg.Namespace == "" {
@@ -71,7 +68,7 @@ func namespaceOrDefault(cfg Config) string {
 //
 // The same wrapper injects the sandbox's lease, which is what stops the daemon's
 // garbage collector reclaiming a snapshot mid-lifecycle. See ensureLease.
-func (s *ContainerdSandbox) connect(ctx context.Context) error {
+func (s *ContainerdSandbox) connect() error {
 	c, err := containerd.New(s.cfg.Address)
 	if err != nil {
 		return fmt.Errorf("containerd sandbox: connect to daemon: %w", err)
@@ -91,7 +88,6 @@ func (s *ContainerdSandbox) connect(ctx context.Context) error {
 	s.leases = c.LeasesService()
 	s.images = images
 	s.tasks = &containerdTasks{client: c, ns: ns, cfg: s.cfg, images: images}
-	_ = ctx
 	return nil
 }
 
@@ -382,10 +378,13 @@ func (i *containerdImages) image(ctx context.Context, ref string) (containerd.Im
 // generations are found through the sandbox label rather than an in-process map,
 // so a restarted process can still clean them up.
 type containerdTasks struct {
-	client *containerd.Client
-	ns     string
-	cfg    Config
-	images *containerdImages
+	// execSeq numbers exec IDs within this sandbox's client. The zero value
+	// works: it counts from 1.
+	execSeq atomic.Uint64
+	client  *containerd.Client
+	ns      string
+	cfg     Config
+	images  *containerdImages
 }
 
 func (t *containerdTasks) ctx(ctx context.Context) context.Context {
@@ -611,22 +610,6 @@ func (t *containerdTasks) StopTask(ctx context.Context, id string) error {
 	return errors.Join(errs...)
 }
 
-// Running reports whether any container generation for id has a live task.
-func (t *containerdTasks) Running(ctx context.Context, id string) (bool, error) {
-	ctx = t.ctx(ctx)
-
-	ctrs, err := t.sandboxContainers(ctx, id)
-	if err != nil {
-		return false, err
-	}
-	for _, ctr := range ctrs {
-		if _, err := ctr.Task(ctx, nil); err == nil {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // Exec runs a command in the sandbox's current container generation.
 func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) (ExecResult, error) {
 	// Rejected before any RPC: the process would start, block on a stdin that can
@@ -656,7 +639,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 		spec.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 	}
 
-	execID := fmt.Sprintf("exec-%d", execSeq.Add(1))
+	execID := fmt.Sprintf("exec-%d", t.execSeq.Add(1))
 
 	// req.Stdin is rejected at the top of this method (see ErrStdinUnsupported),
 	// so stdin is always empty here. A reader is still supplied because copyIO

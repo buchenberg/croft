@@ -279,10 +279,6 @@ func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeTasks) Running(_ context.Context, id string) (bool, error) {
-	return f.isRunning(), nil
-}
-
 // isRunning reports whether a task is currently rooted anywhere. Test
 // convenience, avoiding a context and error in every assertion.
 func (f *fakeTasks) isRunning() bool {
