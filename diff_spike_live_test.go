@@ -14,6 +14,7 @@ package croft
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -192,45 +193,26 @@ func TestLive_DiffSpike(t *testing.T) {
 		t.Fatalf("read blob: %v", err)
 	}
 
-	// Dump the golden (first run creates it; later runs must match) and log
-	// every entry: the findings downstream tasks key off.
-	goldenDir := filepath.Join("testdata", "change-tar")
-	if err := os.MkdirAll(goldenDir, 0o755); err != nil {
-		t.Fatalf("mkdir golden dir: %v", err)
-	}
-	goldenPath := filepath.Join(goldenDir, "live-changes.tar")
-	if existing, rerr := os.ReadFile(goldenPath); rerr == nil {
-		if string(existing) != string(blob) {
-			t.Fatalf("golden %s changed: the daemon's diff format moved; regenerate deliberately and update this comparison", goldenPath)
-		}
-		t.Logf("golden %s matches (%d bytes)", goldenPath, len(blob))
-	} else {
-		if err := os.WriteFile(goldenPath, blob, 0o644); err != nil {
-			t.Fatalf("write golden: %v", err)
-		}
-		t.Logf("wrote golden %s (%d bytes)", goldenPath, len(blob))
-	}
-
 	// Finding two: the default diff blob is a gzipped OCI layer
 	// (application/vnd.oci.image.layer.v1.tar+gzip), not a plain tar. The
-	// wire golden stays as-is (what the daemon actually emits); the parser
-	// sniffs the gzip magic and decompresses, and a plain-tar fixture is
-	// dumped beside it for inspection and parser tests.
+	// parser sniffs the gzip magic and decompresses, whatever media type the
+	// daemon chose.
 	plain, err := gunzipIfCompressed(blob)
 	if err != nil {
 		t.Fatalf("decompress diff blob: %v", err)
 	}
-	plainPath := filepath.Join(goldenDir, "live-changes.plain.tar")
-	if existing, rerr := os.ReadFile(plainPath); rerr == nil {
-		if string(existing) != string(plain) {
-			t.Fatalf("plain-tar golden %s changed; regenerate deliberately", plainPath)
-		}
-	} else {
-		if err := os.WriteFile(plainPath, plain, 0o644); err != nil {
-			t.Fatalf("write plain golden: %v", err)
-		}
-	}
 
+	// Walk first, so the format findings always print; the golden compares
+	// only a normalized copy.
+	//
+	// Finding three: the blob is not byte-deterministic across runs — the
+	// upper files' wall-clock mtimes ride in the headers, so two identical
+	// change sets produce different digests and the wire bytes cannot be a
+	// golden. Nothing downstream (caching, identity) may assume stability.
+	// The golden is a normalized plain tar: same entries, same content,
+	// timestamps (and their PAX shadows) stripped.
+	var norm bytes.Buffer
+	tw := tar.NewWriter(&norm)
 	tr := tar.NewReader(newByteSliceReader(plain))
 	for {
 		hdr, err := tr.Next()
@@ -247,7 +229,46 @@ func TestLive_DiffSpike(t *testing.T) {
 		if hdr.PAXRecords != nil {
 			kind += fmt.Sprintf(" pax=%v", hdr.PAXRecords)
 		}
-		t.Logf("entry: name=%q mode=%o size=%d %s", hdr.Name, hdr.Mode, hdr.Size, kind)
+		t.Logf("entry: name=%q mode=%o size=%d mtime=%d %s", hdr.Name, hdr.Mode, hdr.Size, hdr.ModTime.Unix(), kind)
+
+		nh := *hdr
+		nh.ModTime = time.Time{}
+		nh.AccessTime = time.Time{}
+		nh.ChangeTime = time.Time{}
+		for k := range nh.PAXRecords {
+			if k == "mtime" || k == "atime" || k == "ctime" {
+				delete(nh.PAXRecords, k)
+			}
+		}
+		if len(nh.PAXRecords) == 0 {
+			nh.PAXRecords = nil
+		}
+		if err := tw.WriteHeader(&nh); err != nil {
+			t.Fatalf("normalize header %s: %v", hdr.Name, err)
+		}
+		if _, err := io.Copy(tw, tr); err != nil {
+			t.Fatalf("normalize content %s: %v", hdr.Name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close normalized tar: %v", err)
+	}
+
+	goldenDir := filepath.Join("testdata", "change-tar")
+	if err := os.MkdirAll(goldenDir, 0o755); err != nil {
+		t.Fatalf("mkdir golden dir: %v", err)
+	}
+	goldenPath := filepath.Join(goldenDir, "live-changes.plain.tar")
+	if existing, rerr := os.ReadFile(goldenPath); rerr == nil {
+		if string(existing) != norm.String() {
+			t.Fatalf("golden %s changed: the entry set moved; regenerate deliberately and update this comparison", goldenPath)
+		}
+		t.Logf("golden %s matches (%d normalized bytes)", goldenPath, norm.Len())
+	} else {
+		if err := os.WriteFile(goldenPath, norm.Bytes(), 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		t.Logf("wrote golden %s (%d normalized bytes)", goldenPath, norm.Len())
 	}
 }
 
