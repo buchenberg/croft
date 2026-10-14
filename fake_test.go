@@ -110,7 +110,7 @@ func (f *fakeSnapshotter) Prepare(_ context.Context, key, parent string, _ ...sn
 	if parent != "" {
 		p, ok := f.ls[parent]
 		if !ok {
-			return nil, fmt.Errorf("prepare %s: parent %s not found", key, parent)
+			return nil, fmt.Errorf("prepare %s: parent %s: %w", key, parent, errdefs.ErrNotFound)
 		}
 		if p.kind != snapshots.KindCommitted {
 			// The real snapshotter cannot stack an active layer as a parent.
@@ -135,7 +135,10 @@ func (f *fakeSnapshotter) View(_ context.Context, key, parent string, _ ...snaps
 	if p.kind != snapshots.KindCommitted {
 		return nil, fmt.Errorf("view %s: parent %s is not committed", key, parent)
 	}
-	f.ls[key] = &fakeLayer{kind: snapshots.KindView, parent: parent, writable: false}
+	// Writable in the fake: the write check enforces the lifecycle invariant
+	// (a task on a committed layer is a bug), not view read-only-ness. The
+	// reader task's cat/ls are reads; the fake does not distinguish.
+	f.ls[key] = &fakeLayer{kind: snapshots.KindView, parent: parent, writable: true}
 	f.log.add("view:%s<-%s", key, parent)
 	return []mount.Mount{{Type: "overlay", Source: "overlay", Target: "/mnt/" + key}}, nil
 }
@@ -252,10 +255,20 @@ type fakeTasks struct {
 	// chunked WriteFile can be asserted on as a sequence rather than only by its
 	// last call.
 	allReqs []ExecRequest
-	// current is the layer the running task is rooted at, "" when stopped.
-	current string
+	// current maps task id → snapshot key for running tasks. A map, not a
+	// single slot: the reader tasks (ReadFilesAt, readDirAt) run concurrently
+	// with the main task, and StopTask(id) must stop only the named task.
+	current map[string]string
 	started int
 	stopped int
+
+	// catFiles maps resolved path → content for `cat -- "$1"` execs.
+	// catMissing is a set of paths cat reports as absent (exit 1).
+	// lsDirs maps resolved dir → entry names for `ls -A1 -- "$1"` execs.
+	// These let reader-task tests assert content without a filesystem model.
+	catFiles   map[string]string
+	catMissing map[string]bool
+	lsDirs     map[string][]string
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -264,19 +277,27 @@ type fakeTasks struct {
 }
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
-	return &fakeTasks{log: log, snap: snap, runErr: map[string]error{}}
+	return &fakeTasks{
+		log:        log,
+		snap:       snap,
+		runErr:     map[string]error{},
+		current:    map[string]string{},
+		catFiles:   map[string]string{},
+		catMissing: map[string]bool{},
+		lsDirs:     map[string][]string{},
+	}
 }
 
 func (f *fakeTasks) StartTask(_ context.Context, id, snapshotKey string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.current != "" {
-		return fmt.Errorf("start %s: task already running on %s", id, f.current)
+	if _, exists := f.current[id]; exists {
+		return fmt.Errorf("start %s: task already running on %s", id, f.current[id])
 	}
 	if !f.snap.has(snapshotKey) {
 		return fmt.Errorf("start %s: snapshot %s not found", id, snapshotKey)
 	}
-	f.current = snapshotKey
+	f.current[id] = snapshotKey
 	f.started++
 	f.log.add("start:%s", snapshotKey)
 	return nil
@@ -285,11 +306,12 @@ func (f *fakeTasks) StartTask(_ context.Context, id, snapshotKey string) error {
 func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.current == "" {
+	key, exists := f.current[id]
+	if !exists {
 		return nil // idempotent
 	}
-	f.log.add("stop:%s", f.current)
-	f.current = ""
+	f.log.add("stop:%s", key)
+	delete(f.current, id)
 	f.stopped++
 	return nil
 }
@@ -299,38 +321,94 @@ func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 func (f *fakeTasks) isRunning() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.current != ""
+	return len(f.current) > 0
+}
+
+// snapshotFor returns the snapshot key the named task is rooted at, or ""
+// when no task with that id is running.
+func (f *fakeTasks) snapshotFor(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.current[id]
+}
+
+// runningIDs returns the ids of all running tasks.
+func (f *fakeTasks) runningIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.current))
+	for id := range f.current {
+		out = append(out, id)
+	}
+	return out
 }
 
 func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecResult, error) {
 	f.mu.Lock()
-	if f.current == "" {
+	current, ok := f.current[id]
+	if !ok {
 		f.mu.Unlock()
 		return ExecResult{}, fmt.Errorf("exec: no running task for %s", id)
 	}
 	// A command writes into the layer the task is rooted at. If Capture committed
 	// that layer without stopping the task, this fails.
-	if err := f.snap.write(f.current); err != nil {
+	if err := f.snap.write(current); err != nil {
 		f.mu.Unlock()
 		return ExecResult{}, err
 	}
 	f.lastReq = req
 	f.lastStdin = req.Stdin
 	f.allReqs = append(f.allReqs, req)
-	current := f.current
 	runErr, hasRunErr := f.runErr[req.Command]
+	// Snapshot the programmable responses under the lock.
+	catContent, catOK := f.catFiles[f.shArg(req)]
+	catGone := f.catMissing[f.shArg(req)]
+	lsListing, lsOK := f.lsDirs[f.shArg(req)]
 	f.mu.Unlock()
 
 	if hasRunErr {
 		return ExecResult{ExitCode: 1, Stderr: runErr.Error()}, nil
 	}
-	_ = current
 
 	switch req.Command {
 	case "sh":
-		return ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
+		return f.shExec(req, catOK, catContent, catGone, lsOK, lsListing), nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
+	}
+}
+
+// shArg extracts $1 from a `sh -c script croft arg` request, or "".
+func (f *fakeTasks) shArg(req ExecRequest) string {
+	// Args: ["-c", script, "croft", arg1, ...]
+	if len(req.Args) >= 4 {
+		return req.Args[3]
+	}
+	return ""
+}
+
+// shExec dispatches the programmable cat/ls responses and falls back to the
+// canned "file-contents" for everything else.
+func (f *fakeTasks) shExec(req ExecRequest, catOK bool, catContent string, catGone bool, lsOK bool, lsListing []string) ExecResult {
+	if len(req.Args) < 2 {
+		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
+	}
+	switch req.Args[1] {
+	case `cat -- "$1"`:
+		if catGone {
+			return ExecResult{ExitCode: 1, Stderr: "cat: " + f.shArg(req) + ": No such file or directory"}
+		}
+		if catOK {
+			return ExecResult{ExitCode: 0, Stdout: catContent}
+		}
+		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
+	case `ls -A1 -- "$1"`:
+		if lsOK {
+			return ExecResult{ExitCode: 0, Stdout: strings.Join(lsListing, "\n")}
+		}
+		return ExecResult{ExitCode: 0, Stdout: ""}
+	default:
+		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
 }
 

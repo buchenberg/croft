@@ -825,3 +825,318 @@ func TestChangeKind_String(t *testing.T) {
 		}
 	}
 }
+
+// readerKeys returns the live reader snapshot keys.
+func readerKeys(snap *fakeSnapshotter) []string {
+	var out []string
+	for _, k := range snap.keys() {
+		if strings.Contains(k, "/reader/") {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// TestReadFilesAt_ReadsFromState pins the full reader-task lifecycle: the
+// files are read from the state's layer, the main task keeps running, and
+// the reader snapshot and task are torn down.
+func TestReadFilesAt_ReadsFromState(t *testing.T) {
+	sb, snap, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	tasks.catFiles["/workspace/old.txt"] = "old content\n"
+	tasks.catFiles["/workspace/other.txt"] = "other\n"
+
+	files, err := sb.ReadFilesAt(ctx, state, []string{"old.txt", "other.txt"})
+	if err != nil {
+		t.Fatalf("ReadFilesAt: %v", err)
+	}
+	if got := string(files["old.txt"]); got != "old content\n" {
+		t.Errorf("old.txt = %q, want %q", got, "old content\n")
+	}
+	if got := string(files["other.txt"]); got != "other\n" {
+		t.Errorf("other.txt = %q, want %q", got, "other\n")
+	}
+
+	// The main task is still running on its active layer.
+	if got := tasks.snapshotFor(sb.id); got == "" {
+		t.Error("main task is not running after ReadFilesAt")
+	}
+	// The reader task is stopped: only the main task remains.
+	if ids := tasks.runningIDs(); len(ids) != 1 || ids[0] != sb.id {
+		t.Errorf("running tasks = %v, want [%s] (the main task only)", ids, sb.id)
+	}
+	// The reader snapshot is removed.
+	if readers := readerKeys(snap); len(readers) != 0 {
+		t.Errorf("reader snapshots leaked: %v", readers)
+	}
+}
+
+// TestReadFilesAt_BeforeCreate pins that ReadFilesAt works without Create:
+// it needs only the state's committed layer and the image, not the active
+// layer.
+func TestReadFilesAt_BeforeCreate(t *testing.T) {
+	sb, snap, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	// Seed a committed layer to stand in for a captured state.
+	snap.seed("croft/test/committed/1")
+	tasks.catFiles["/workspace/file.txt"] = "content\n"
+
+	files, err := sb.ReadFilesAt(ctx, WorkspaceState{SnapshotKey: "croft/test/committed/1"}, []string{"file.txt"})
+	if err != nil {
+		t.Fatalf("ReadFilesAt before Create: %v", err)
+	}
+	if got := string(files["file.txt"]); got != "content\n" {
+		t.Errorf("file.txt = %q, want %q", got, "content\n")
+	}
+
+	// The reader snapshot is cleaned up.
+	if readers := readerKeys(snap); len(readers) != 0 {
+		t.Errorf("reader snapshots leaked: %v", readers)
+	}
+}
+
+// TestReadFilesAt_ReleasedStateIsUnavailable pins that a state whose layer
+// has been released surfaces ErrStateUnavailable.
+func TestReadFilesAt_ReleasedStateIsUnavailable(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	_, err := sb.ReadFilesAt(ctx, WorkspaceState{SnapshotKey: "croft/ghost/committed/1"}, []string{"f.txt"})
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("err = %v, want ErrStateUnavailable", err)
+	}
+}
+
+// TestReadFilesAt_MissingFileFails pins that a path absent from the state
+// fails the call — the workspace raced the read; documented, retryable.
+func TestReadFilesAt_MissingFileFails(t *testing.T) {
+	sb, snap, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	tasks.catMissing["/workspace/gone.txt"] = true
+
+	_, err = sb.ReadFilesAt(ctx, state, []string{"gone.txt"})
+	if err == nil || !strings.Contains(err.Error(), "read gone.txt at state") {
+		t.Fatalf("err = %v, want a wrapped read-at-state error", err)
+	}
+
+	// The reader snapshot is cleaned up on the failure path.
+	if readers := readerKeys(snap); len(readers) != 0 {
+		t.Errorf("reader snapshots leaked after a failed ReadFilesAt: %v", readers)
+	}
+	// The main task is still running.
+	if got := tasks.snapshotFor(sb.id); got == "" {
+		t.Error("main task is not running after a failed ReadFilesAt")
+	}
+}
+
+// TestReadFilesAt_EmptyStateKey pins the guard: a state without a snapshot
+// key is a bug, not a no-op.
+func TestReadFilesAt_EmptyStateKey(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	_, err := sb.ReadFilesAt(ctx, WorkspaceState{}, []string{"f.txt"})
+	if err == nil || !strings.Contains(err.Error(), "no snapshot key") {
+		t.Fatalf("err = %v, want a no-snapshot-key error", err)
+	}
+}
+
+// TestReadFilesAt_NoPaths pins that an empty path list returns an empty map
+// without error.
+func TestReadFilesAt_NoPaths(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	files, err := sb.ReadFilesAt(ctx, state, nil)
+	if err != nil {
+		t.Fatalf("ReadFilesAt with no paths: %v", err)
+	}
+	if len(files) != 0 {
+		t.Errorf("files = %v, want empty", files)
+	}
+}
+
+// TestReadFilesAt_ConcurrentCallsGetDistinctReaders pins that concurrent
+// ReadFilesAt calls get distinct reader keys (the readSeq counter) and all
+// clean up after themselves.
+func TestReadFilesAt_ConcurrentCallsGetDistinctReaders(t *testing.T) {
+	sb, snap, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	tasks.catFiles["/workspace/f.txt"] = "x"
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+	for i := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = sb.ReadFilesAt(ctx, state, []string{"f.txt"})
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("ReadFilesAt from goroutine %d: %v", i, err)
+		}
+	}
+
+	// No reader snapshots leaked.
+	if readers := readerKeys(snap); len(readers) != 0 {
+		t.Errorf("reader snapshots leaked after concurrent ReadFilesAt: %v", readers)
+	}
+	// Only the main task remains.
+	if ids := tasks.runningIDs(); len(ids) != 1 || ids[0] != sb.id {
+		t.Errorf("running tasks = %v, want [%s] (the main task only)", ids, sb.id)
+	}
+}
+
+// TestReadDirAt_ListsEntries pins that readDirAt returns the directory
+// listing from the state's layer, for opaque-dir resolution.
+func TestReadDirAt_ListsEntries(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	tasks.lsDirs["/workspace/opaque-dir"] = []string{"a.txt", "b.txt"}
+
+	names, err := sb.readDirAt(ctx, state, "opaque-dir")
+	if err != nil {
+		t.Fatalf("readDirAt: %v", err)
+	}
+	if len(names) != 2 || names[0] != "a.txt" || names[1] != "b.txt" {
+		t.Errorf("names = %v, want [a.txt b.txt]", names)
+	}
+}
+
+// TestReadDirAt_EmptyDir pins that an empty directory returns no names.
+func TestReadDirAt_EmptyDir(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	tasks.lsDirs["/workspace/empty"] = []string{}
+
+	names, err := sb.readDirAt(ctx, state, "empty")
+	if err != nil {
+		t.Fatalf("readDirAt on empty dir: %v", err)
+	}
+	if len(names) != 0 {
+		t.Errorf("names = %v, want []", names)
+	}
+}
+
+// TestReadDirAt_ReleasedStateIsUnavailable pins ErrStateUnavailable for
+// readDirAt, matching readFilesAt.
+func TestReadDirAt_ReleasedStateIsUnavailable(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	_, err := sb.readDirAt(ctx, WorkspaceState{SnapshotKey: "croft/ghost/committed/1"}, "dir")
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("err = %v, want ErrStateUnavailable", err)
+	}
+}
+
+// TestReadFilesAt_ReaderSnapshotKeyShape pins that reader snapshot keys
+// follow croft/<id>/reader/<n> and do not collide with capture keys.
+func TestReadFilesAt_ReaderSnapshotKeyShape(t *testing.T) {
+	sb, _, tasks, log := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	tasks.catFiles["/workspace/f.txt"] = "x"
+	if _, err := sb.ReadFilesAt(ctx, state, []string{"f.txt"}); err != nil {
+		t.Fatalf("ReadFilesAt: %v", err)
+	}
+
+	// The reader snapshot was prepared and removed; the op log records it.
+	ops := log.snapshot()
+	var prepared, removed bool
+	for _, op := range ops {
+		if strings.HasPrefix(op, "prepare:") && strings.Contains(op, "/reader/") {
+			prepared = true
+		}
+		if strings.HasPrefix(op, "remove:") && strings.Contains(op, "/reader/") {
+			removed = true
+		}
+	}
+	if !prepared {
+		t.Error("no reader snapshot was prepared (op log has no prepare:/reader/)")
+	}
+	if !removed {
+		t.Error("no reader snapshot was removed (op log has no remove:/reader/)")
+	}
+
+	// The capture seq was not moved by the reader: the state's snapshot key
+	// still has its original sequence number.
+	if !strings.Contains(state.SnapshotKey, "/committed/") {
+		t.Errorf("state snapshot key %q does not look like a committed layer", state.SnapshotKey)
+	}
+}

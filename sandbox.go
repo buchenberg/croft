@@ -247,6 +247,10 @@ type ContainerdSandbox struct {
 	// from seq: state identity is sequence-derived, and diff views must not
 	// move the capture sequence.
 	diffSeq uint64
+	// readSeq orders reader snapshot keys within this sandbox. Separate from
+	// seq for the same reason: reader snapshots are throwaway and must not
+	// move the capture sequence.
+	readSeq uint64
 }
 
 // The compile-time assertion is load-bearing: if Sandbox gains or

@@ -681,7 +681,7 @@ func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 	before := len(snap.keys())
-	onActive := tasks.current
+	onActive := tasks.snapshotFor(sb.id)
 
 	// Break exactly the roll-forward's StartTask; the recovery restart must
 	// go through the same fake and succeed.
@@ -690,9 +690,9 @@ func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
 	if err := sb.Apply(ctx, state); err == nil {
 		t.Fatal("Apply succeeded although the successor task could not start")
 	}
-	if tasks.current != onActive {
+	if got := tasks.snapshotFor(sb.id); got != onActive {
 		t.Fatalf("after the failed Apply the task runs on %q, want the old active %q: "+
-			"the sandbox must recover in place, not stay stopped", tasks.current, onActive)
+			"the sandbox must recover in place, not stay stopped", got, onActive)
 	}
 	if len(snap.keys()) != before {
 		t.Errorf("snapshot count = %d after the failed Apply, want %d: the prepared successor must not leak",

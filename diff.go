@@ -327,3 +327,142 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 
 	return desc, drop, nil
 }
+
+// withReaderTask prepares a throwaway reader snapshot from ws's committed
+// layer, starts a task on it, and calls fn with the reader's task id. The
+// task is stopped and the snapshot removed on return — cancel-free, on every
+// path, exactly like Create's failure-cleanup shape.
+//
+// The reader task id is derived from the sandbox id and the readSeq counter,
+// so StopTask(readerID) stops only the reader and never the main task. The
+// snapshot key is croft/<id>/reader/<n> — readable in the snapshotter, and
+// distinct from the capture seq (state identity is sequence-derived).
+//
+// A state whose layer has been released surfaces as ErrStateUnavailable.
+func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceState, fn func(ctx context.Context, readerID string) error) error {
+	if ws.SnapshotKey == "" {
+		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
+	}
+	if err := s.requireBackend(ctx); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	id := s.id
+	if id == "" {
+		// ReadFilesAt works before Create: the reader task does not need the
+		// active layer, only the state's committed layer and the image.
+		id = newSandboxID()
+	}
+	s.readSeq++
+	n := s.readSeq
+	s.mu.Unlock()
+
+	readerKey := s.key(id, "reader", n)
+	readerID := fmt.Sprintf("%s-reader-%d", id, n)
+
+	// Prepare a reader snapshot from the state's committed layer.
+	if _, err := s.snap.Prepare(ctx, readerKey, ws.SnapshotKey); err != nil {
+		if errdefs.IsNotFound(err) {
+			return fmt.Errorf("%w: %s", ErrStateUnavailable, ws.SnapshotKey)
+		}
+		return fmt.Errorf("containerd sandbox: prepare reader snapshot from %s: %w", ws.SnapshotKey, err)
+	}
+	defer func() {
+		_ = s.snap.Remove(context.WithoutCancel(ctx), readerKey)
+	}()
+
+	if err := s.tasks.StartTask(ctx, readerID, readerKey); err != nil {
+		return fmt.Errorf("containerd sandbox: start reader task: %w", err)
+	}
+	defer func() {
+		_ = s.tasks.StopTask(context.WithoutCancel(ctx), readerID)
+	}()
+
+	return fn(ctx, readerID)
+}
+
+// readFilesAt reads the given paths from ws's committed layer, returning a
+// map keyed by the original (unresolved) paths. A missing path fails the
+// call — the workspace raced the read; documented, retryable.
+//
+// One `cat -- "$1"` exec per file: robust over clever marker protocols, and
+// changed-file counts in practice are small.
+func (s *ContainerdSandbox) readFilesAt(ctx context.Context, ws WorkspaceState, paths []string) (map[string][]byte, error) {
+	var out map[string][]byte
+	err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+		out = make(map[string][]byte, len(paths))
+		for _, p := range paths {
+			resolved := s.resolve(p)
+			res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+				Command: "sh",
+				Args:    []string{"-c", `cat -- "$1"`, "croft", resolved},
+				Cwd:     s.cfg.workdir(),
+			})
+			if err != nil {
+				return fmt.Errorf("containerd sandbox: read %s at state: %w", p, err)
+			}
+			if res.ExitCode != 0 {
+				return fmt.Errorf("containerd sandbox: read %s at state: exit %d: %s",
+					p, res.ExitCode, strings.TrimSpace(res.Stderr))
+			}
+			out[p] = []byte(res.Stdout)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ReadFilesAt reads files from a workspace state without applying it —
+// inspect a checkpoint's contents as they were when captured. The returned
+// map is keyed by the paths as given.
+//
+// This is a concrete method on ContainerdSandbox, not on the Sandbox
+// interface: it is independently useful for hosts that hold a concrete
+// sandbox, and promotion to the interface is a later decision (the
+// StateReleaser precedent).
+//
+// The reader task runs concurrently with the sandbox's main task and is
+// torn down before returning; the main task is untouched. A missing path
+// fails the call (the workspace raced; retryable).
+func (s *ContainerdSandbox) ReadFilesAt(ctx context.Context, ws WorkspaceState, paths []string) (map[string][]byte, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.readFilesAt(ctx, ws, paths)
+}
+
+// readDirAt lists a directory's entries at ws's committed layer, for
+// opaque-dir resolution (Task 5): when a differ emits a .wh..wh..opq marker
+// instead of per-file whiteouts, the parser reports the directory as opaque
+// and Changes enumerates the state's contents to emit the deletes.
+//
+// Uses `ls -A1 --` — one name per line, no . or .., no metadata.
+func (s *ContainerdSandbox) readDirAt(ctx context.Context, ws WorkspaceState, dir string) ([]string, error) {
+	var names []string
+	err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+		resolved := s.resolve(dir)
+		res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+			Command: "sh",
+			Args:    []string{"-c", `ls -A1 -- "$1"`, "croft", resolved},
+			Cwd:     s.cfg.workdir(),
+		})
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: list %s at state: %w", dir, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("containerd sandbox: list %s at state: exit %d: %s",
+				dir, res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+		if out := res.Stdout; out != "" {
+			names = strings.Split(strings.TrimSpace(out), "\n")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return names, nil
+}
