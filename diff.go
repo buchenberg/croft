@@ -572,3 +572,234 @@ func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) 
 
 	return changes, nil
 }
+
+// Diff returns a unified text diff between ws and the current workspace.
+//
+// It takes the shared operation lock: like Changes, it never interleaves
+// with Capture/Apply/Destroy, so it always sees a quiescent workspace.
+func (s *ContainerdSandbox) Diff(ctx context.Context, ws WorkspaceState) (string, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.diffImpl(ctx, ws)
+}
+
+// diffImpl is Diff without the lock.
+func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (string, error) {
+	// Get the change list.
+	changes, err := s.changesImpl(ctx, ws)
+	if err != nil {
+		return "", err
+	}
+
+	// Collect pre-image paths: ChangeModify and ChangeDelete need pre-images.
+	var prePaths []string
+	for _, c := range changes {
+		if c.Kind == ChangeModify || c.Kind == ChangeDelete {
+			prePaths = append(prePaths, c.Path)
+		}
+	}
+
+	// Read pre-images from the state's layer.
+	var preImages map[string][]byte
+	if len(prePaths) > 0 {
+		preImages, err = s.readFilesAt(ctx, ws, prePaths)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// Render each change.
+	var out strings.Builder
+	for _, c := range changes {
+		if err := s.renderChange(ctx, &out, c, ws, preImages); err != nil {
+			return "", err
+		}
+	}
+
+	return out.String(), nil
+}
+
+// renderChange renders one change's diff section.
+func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, preImages map[string][]byte) error {
+	switch {
+	case c.IsDir:
+		// Directory: render a marker. Content diffs are per-file.
+		switch c.Kind {
+		case ChangeAdd:
+			fmt.Fprintf(out, "new directory: %s\n", c.Path)
+		case ChangeDelete:
+			fmt.Fprintf(out, "deleted directory: %s\n", c.Path)
+		}
+		return nil
+
+	case c.Mode&fs.ModeSymlink != 0:
+		// Symlink: render the target as a one-line diff.
+		return s.renderSymlinkChange(ctx, out, c, ws)
+
+	default:
+		// Regular file: unified diff with binary and mode-only handling.
+		return s.renderFileChange(ctx, out, c, ws, preImages)
+	}
+}
+
+// renderFileChange renders a regular file's diff section.
+func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, preImages map[string][]byte) error {
+	var pre, post []byte
+	var isAdd, isDelete bool
+
+	switch c.Kind {
+	case ChangeAdd:
+		isAdd = true
+		var err error
+		post, err = s.readFileImpl(ctx, c.Path)
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: read %s for diff: %w", c.Path, err)
+		}
+	case ChangeDelete:
+		isDelete = true
+		pre = preImages[c.Path]
+	case ChangeModify:
+		pre = preImages[c.Path]
+		var err error
+		post, err = s.readFileImpl(ctx, c.Path)
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: read %s for diff: %w", c.Path, err)
+		}
+	}
+
+	// Binary check: NUL in the first 8 KiB of either side.
+	if isBinary(pre) || isBinary(post) {
+		oldSide, newSide := "a/"+c.Path, "b/"+c.Path
+		if isAdd {
+			oldSide = "/dev/null"
+		}
+		if isDelete {
+			newSide = "/dev/null"
+		}
+		fmt.Fprintf(out, "Binary files %s and %s differ\n", oldSide, newSide)
+		return nil
+	}
+
+	// Mode-only check: content identical, mode differs.
+	if c.Kind == ChangeModify && bytes.Equal(pre, post) {
+		oldMode, err := s.readModeAt(ctx, ws, c.Path)
+		if err != nil {
+			return err
+		}
+		if oldMode.Perm() != c.Mode.Perm() {
+			fmt.Fprintf(out, "old mode %s\nnew mode %s\n", formatMode(oldMode), formatMode(c.Mode))
+			return nil
+		}
+		// Content and mode both identical: no output (shouldn't happen).
+		return nil
+	}
+
+	// Unified diff.
+	out.WriteString(renderUnified(c.Path, pre, post, isAdd, isDelete))
+	return nil
+}
+
+// renderSymlinkChange renders a symlink's target as a one-line unified diff.
+func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState) error {
+	var oldTarget, newTarget string
+	var isAdd, isDelete bool
+
+	switch c.Kind {
+	case ChangeAdd:
+		isAdd = true
+		target, err := s.readlinkCurrent(ctx, c.Path)
+		if err != nil {
+			return err
+		}
+		newTarget = target
+	case ChangeDelete:
+		isDelete = true
+		target, err := s.readlinkAt(ctx, ws, c.Path)
+		if err != nil {
+			return err
+		}
+		oldTarget = target
+	case ChangeModify:
+		var err error
+		oldTarget, err = s.readlinkAt(ctx, ws, c.Path)
+		if err != nil {
+			return err
+		}
+		newTarget, err = s.readlinkCurrent(ctx, c.Path)
+		if err != nil {
+			return err
+		}
+	}
+
+	out.WriteString(renderUnified(c.Path,
+		[]byte(oldTarget+"\n"), []byte(newTarget+"\n"),
+		isAdd, isDelete))
+	return nil
+}
+
+// readModeAt reads a file's mode from ws's committed layer, via ls -ld and
+// symbolic-mode parsing.
+func (s *ContainerdSandbox) readModeAt(ctx context.Context, ws WorkspaceState, path string) (fs.FileMode, error) {
+	var mode fs.FileMode
+	err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+		resolved := s.resolve(path)
+		res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+			Command: "sh",
+			Args:    []string{"-c", `ls -ld -- "$1"`, "croft", resolved},
+			Cwd:     s.cfg.workdir(),
+		})
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: stat %s at state: %w", path, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("containerd sandbox: stat %s at state: exit %d: %s",
+				path, res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+		fields := strings.Fields(res.Stdout)
+		if len(fields) == 0 {
+			return fmt.Errorf("containerd sandbox: stat %s at state: empty ls output", path)
+		}
+		mode = parseSymbolicMode(fields[0])
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return mode, nil
+}
+
+// readlinkAt reads a symlink's target from ws's committed layer.
+func (s *ContainerdSandbox) readlinkAt(ctx context.Context, ws WorkspaceState, path string) (string, error) {
+	var target string
+	err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+		resolved := s.resolve(path)
+		res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+			Command: "sh",
+			Args:    []string{"-c", `readlink -- "$1"`, "croft", resolved},
+			Cwd:     s.cfg.workdir(),
+		})
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: readlink %s at state: %w", path, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("containerd sandbox: readlink %s at state: exit %d: %s",
+				path, res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+		target = strings.TrimSpace(res.Stdout)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+// readlinkCurrent reads a symlink's target from the current workspace.
+func (s *ContainerdSandbox) readlinkCurrent(ctx context.Context, path string) (string, error) {
+	resolved := s.resolve(path)
+	res, err := s.execShell(ctx, nil, `readlink -- "$1"`, resolved)
+	if err != nil {
+		return "", fmt.Errorf("containerd sandbox: readlink %s: %w", path, err)
+	}
+	return strings.TrimSpace(res.Stdout), nil
+}

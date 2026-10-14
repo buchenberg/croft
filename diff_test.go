@@ -857,8 +857,8 @@ func TestReadFilesAt_ReadsFromState(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 
-	tasks.catFiles["/workspace/old.txt"] = "old content\n"
-	tasks.catFiles["/workspace/other.txt"] = "other\n"
+	tasks.preFiles["/workspace/old.txt"] = "old content\n"
+	tasks.preFiles["/workspace/other.txt"] = "other\n"
 
 	files, err := sb.ReadFilesAt(ctx, state, []string{"old.txt", "other.txt"})
 	if err != nil {
@@ -894,7 +894,7 @@ func TestReadFilesAt_BeforeCreate(t *testing.T) {
 
 	// Seed a committed layer to stand in for a captured state.
 	snap.seed("croft/test/committed/1")
-	tasks.catFiles["/workspace/file.txt"] = "content\n"
+	tasks.preFiles["/workspace/file.txt"] = "content\n"
 
 	files, err := sb.ReadFilesAt(ctx, WorkspaceState{SnapshotKey: "croft/test/committed/1"}, []string{"file.txt"})
 	if err != nil {
@@ -1007,7 +1007,7 @@ func TestReadFilesAt_ConcurrentCallsGetDistinctReaders(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 
-	tasks.catFiles["/workspace/f.txt"] = "x"
+	tasks.preFiles["/workspace/f.txt"] = "x"
 
 	const goroutines = 8
 	var wg sync.WaitGroup
@@ -1116,7 +1116,7 @@ func TestReadFilesAt_ReaderSnapshotKeyShape(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 
-	tasks.catFiles["/workspace/f.txt"] = "x"
+	tasks.preFiles["/workspace/f.txt"] = "x"
 	if _, err := sb.ReadFilesAt(ctx, state, []string{"f.txt"}); err != nil {
 		t.Fatalf("ReadFilesAt: %v", err)
 	}
@@ -1476,5 +1476,378 @@ func TestChanges_ConcurrentWithSharedLock(t *testing.T) {
 	fl.mu.Unlock()
 	if deleted != goroutines {
 		t.Errorf("deleted %d leases, want %d: every call must drop its blob", deleted, goroutines)
+	}
+}
+
+// TestDiff_Modify pins the core unified-diff path: a modified file produces
+// ---/+++ headers and a hunk with -old/+new lines.
+func TestDiff_Modify(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob: a modified file.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\n")},
+	)
+	// Pre-image (state) and post-image (current workspace) differ.
+	tasks.preFiles["/workspace/file.txt"] = "old\n"
+	tasks.catFiles["/workspace/file.txt"] = "new\n"
+	// file.txt exists in the lower tree (not in missingPaths) → ChangeModify.
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/file.txt
++++ b/file.txt
+@@ -1 +1 @@
+-old
++new
+`
+	if got != want {
+		t.Errorf("Diff modify:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_Add pins the add path: /dev/null as the a side, all lines added.
+func TestDiff_Add(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/new.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("hello\n")},
+	)
+	tasks.missingPaths["/workspace/new.txt"] = true // absent from lower → ChangeAdd
+	tasks.catFiles["/workspace/new.txt"] = "hello\n"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- /dev/null
++++ b/new.txt
+@@ -0,0 +1 @@
++hello
+`
+	if got != want {
+		t.Errorf("Diff add:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_Delete pins the delete path: /dev/null as the b side, all lines
+// removed.
+func TestDiff_Delete(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/.wh.gone.txt", mode: 0, typeflag: tar.TypeReg},
+	)
+	tasks.preFiles["/workspace/gone.txt"] = "bye\n"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+`
+	if got != want {
+		t.Errorf("Diff delete:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_ModeOnly pins the mode-only rendering: content identical, mode
+// differs → old mode/new mode pair, no hunks.
+func TestDiff_ModeOnly(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob: a file with new mode 0600 and unchanged content.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/modeonly.txt", mode: 0o600, typeflag: tar.TypeReg, content: []byte("same\n")},
+	)
+	// Pre-image and post-image have identical content.
+	tasks.preFiles["/workspace/modeonly.txt"] = "same\n"
+	tasks.catFiles["/workspace/modeonly.txt"] = "same\n"
+	// The state's layer had mode 0644.
+	tasks.modes["/workspace/modeonly.txt"] = "-rw-r--r--"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "old mode 0644\nnew mode 0600\n"
+	if got != want {
+		t.Errorf("Diff mode-only:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_Binary pins the binary rendering: NUL in either side → a single
+// "Binary files ... differ" line.
+func TestDiff_Binary(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/blob.bin", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\x00data")},
+	)
+	tasks.preFiles["/workspace/blob.bin"] = "old\x00data"
+	tasks.catFiles["/workspace/blob.bin"] = "new\x00data"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "Binary files a/blob.bin and b/blob.bin differ\n"
+	if got != want {
+		t.Errorf("Diff binary:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_SymlinkModify pins symlink rendering: the target is read from
+// both sides and rendered as a one-line diff.
+func TestDiff_SymlinkModify(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "newtarget"},
+	)
+	// Old target (state, reader task) and new target (current, main task).
+	tasks.preReadlinkTargets["/workspace/link"] = "oldtarget"
+	tasks.readlinkTargets["/workspace/link"] = "newtarget"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/link
++++ b/link
+@@ -1 +1 @@
+-oldtarget
++newtarget
+`
+	if got != want {
+		t.Errorf("Diff symlink modify:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_NewDirectory pins directory rendering: a new directory produces a
+// marker line, no hunks.
+func TestDiff_NewDirectory(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/newdir/", mode: 0o755, typeflag: tar.TypeDir},
+	)
+	tasks.missingPaths["/workspace/newdir"] = true // absent from lower → ChangeAdd
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "new directory: newdir\n"
+	if got != want {
+		t.Errorf("Diff new directory:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_NoChanges pins that an empty change list produces empty output.
+func TestDiff_NoChanges(t *testing.T) {
+	sb, _, _, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir},
+	)
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if got != "" {
+		t.Errorf("Diff no changes = %q, want empty", got)
+	}
+}
+
+// TestDiff_BeforeCreate pins the guard.
+func TestDiff_BeforeCreate(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	_, err := sb.Diff(ctx, WorkspaceState{SnapshotKey: "anything"})
+	if err == nil || !strings.Contains(err.Error(), "Changes before Create") {
+		t.Fatalf("err = %v, want a Changes-before-Create error (Diff delegates to Changes)", err)
+	}
+}
+
+// TestDiff_ReleasedStateIsUnavailable pins ErrStateUnavailable.
+func TestDiff_ReleasedStateIsUnavailable(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	_, err := sb.Diff(ctx, WorkspaceState{SnapshotKey: "croft/ghost/committed/1"})
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("err = %v, want ErrStateUnavailable", err)
+	}
+}
+
+// TestDiff_PreImageRaceFails pins that a pre-image the reader cannot fetch
+// fails Diff (documented, retryable — same contract as ReadFilesAt). A
+// ChangeDelete's pre-image read goes through readFilesAt; when the state's
+// layer cannot serve the file, Diff propagates the error.
+func TestDiff_PreImageRaceFails(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob names a deleted file, but the state's layer cannot serve it
+	// (the workspace raced the read). ChangeDelete entries are not checked
+	// by test -e, so missingPaths only affects the pre-image cat read.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/.wh.raced.txt", mode: 0, typeflag: tar.TypeReg},
+	)
+	tasks.missingPaths["/workspace/raced.txt"] = true
+
+	_, err = sb.Diff(ctx, state)
+	if err == nil || !strings.Contains(err.Error(), "read raced.txt at state") {
+		t.Fatalf("err = %v, want a wrapped read-at-state error", err)
+	}
+}
+
+// TestDiff_MultiFile pins that multiple changes render in sorted order, each
+// with its own headers.
+func TestDiff_MultiFile(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// An add, a modify, and a delete.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/added.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("a\n")},
+		tarEntry{name: "workspace/modified.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\n")},
+		tarEntry{name: "workspace/.wh.deleted.txt", mode: 0, typeflag: tar.TypeReg},
+	)
+	tasks.missingPaths["/workspace/added.txt"] = true
+	tasks.catFiles["/workspace/added.txt"] = "a\n"
+	tasks.preFiles["/workspace/modified.txt"] = "old\n"
+	tasks.catFiles["/workspace/modified.txt"] = "new\n"
+	tasks.preFiles["/workspace/deleted.txt"] = "bye\n"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	// Sorted by path: added.txt, deleted.txt, modified.txt.
+	want := `--- /dev/null
++++ b/added.txt
+@@ -0,0 +1 @@
++a
+--- a/deleted.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+--- a/modified.txt
++++ b/modified.txt
+@@ -1 +1 @@
+-old
++new
+`
+	if got != want {
+		t.Errorf("Diff multi-file:\n got: %q\nwant: %q", got, want)
 	}
 }

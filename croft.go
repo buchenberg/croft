@@ -175,4 +175,12 @@ type Sandbox interface {
 	// lock, so it cannot interleave with Capture/Apply/Destroy — it always
 	// sees a quiescent workspace.
 	Changes(ctx context.Context, ws WorkspaceState) ([]Change, error)
+
+	// Diff returns a unified text diff between ws and the current
+	// workspace. Binary files render as "Binary files ... differ"; mode-only
+	// changes as "old mode"/"new mode" pairs; symlinks as target lines.
+	// Returns ErrStateUnavailable once ws's layer has been released.
+	//
+	// Like Changes, Diff is read-only and takes the shared operation lock.
+	Diff(ctx context.Context, ws WorkspaceState) (string, error)
 }

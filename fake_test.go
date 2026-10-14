@@ -262,16 +262,30 @@ type fakeTasks struct {
 	started int
 	stopped int
 
-	// catFiles maps resolved path → content for `cat -- "$1"` execs.
+	// catFiles maps resolved path → content for main-task `cat -- "$1"`
+	// execs (post-images in Diff).
+	// preFiles maps resolved path → content for reader-task `cat -- "$1"`
+	// execs (pre-images in Diff). Separate from catFiles so tests can give
+	// a file different old and new content.
 	// missingPaths is a set of resolved paths that do not exist in the
 	// fake's filesystem model: cat reports them absent (exit 1), and
 	// test -e reports them missing (exit 1). By default every path exists.
 	// lsDirs maps resolved dir → entry names for `ls -A1 -- "$1"` execs.
-	// These let reader-task and Changes tests assert behavior without a
-	// filesystem model.
-	catFiles     map[string]string
-	missingPaths map[string]bool
-	lsDirs       map[string][]string
+	// modes maps resolved path → symbolic mode string (e.g. "-rw-r--r--")
+	// for `ls -ld -- "$1"` execs (mode-only change rendering in Diff).
+	// readlinkTargets maps resolved path → symlink target for main-task
+	// `readlink -- "$1"` execs (post-image symlink targets in Diff).
+	// preReadlinkTargets maps resolved path → symlink target for reader-task
+	// `readlink -- "$1"` execs (pre-image symlink targets in Diff).
+	// These let reader-task, Changes, and Diff tests assert behavior without
+	// a filesystem model.
+	catFiles           map[string]string
+	preFiles           map[string]string
+	missingPaths       map[string]bool
+	lsDirs             map[string][]string
+	modes              map[string]string
+	readlinkTargets    map[string]string
+	preReadlinkTargets map[string]string
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -281,13 +295,17 @@ type fakeTasks struct {
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
 	return &fakeTasks{
-		log:          log,
-		snap:         snap,
-		runErr:       map[string]error{},
-		current:      map[string]string{},
-		catFiles:     map[string]string{},
-		missingPaths: map[string]bool{},
-		lsDirs:       map[string][]string{},
+		log:                log,
+		snap:               snap,
+		runErr:             map[string]error{},
+		current:            map[string]string{},
+		catFiles:           map[string]string{},
+		preFiles:           map[string]string{},
+		missingPaths:       map[string]bool{},
+		lsDirs:             map[string][]string{},
+		modes:              map[string]string{},
+		readlinkTargets:    map[string]string{},
+		preReadlinkTargets: map[string]string{},
 	}
 }
 
@@ -363,11 +381,24 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 	f.lastStdin = req.Stdin
 	f.allReqs = append(f.allReqs, req)
 	runErr, hasRunErr := f.runErr[req.Command]
-	// Snapshot the programmable responses under the lock.
+	// Snapshot the programmable responses under the lock. Reader tasks
+	// (id contains "-reader-") serve pre-images from preFiles and see
+	// missingPaths; the main task serves post-images from catFiles and
+	// always sees paths as present (the current workspace is the source
+	// of truth for post-images).
 	arg := f.shArg(req)
+	isReader := strings.Contains(id, "-reader-")
 	catContent, catOK := f.catFiles[arg]
-	pathGone := f.missingPaths[arg]
+	if isReader {
+		catContent, catOK = f.preFiles[arg]
+	}
+	pathGone := f.missingPaths[arg] && isReader
 	lsListing, lsOK := f.lsDirs[arg]
+	modeStr, modeOK := f.modes[arg]
+	linkTarget, linkOK := f.readlinkTargets[arg]
+	if isReader {
+		linkTarget, linkOK = f.preReadlinkTargets[arg]
+	}
 	f.mu.Unlock()
 
 	if hasRunErr {
@@ -376,7 +407,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 
 	switch req.Command {
 	case "sh":
-		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing), nil
+		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing, modeOK, modeStr, linkOK, linkTarget), nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
 	}
@@ -391,9 +422,9 @@ func (f *fakeTasks) shArg(req ExecRequest) string {
 	return ""
 }
 
-// shExec dispatches the programmable cat/ls/test responses and falls back to
-// the canned "file-contents" for everything else.
-func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string) ExecResult {
+// shExec dispatches the programmable cat/ls/test/mode/readlink responses and
+// falls back to the canned "file-contents" for everything else.
+func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string, modeOK bool, modeStr string, linkOK bool, linkTarget string) ExecResult {
 	if len(req.Args) < 2 {
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
@@ -411,11 +442,27 @@ func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent s
 			return ExecResult{ExitCode: 0, Stdout: strings.Join(lsListing, "\n")}
 		}
 		return ExecResult{ExitCode: 0, Stdout: ""}
+	case `ls -ld -- "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1, Stderr: "ls: cannot access " + arg + ": No such file or directory"}
+		}
+		if modeOK {
+			return ExecResult{ExitCode: 0, Stdout: modeStr + " 1 0 0 0 Jan  1 00:00 " + arg + "\n"}
+		}
+		return ExecResult{ExitCode: 0, Stdout: "-rw-r--r-- 1 0 0 0 Jan  1 00:00 " + arg + "\n"}
 	case `test -e "$1"`:
 		if pathGone {
 			return ExecResult{ExitCode: 1}
 		}
 		return ExecResult{ExitCode: 0}
+	case `readlink -- "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1, Stderr: "readlink: " + arg + ": No such file or directory"}
+		}
+		if linkOK {
+			return ExecResult{ExitCode: 0, Stdout: linkTarget + "\n"}
+		}
+		return ExecResult{ExitCode: 0, Stdout: "target\n"}
 	default:
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
