@@ -139,10 +139,10 @@ type Sandbox interface {
 	// snapshot, pins it, and continues on a fresh layer. Non-mutating to
 	// the caller's workspace metadata.
 	//
-	// Contract caveat: the state's identity is the snapshot key, which is
+	// Contract caveat: the state's identity is its snapshot key, which is
 	// sequence-derived, so two captures of identical content produce
-	// different states. Digest equality means identity, not content
-	// equality; a content-derived state identity is a recorded follow-up.
+	// different states — identity, not content equality. A content-derived
+	// state identity is a recorded follow-up.
 	Capture(ctx context.Context) (WorkspaceState, error)
 
 	// Apply resumes the workspace from a previously captured state by

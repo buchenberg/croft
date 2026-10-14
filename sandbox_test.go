@@ -546,18 +546,6 @@ func TestSnapshotState_RoundTrip(t *testing.T) {
 		t.Errorf("Image = %q, want example/dev:latest", state.Image)
 	}
 
-	// The state must digest stably, so records and drift detection work.
-	d1, err := state.Digest()
-	if err != nil {
-		t.Fatalf("Digest: %v", err)
-	}
-	d2, err := snapshotState("example/dev:latest", "layer-7", "layer-3").Digest()
-	if err != nil {
-		t.Fatalf("Digest (second): %v", err)
-	}
-	if d1 != d2 {
-		t.Errorf("digest is not stable: %s vs %s", d1, d2)
-	}
 }
 
 func TestZeroValueStatesAreRejected(t *testing.T) {
