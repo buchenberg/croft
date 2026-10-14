@@ -2,6 +2,8 @@ package croft
 
 import (
 	"bytes"
+	"fmt"
+	"io/fs"
 	"sort"
 )
 
@@ -143,4 +145,89 @@ func forEachUnder(list []Change, dir string, fn func(Change) bool) {
 			return
 		}
 	}
+}
+
+// deltaOpKind classifies a planned delta mutation.
+type deltaOpKind int
+
+const (
+	// opRemove deletes a path (rm -rf: files, symlinks, and directories
+	// alike, since a deleted directory's remaining contents go with it).
+	opRemove deltaOpKind = iota
+	// opMkdir creates a directory and applies its mode.
+	opMkdir
+	// opWrite writes a regular file's content and mode (WriteFile, which
+	// creates parent directories as needed).
+	opWrite
+	// opSymlink replaces a path with a symlink to target.
+	opSymlink
+)
+
+// deltaOp is one planned mutation of the ApplyDelta application phase.
+// path is workspace-relative; content is the post-image from theirs' diff
+// blob (nil for an empty file); mode carries the full fs.FileMode from the
+// tar, special bits included.
+type deltaOp struct {
+	kind    deltaOpKind
+	path    string
+	content []byte
+	mode    fs.FileMode
+	target  string
+}
+
+// planDelta turns the merged apply set into the concrete mutation sequence,
+// validating that every entry is applicable BEFORE anything is written — the
+// refusal-is-atomic contract extends to entries the workspace cannot express.
+//
+// Ordering is load-bearing: removes first (a path theirs deleted and then
+// recreated as another type — file → directory, file → symlink — must be
+// cleared before the new type is created), then directories (path-sorted, so
+// parents precede children), then regular files, then symlinks last (a
+// symlink's target path may be created by an earlier op, and ln must not be
+// shadowed by a write to the same path). apply arrives sorted by path, and
+// the partition preserves that order within each group.
+//
+// No size guard: the delta carries full file contents transiently, the same
+// documented blob-cost risk the diff machinery carries (the roadmap rules
+// MaxDeltaBytes a knob only once a host hits the ceiling).
+func planDelta(apply []Change, theirsContent map[string][]byte) ([]deltaOp, error) {
+	var removes, mkdirs, writes, symlinks []deltaOp
+	for _, c := range apply {
+		switch {
+		case c.Kind == ChangeDelete:
+			removes = append(removes, deltaOp{kind: opRemove, path: c.Path})
+
+		case c.Mode&specialFileMode != 0:
+			// A FIFO, socket, or device node in theirs: the workspace has no
+			// contract tool to recreate it (mkfifo/mknod are outside the
+			// image contract), and writing its "content" would silently
+			// create a regular file instead. Refuse before any mutation.
+			return nil, fmt.Errorf("cannot apply special file %s: the image contract has no primitive to recreate it", c.Path)
+
+		case c.Mode&fs.ModeSymlink != 0:
+			target := string(theirsContent[c.Path])
+			if target == "" {
+				// The parser captures every symlink's target from the tar's
+				// Linkname; a missing one is a corrupt blob, not an empty
+				// target (symlink(2) rejects those).
+				return nil, fmt.Errorf("cannot apply symlink %s: no target in the delta blob", c.Path)
+			}
+			symlinks = append(symlinks, deltaOp{kind: opSymlink, path: c.Path, target: target})
+
+		case c.IsDir:
+			mkdirs = append(mkdirs, deltaOp{kind: opMkdir, path: c.Path, mode: c.Mode})
+
+		default:
+			// Regular file: content from the blob; a missing entry is an
+			// empty file (the parser omits empty bodies).
+			writes = append(writes, deltaOp{kind: opWrite, path: c.Path, content: theirsContent[c.Path], mode: c.Mode})
+		}
+	}
+
+	ops := make([]deltaOp, 0, len(apply))
+	ops = append(ops, removes...)
+	ops = append(ops, mkdirs...)
+	ops = append(ops, writes...)
+	ops = append(ops, symlinks...)
+	return ops, nil
 }

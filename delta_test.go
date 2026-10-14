@@ -3,6 +3,8 @@ package croft
 import (
 	"fmt"
 	"io/fs"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -316,4 +318,80 @@ func TestForEachUnder(t *testing.T) {
 	if len(got) != 0 {
 		t.Errorf("forEachUnder(e) = %v, want empty", got)
 	}
+}
+
+// TestPlanDelta pins the mutation sequence: grouping order (removes, dirs,
+// writes, symlinks), preserved path order within groups, content and mode
+// pass-through, and the pre-mutation refusals.
+func TestPlanDelta(t *testing.T) {
+	t.Run("ordered groups and payload", func(t *testing.T) {
+		apply := []Change{
+			dirChange("a", ChangeAdd, 0o750),
+			regChange("a/new.txt", ChangeAdd, 0o640),
+			regChange("b/setuid", ChangeModify, 0o755|fs.ModeSetuid),
+			regChange("e/empty", ChangeAdd, 0o644),
+			del("gone.txt"),
+			linkChange("l", ChangeAdd),
+		}
+		content := contents("a/new.txt", "N", "l", "target", "b/setuid", "S")
+
+		ops, err := planDelta(apply, content)
+		if err != nil {
+			t.Fatalf("planDelta: %v", err)
+		}
+
+		want := []deltaOp{
+			{kind: opRemove, path: "gone.txt"},
+			{kind: opMkdir, path: "a", mode: 0o750 | fs.ModeDir},
+			{kind: opWrite, path: "a/new.txt", content: []byte("N"), mode: 0o640},
+			{kind: opWrite, path: "b/setuid", content: []byte("S"), mode: 0o755 | fs.ModeSetuid},
+			{kind: opWrite, path: "e/empty", content: nil, mode: 0o644},
+			{kind: opSymlink, path: "l", target: "target"},
+		}
+		if !reflect.DeepEqual(ops, want) {
+			t.Errorf("planDelta:\n got: %+v\nwant: %+v", ops, want)
+		}
+	})
+
+	t.Run("same-path delete then recreate orders remove first", func(t *testing.T) {
+		// A file→directory replacement arrives as a delete and a dir add on
+		// the same path; the remove must precede the mkdir.
+		apply := []Change{del("p"), dirChange("p", ChangeAdd, 0o755)}
+		ops, err := planDelta(apply, nil)
+		if err != nil {
+			t.Fatalf("planDelta: %v", err)
+		}
+		if len(ops) != 2 || ops[0].kind != opRemove || ops[1].kind != opMkdir {
+			t.Fatalf("ops = %+v, want [remove p, mkdir p]", ops)
+		}
+	})
+
+	t.Run("special file refuses before any mutation", func(t *testing.T) {
+		apply := []Change{
+			regChange("ok.txt", ChangeAdd, 0o644),
+			{Path: "pipe", Kind: ChangeAdd, Mode: 0o644 | fs.ModeNamedPipe},
+		}
+		_, err := planDelta(apply, contents("ok.txt", "x"))
+		if err == nil || !strings.Contains(err.Error(), "cannot apply special file pipe") {
+			t.Fatalf("err = %v, want a cannot-apply-special-file refusal", err)
+		}
+	})
+
+	t.Run("symlink without a target refuses", func(t *testing.T) {
+		apply := []Change{linkChange("l", ChangeAdd)}
+		_, err := planDelta(apply, nil)
+		if err == nil || !strings.Contains(err.Error(), "no target in the delta blob") {
+			t.Fatalf("err = %v, want a missing-target refusal", err)
+		}
+	})
+
+	t.Run("empty apply set plans nothing", func(t *testing.T) {
+		ops, err := planDelta(nil, nil)
+		if err != nil {
+			t.Fatalf("planDelta: %v", err)
+		}
+		if len(ops) != 0 {
+			t.Errorf("ops = %+v, want empty", ops)
+		}
+	})
 }
