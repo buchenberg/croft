@@ -227,13 +227,9 @@ func (f *fakeImages) RootfsSnapshot(_ context.Context, ref string) (string, erro
 }
 
 // fakeTasks models container lifecycle and commands.
-//
-// gitHead, when set, is returned by `git rev-parse HEAD` so Capture can record
-// the workspace's git baseline.
 type fakeTasks struct {
 	log       *opLog
 	snap      *fakeSnapshotter
-	gitHead   string
 	runErr    map[string]error // command -> error
 	lastReq   ExecRequest
 	lastStdin []byte
@@ -245,17 +241,6 @@ type fakeTasks struct {
 	current string
 	started int
 	stopped int
-	// diffStdout, when set, overrides the canned response for the diff script so
-	// a test can exercise malformed staging output.
-	diffStdout string
-	// deltaPatchStdout, when set, overrides the canned response for the delta
-	// patch script; the canned default is a one-line patch. Set to "\n" to
-	// model a clean capture (no changes against the base).
-	deltaPatchStdout string
-	// mergeConflict, when set, makes the apply-delta script fail with the
-	// conflict sentinel (exit 3) and conflicted paths on stderr, so a test can
-	// exercise the refused-merge path.
-	mergeConflict bool
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -294,10 +279,6 @@ func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeTasks) Running(_ context.Context, id string) (bool, error) {
-	return f.isRunning(), nil
-}
-
 // isRunning reports whether a task is currently rooted anywhere. Test
 // convenience, avoiding a context and error in every assertion.
 func (f *fakeTasks) isRunning() bool {
@@ -322,10 +303,6 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 	f.lastStdin = req.Stdin
 	f.allReqs = append(f.allReqs, req)
 	current := f.current
-	gitHead := f.gitHead
-	diffStdout := f.diffStdout
-	deltaPatchStdout := f.deltaPatchStdout
-	mergeConflict := f.mergeConflict
 	runErr, hasRunErr := f.runErr[req.Command]
 	f.mu.Unlock()
 
@@ -335,46 +312,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 	_ = current
 
 	switch req.Command {
-	case "git":
-		if len(req.Args) >= 1 && req.Args[0] == "rev-parse" {
-			if gitHead == "" {
-				return ExecResult{ExitCode: 128, Stderr: "fatal: not a git repository"}, nil
-			}
-			return ExecResult{ExitCode: 0, Stdout: gitHead + "\n"}, nil
-		}
-		if len(req.Args) >= 1 && req.Args[0] == "diff" {
-			return ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+change\n"}, nil
-		}
-		return ExecResult{ExitCode: 0}, nil
 	case "sh":
-		// Dispatch on the script rather than answering every shell call with one
-		// canned string: Diff's scratch-index script and the ReadFile/WriteFile
-		// file scripts need different output.
-		script := ""
-		if len(req.Args) >= 2 {
-			script = req.Args[1]
-		}
-		if strings.Contains(script, "git diff --cached") {
-			if diffStdout != "" {
-				return ExecResult{ExitCode: 0, Stdout: diffStdout}, nil
-			}
-			// Diff stages once and gets both sections back from that one exec, so
-			// the fake answers in the same shape: names, the marker, then the diff.
-			return ExecResult{ExitCode: 0,
-				Stdout: "f\n\n" + diffNamesMarker + "\ndiff --git a/f b/f\n+change\n"}, nil
-		}
-		if strings.Contains(script, "git diff --binary --cached") {
-			if deltaPatchStdout != "" {
-				return ExecResult{ExitCode: 0, Stdout: deltaPatchStdout}, nil
-			}
-			return ExecResult{ExitCode: 0, Stdout: "diff --git a/f b/f\n+child\n"}, nil
-		}
-		if strings.Contains(script, "git merge-tree") {
-			if mergeConflict {
-				return ExecResult{ExitCode: 3, Stderr: "conflicting paths:\nf.txt"}, nil
-			}
-			return ExecResult{ExitCode: 0}, nil
-		}
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
@@ -387,13 +325,12 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 // Capture takes on a real backend; tests that care about the lease lifecycle
 // overwrite sb.leases with their own fake. The nil-manager no-op behavior is
 // covered by tests that clear the manager explicitly.
-func newTestSandbox(t *testing.T, gitHead string) (*ContainerdSandbox, *fakeSnapshotter, *fakeTasks, *opLog) {
+func newTestSandbox(t *testing.T) (*ContainerdSandbox, *fakeSnapshotter, *fakeTasks, *opLog) {
 	t.Helper()
 	log := &opLog{}
 	snap := newFakeSnapshotter(log)
 	snap.seed("rootfs-image-digest")
 	tasks := newFakeTasks(log, snap)
-	tasks.gitHead = gitHead
 	images := &fakeImages{rootfs: "rootfs-image-digest"}
 	sb := NewWithBackend(Config{Image: "example/dev:latest"}, snap, tasks, images, WithLeases(&fakeLeases{}))
 	return sb, snap, tasks, log

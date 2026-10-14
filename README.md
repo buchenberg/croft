@@ -1,15 +1,15 @@
 # croft
 
 A croft is a small enclosed plot of land one party works on its own. This
-library gives a program the same thing: an isolated, snapshot-backed
-workspace on [containerd](https://containerd.io)'s overlayfs snapshotter —
-provisioned from an image, worked through exec and file I/O, and checkpointed
-into states that outlive the sandbox that captured them.
+library gives a program the same thing: an isolated, snapshot-backed workspace
+on [containerd](https://containerd.io)'s overlayfs snapshotter — provisioned
+from an image, worked through exec and file I/O, and checkpointed into states
+that outlive the sandbox that captured them.
 
 Croft is Linux-only (OverlayFS, a containerd daemon, root or user namespaces)
-and is deliberately not a container runtime: it is the substrate a host uses
-when it wants a real filesystem boundary per workspace, with commands executed
-in-band inside that boundary.
+and is deliberately not a container runtime: it is the library a host uses
+when it wants a real filesystem boundary per workspace, with cheap
+checkpoints, rollback, and forks over that boundary.
 
 ## What it does
 
@@ -24,19 +24,23 @@ ReleaseState drop a state's pin; the daemon's GC reclaims the layer
 Destroy      stop the task, remove the active layer; committed states survive
 ```
 
-Capabilities, honestly:
+The properties, honestly:
 
-- **Layered** — every Capture commits an immutable overlayfs layer and continues
-  on a new one; lineage is recorded.
-- **Rollback** — Apply rebinds a sandbox to any captured state, including from
-  a fresh process after a crash (the resume path).
-- **State sharing** — a captured state can be applied by a different, equally
-  configured sandbox; that is the fork primitive. Note there is no fork
-  *orchestration* here: Capture on the parent, Apply on the child is the whole
-  recipe.
-- **Merge without reset** — `DeltaApplier` (optional interface) merges a
-  captured delta onto a workspace that moved past the delta's base, refusing
-  conflicts atomically.
+- **Layered** — every Capture commits an immutable overlayfs layer and
+  continues on a new one; lineage is recorded in the state.
+- **States outlive sandboxes** — a captured state survives Destroy, crashes,
+  and process restarts, and any equally configured sandbox can resume it.
+- **Rollback** — Apply rebinds a sandbox to any captured state, exactly and
+  O(1) (a re-point, not a replay).
+- **Fork** — there is no fork orchestration; Capture on the parent plus Apply
+  on the child is the whole recipe, at layer-sharing cost.
+- **Serialized** — lifecycle operations are exclusive, workspace operations
+  shared: an in-flight Exec finishes before a Capture commits the layer it is
+  writing to, by construction.
+- **A state's identity is its snapshot key** — sequence-derived, so two
+  captures of identical content are distinct states. Identity, not content
+  equality; croft has no digest, and a host that wants a record identity
+  hashes the three-field struct itself.
 
 ## Quick start
 
@@ -45,22 +49,31 @@ sb := croft.New(croft.Config{
     Namespace: "croft",
     Image:     "docker.io/library/golang:1.26",
 })
-if err := sb.Create(ctx, croft.SandboxSpec{}); err != nil { ... }
+if err := sb.Create(ctx); err != nil { ... }   // the caller's ctx bounds it
 defer sb.Destroy(ctx)
 
 res, _ := sb.Exec(ctx, croft.ExecRequest{Command: "go", Args: []string{"version"}})
 state, _ := sb.Capture(ctx)   // pinned against the daemon's GC
-_ = sb.Apply(ctx, state)      // resume from it
-if r, ok := sb.(croft.StateReleaser); ok { r.ReleaseState(ctx, state) }
+_ = sb.Apply(ctx, state)      // resume from it — rollback, crash-resume, fork
+_ = sb.ReleaseState(ctx, state) // disk comes back when the caller says so
 ```
 
 ## The image contract
 
-`Diff` and `ApplyDelta` run git inside the container, so the image must provide
-`sh`, `stat`, GNU `find`, and `git` (a typical host also probes for whatever its
-workload needs). A workspace that is not a git repository degrades to
-snapshot-only states: Capture and Apply still work; Diff and ApplyDelta have
-nothing semantic to say.
+The workspace's file operations shell out inside the container, so the image
+must provide a shell (`/bin/sh` — also the keep-alive command's default) and
+the small coreutils croft itself uses: `mkdir` (Create provisions the
+workdir), and `cat`, `dirname`, `printf`, `base64`, and `chmod` (ReadFile and
+WriteFile). BusyBox and coreutils both carry all of them.
+
+## Scale envelope
+
+Workspaces are source-tree-sized. `ReadFile` and `WriteFile` buffer whole
+files; `WriteFile` costs roughly one container exec per 512 KiB (configurable
+via `WriteChunkBytes`) and carries its payload base64-encoded in exec
+arguments, visible in `/proc/*/cmdline` while the exec runs — so large
+artifacts are out of the design scope and secrets never travel through
+`WriteFile`.
 
 ## Configuration
 
@@ -72,40 +85,25 @@ each field.
 
 ## State format
 
-The state format is croft's own, and it is not comparable with other
-ecosystems' workspace-state formats. The pieces:
-
-- `WorkspaceState` data keys. Always present: `snapshot_key`, `parent_key`,
-  `image`. Conditional: `git_head` only when the workspace is a git
-  repository, `delta_base` only once a state carrying a git HEAD has been
-  applied, `delta_patch` only when that range has changes — a state without
-  them is valid, and consumers must not reject it for lacking them.
-- Snapshot keys use the `croft/` prefix; leases and containers are labeled
-  `croft.lease` and `croft.sandbox`; the states lease is `croft-states`;
-  the digest version is `croft.state.canonical.v1`.
-- The backend identifier is `"containerd"` — the technology, not a brand:
-  hosts' config strings and recorded states name the backend, and croft
-  reports it.
-
-Known gap, inherited and recorded: a state's identity is its sequence-derived
-snapshot key, so two captures of identical content produce different digests.
-Digest equality means identity, not content equality; a content-derived state
-identity is a planned follow-up.
+`WorkspaceState` is a plain three-field record — `SnapshotKey`, `ParentKey`,
+`Image` — so it can be stored, logged, and handed back by value. Daemon-visible
+identifiers: snapshot keys use the `croft/` prefix; leases and containers are
+labeled `croft.lease` and `croft.sandbox`; the states lease is `croft-states`.
 
 ## Testing
 
 ```sh
 go test ./...          # unit suite; no daemon required
 
-# live suite, against a real containerd:
+# live suite, against a real containerd (root is required for the socket):
 sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
-     CROFT_CONTAINERD_IMAGE=docker.io/library/debian:bookworm \
-     go test -count=1 -v -run TestLive_ ./...
+  go test -count=1 -v -run TestLive_ ./...
 ```
 
-Croft has no dependencies beyond containerd and the Go standard library.
-What the live suite verifies, and how to run it against a real daemon, is in
-[docs/verification.md](docs/verification.md).
+Croft has no dependencies beyond containerd and the Go standard library. What
+the live suite verifies — and how to run it against a real daemon — is in
+[docs/verification.md](docs/verification.md); how the pieces fit together is
+in [docs/overview.md](docs/overview.md).
 
 ## License
 

@@ -2,7 +2,7 @@
 
 package croft
 
-// Live-daemon acceptance test for the containerd backend (plan 05 §3, T0.5).
+// Live-daemon acceptance test for the containerd backend.
 //
 // Everything else in this package runs against fakeSnapshotter and fakeTasks.
 // Those fakes enforce the overlayfs snapshotter's invariants, so they cover the
@@ -46,8 +46,8 @@ package croft
 // mkdir -p on the workdir and tears the sandbox back down if that fails.
 //
 // F2 — FIXED. The FIFO directory was hardcoded to containerd's root-owned
-// default with no knob, making the backend root-client-only; yaah is a developer
-// CLI running as an ordinary user and could not have driven it. Config.FIFODir
+// default with no knob, making the backend root-client-only; an unprivileged
+// client could not have driven it. Config.FIFODir
 // now threads into cio.WithFIFODir, and these tests set it to a t.TempDir() so
 // the knob is exercised on every run. requireRoot remains, but for the daemon's
 // socket permissions rather than anything the client creates.
@@ -83,11 +83,9 @@ const (
 // Defaults for the knobs above. defaultSnapshotter is client.go's own constant
 // rather than a copy, so the test cannot drift from the value the adapter uses.
 //
-// The image needs both sh and git in-container: sandbox.go shells out to
-// cat/mkdir/dirname/chmod for file I/O and to git for Diff. alpine/git carries
-// both at ~15MB. Its BusyBox userland supports every command this backend uses
-// (unlike yaah's sandboxWorkspace, which needs GNU find -printf and would
-// require a glibc image).
+// The image needs sh plus the coreutils croft's own file I/O shells out to:
+// cat, mkdir, dirname, printf, base64, chmod. alpine/git carries them at
+// ~15MB, and its BusyBox userland supports every command croft uses.
 const (
 	defaultImage     = "docker.io/alpine/git:latest"
 	defaultNamespace = "croft-live"
@@ -124,7 +122,7 @@ func loadLiveConfig(t *testing.T) liveConfig {
 
 	addr := strings.TrimSpace(os.Getenv(envAddr))
 	if addr == "" {
-		t.Skipf("%s not set: skipping live containerd verification (plan 05 §3)", envAddr)
+		t.Skipf("%s not set: skipping live containerd verification", envAddr)
 	}
 	requireRoot(t)
 
@@ -281,9 +279,9 @@ func mustExec(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd, com
 //
 // States outlive sandboxes by design now, and the live suite runs against a
 // persistent namespace: without this, every run would leave another pinned
-// snapshot behind. States captured *inside* Materialize (the substrate's own
-// captures) have no test-side handle and intentionally keep their pins —
-// releasing them is the kernel's state-expiry business, not the test's.
+// snapshot behind. States the library captured for its own bookkeeping have
+// no test-side handle and intentionally keep their pins — expiry is the pin
+// holder's business, not the test's.
 func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) WorkspaceState {
 	t.Helper()
 	state, err := sb.Capture(ctx)
@@ -294,35 +292,14 @@ func captureLive(t *testing.T, ctx context.Context, sb *ContainerdSandbox) Works
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
 		if err := sb.ReleaseState(rctx, state); err != nil {
-			t.Logf("release state %s during cleanup: %v", state.Revision, err)
+			t.Logf("release state %s during cleanup: %v", state.SnapshotKey, err)
 		}
 	})
 	return state
 }
 
-// bootstrapGit seeds a committed git repository in the workdir.
-//
-// Capture records StateKeyGitHead only when the workdir is a repository, and
-// Diff needs that baseline — without a commit, Diff returns an error instead of
-// a diff. Create provisions the workdir itself (finding F1), so this does not
-// have to.
-//
-// git identity is set explicitly because alpine/git ships none, and a commit
-// without it fails.
-func bootstrapGit(t *testing.T, ctx context.Context, sb *ContainerdSandbox, workdir string) {
-	t.Helper()
-
-	mustExec(t, ctx, sb, workdir, "git", "init", "-q", ".")
-	mustExec(t, ctx, sb, workdir, "git", "config", "user.email", "croft-live@test.invalid")
-	mustExec(t, ctx, sb, workdir, "git", "config", "user.name", "croft-live")
-	mustExec(t, ctx, sb, workdir, "sh", "-c", "printf 'baseline\\n' > base.txt")
-	mustExec(t, ctx, sb, workdir, "git", "add", "-A")
-	mustExec(t, ctx, sb, workdir, "git", "commit", "-q", "-m", "baseline")
-}
-
-// TestLive_FullLifecycle is the acceptance sequence from plan 05 §3: create
-// from a public image, write, capture, mutate, apply, verify the rollback,
-// exec, diff, destroy.
+// TestLive_FullLifecycle is the acceptance sequence: create from a public
+// image, write, capture, mutate, apply, verify the rollback, exec, destroy.
 //
 // The rollback step is the point of the whole backend. Everything before it is
 // setup; if Apply does not restore the pre-mutation content across a real
@@ -335,17 +312,12 @@ func TestLive_FullLifecycle(t *testing.T) {
 
 	sb := newLiveSandbox(t, ctx, cfg)
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
 		t.Fatal("Create must assign a container id")
 	}
-	if got := sb.Backend(); got != BackendName {
-		t.Errorf("Backend() = %q, want %q", got, BackendName)
-	}
-
-	bootstrapGit(t, ctx, sb, cfg.Workdir)
 
 	// File I/O round-trip. Paths are relative on purpose, so this also covers
 	// resolve() against the configured workdir.
@@ -368,20 +340,12 @@ func TestLive_FullLifecycle(t *testing.T) {
 	}
 
 	state := captureLive(t, ctx, sb)
-	if state.Backend != BackendName {
-		t.Errorf("state.Backend = %q, want %q", state.Backend, BackendName)
+	if state.SnapshotKey == "" {
+		t.Error("state.SnapshotKey is empty: Apply cannot resume without it")
 	}
-	if key, _ := state.Data[StateKeySnapshotKey].(string); key == "" {
-		t.Errorf("state.Data[%q] is empty: Apply cannot resume without it", StateKeySnapshotKey)
+	if state.Image != cfg.Image {
+		t.Errorf("state.Image = %q, want %q", state.Image, cfg.Image)
 	}
-	if state.Revision == "" {
-		t.Error("state.Revision is empty")
-	}
-	if head, _ := state.Data[StateKeyGitHead].(string); head == "" {
-		t.Errorf("state.Data[%q] is empty: Capture must record the in-container git HEAD "+
-			"when the workdir is a repository, or Diff has no baseline", StateKeyGitHead)
-	}
-
 	// Mutate, confirm the mutation is really on the new layer, then roll back.
 	const mutated = "mutated after capture\n"
 	if err := sb.WriteFile(ctx, "live.txt", []byte(mutated), 0o644); err != nil {
@@ -429,10 +393,10 @@ func TestLive_FullLifecycle(t *testing.T) {
 	if strings.Contains(res.Stdout, "to-stderr") {
 		t.Error("stderr leaked into stdout: the streams are not separated")
 	}
-	// Plan 05 §5 item 4: the git backend leaves Duration unset, the containerd
-	// backend must populate it.
+	// Duration is the caller's only signal of a command's cost; it must be
+	// populated.
 	if res.Duration <= 0 {
-		t.Errorf("Exec Duration = %v, want > 0 (plan 05 §5 item 4)", res.Duration)
+		t.Errorf("Exec Duration = %v, want > 0", res.Duration)
 	}
 
 	// A non-zero exit is a result, not an error: Exec returns the code with a
@@ -447,30 +411,6 @@ func TestLive_FullLifecycle(t *testing.T) {
 	}
 	if failed.ExitCode != 7 {
 		t.Errorf("Exec exit = %d, want 7", failed.ExitCode)
-	}
-
-	// Diff against the captured state, with a change made after it.
-	if err := sb.WriteFile(ctx, "changed.txt", []byte("added after capture\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile (for diff): %v", err)
-	}
-	diff, files, err := sb.Diff(ctx, state, 0)
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if len(files) == 0 {
-		t.Error("Diff reported no changed files")
-	}
-	var found bool
-	for _, f := range files {
-		if strings.TrimSpace(f) == "changed.txt" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Diff files = %v, want it to include changed.txt", files)
-	}
-	if !strings.Contains(diff, "changed.txt") {
-		t.Errorf("Diff output does not mention changed.txt:\n%s", diff)
 	}
 
 	// Destroy runs again in cleanup; it is idempotent, so this only asserts the
@@ -493,7 +433,7 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -534,17 +474,17 @@ func TestLive_NamespaceIsolation(t *testing.T) {
 }
 
 // TestLive_ApplyAfterDestroyRecyclesState pins the recycle path: a captured
-// state re-provisions a sandbox after the capturing sandbox's Destroy. This is
-// the acceptance sequence the substrate integration used to carry (write,
-// capture, destroy, apply, verify) — the durability contract made observable:
-// states outlive sandboxes, and an Apply after Destroy proves it end to end.
+// state re-provisions a sandbox after the capturing sandbox's Destroy. The
+// sequence (write, capture, destroy, apply, verify) is the durability contract
+// made observable: states outlive sandboxes, and an Apply after Destroy proves
+// it end to end.
 func TestLive_ApplyAfterDestroyRecyclesState(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	content := "written before the capture\n"
@@ -586,10 +526,9 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	bootstrapGit(t, ctx, sb, cfg.Workdir)
 	if err := sb.WriteFile(ctx, "layer.txt", []byte("forces a committed layer\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -597,10 +536,7 @@ func TestLive_DestroyRemovesActiveLayerKeepsStates(t *testing.T) {
 	// before its own explicit ReleaseState below, the persistent live namespace
 	// must not accumulate another pinned snapshot.
 	state := captureLive(t, ctx, sb)
-	committed, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("state: %v", err)
-	}
+	committed := state.SnapshotKey
 	sb.mu.Lock()
 	active := sb.activeKey
 	rootfs := sb.rootfsKey
@@ -685,65 +621,6 @@ func leaseHoldsSnapshot(t *testing.T, svc leases.Manager, ctx context.Context, k
 	return false
 }
 
-// TestLive_DiffPreservesPreStagedChanges is the regression test for the Sandbox
-// non-mutating contract: a caller's staged-but-uncommitted work must survive a
-// Diff, and Diff must still report the change it was asked about.
-//
-// Diff used to stage with `git add -A` and unwind with `git reset`, which
-// restored the index to HEAD rather than to the state it was found in. A live
-// run on 2026-10-05 confirmed the loss — the index held staged.txt before Diff
-// and was empty after. It now stages into a scratch GIT_INDEX_FILE the way
-// sandbox_git.go's stagedIndex does, so the real index is only ever read.
-func TestLive_DiffPreservesPreStagedChanges(t *testing.T) {
-	cfg := loadLiveConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
-	defer cancel()
-
-	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	bootstrapGit(t, ctx, sb, cfg.Workdir)
-
-	state := captureLive(t, ctx, sb)
-
-	// Stage a change without committing, as a caller legitimately might.
-	mustExec(t, ctx, sb, cfg.Workdir, "sh", "-c", "printf 'staged by caller\\n' > staged.txt")
-	mustExec(t, ctx, sb, cfg.Workdir, "git", "add", "staged.txt")
-
-	stagedBefore := strings.TrimSpace(mustExec(t, ctx, sb, cfg.Workdir, "git", "diff", "--cached", "--name-only"))
-	if !strings.Contains(stagedBefore, "staged.txt") {
-		t.Fatalf("setup failed: staged.txt is not in the index before Diff (got %q)", stagedBefore)
-	}
-
-	diff, files, err := sb.Diff(ctx, state, 0)
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-
-	// The contract under test: the caller's index is exactly as it was found.
-	stagedAfter := strings.TrimSpace(mustExec(t, ctx, sb, cfg.Workdir, "git", "diff", "--cached", "--name-only"))
-	if stagedAfter != stagedBefore {
-		t.Errorf("Diff mutated the caller's index: staged before=%q, after=%q", stagedBefore, stagedAfter)
-	}
-
-	// And Diff still reports the change it was asked about — a scratch index that
-	// preserved the caller's state but staged nothing would pass the check above
-	// while returning an empty diff.
-	var found bool
-	for _, f := range files {
-		if strings.TrimSpace(f) == "staged.txt" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Diff files = %v, want it to include staged.txt", files)
-	}
-	if !strings.Contains(diff, "staged.txt") {
-		t.Errorf("Diff output does not mention staged.txt:\n%s", diff)
-	}
-}
-
 // TestLive_ExecRejectsStdin pins that Exec refuses a non-empty
 // ExecRequest.Stdin immediately instead of starting a process that can never see
 // EOF. This is why WriteFile sends content through argv.
@@ -764,7 +641,7 @@ func TestLive_ExecRejectsStdin(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -811,7 +688,7 @@ func TestLive_LeaseHoldsSnapshots(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	id := sb.ID()
@@ -864,7 +741,7 @@ func TestLive_DestroyReleasesTheLease(t *testing.T) {
 	defer cancel()
 
 	sb := newLiveSandbox(t, ctx, cfg)
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -897,146 +774,5 @@ func TestLive_DestroyReleasesTheLease(t *testing.T) {
 	if len(after) != 0 {
 		t.Fatalf("leases after Destroy = %d (%v), want 0: a lease outliving its sandbox "+
 			"pins snapshots against the GC indefinitely", len(after), after)
-	}
-}
-
-// TestLive_ApplyDeltaMergesOntoMovedParent is the settlement apply verb's
-// acceptance sequence: fork a child off the parent's committed layer, work in
-// the child, and while the parent moves on its own paths — including
-// uncommitted work, which is this substrate's steady state — merge the child's
-// sealed delta back without resetting anything.
-//
-// The three-way tree merge earns its keep on exactly this shape: the delta's
-// patch carries the parent's own pre-fork uncommitted files (they differ from
-// the git base but not from the parent's worktree), so a plain two-way apply
-// would refuse or clobber. theirs == ours must merge to a no-op for those
-// paths, and only the child's real work may land.
-func TestLive_ApplyDeltaMergesOntoMovedParent(t *testing.T) {
-	cfg := loadLiveConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
-	defer cancel()
-
-	parent := newLiveSandbox(t, ctx, cfg)
-	if err := parent.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	bootstrapGit(t, ctx, parent, cfg.Workdir)
-
-	// The parent's pre-fork state is deliberately uncommitted work plus a
-	// staged file: the committed git HEAD (the delta base) is behind the
-	// worktree, which is what the child inherits through the layer.
-	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent work\\n' > parentwork.txt")
-	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent staged\\n' > staged.txt")
-	mustExec(t, ctx, parent, cfg.Workdir, "git", "add", "staged.txt")
-
-	baseline := captureLive(t, ctx, parent)
-	baseHead, _ := baseline.Data[StateKeyGitHead].(string)
-	if baseHead == "" {
-		t.Fatalf("baseline has no %q: the fork flow needs the git HEAD as the delta base", StateKeyGitHead)
-	}
-
-	// The child is a fresh sandbox resumed from the baseline layer — the
-	// isolated-fork flow a host such as yaah will drive. No Create: Apply
-	// provisions.
-	child := newLiveSandbox(t, ctx, cfg)
-	if err := child.Apply(ctx, baseline); err != nil {
-		t.Fatalf("child Apply(baseline): %v", err)
-	}
-	// The layer, not git history, is what forks: the parent's uncommitted work
-	// is present in the child without either side committing anything.
-	if got, err := child.ReadFile(ctx, "parentwork.txt"); err != nil || string(got) != "parent work\n" {
-		t.Fatalf("child parentwork.txt = %q, %v; want the parent's uncommitted content", got, err)
-	}
-	mustExec(t, ctx, child, cfg.Workdir, "sh", "-c", "printf 'child feature\\n' > feature.txt")
-
-	delta := captureLive(t, ctx, child)
-	if got, _ := delta.Data[StateKeyDeltaBase].(string); got != baseHead {
-		t.Errorf("delta_base = %q, want the baseline's git HEAD %q", got, baseHead)
-	}
-	if patch, _ := delta.Data[StateKeyDeltaPatch].(string); patch == "" {
-		t.Fatalf("delta has no %q despite a changed worktree", StateKeyDeltaPatch)
-	}
-
-	// The parent moves on its own paths after the fork — uncommitted, like
-	// its pre-fork work.
-	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent move\\n' > parentmove.txt")
-
-	if err := parent.ApplyDelta(ctx, delta); err != nil {
-		t.Fatalf("ApplyDelta onto moved parent: %v", err)
-	}
-
-	// The child's work landed...
-	if got, err := parent.ReadFile(ctx, "feature.txt"); err != nil || string(got) != "child feature\n" {
-		t.Errorf("parent feature.txt = %q, %v; want the child's content", got, err)
-	}
-	// ...the parent's concurrent work survived...
-	for path, want := range map[string]string{
-		"parentwork.txt": "parent work\n",
-		"parentmove.txt": "parent move\n",
-		"base.txt":       "baseline\n",
-	} {
-		if got, err := parent.ReadFile(ctx, path); err != nil || string(got) != want {
-			t.Errorf("parent %s = %q, %v; want %q", path, got, err, want)
-		}
-	}
-	// ...and nothing touched the parent's git index: the merge landed as
-	// unstaged worktree changes, and the pre-staged file is still the only
-	// staged one.
-	if staged := strings.TrimSpace(mustExec(t, ctx, parent, cfg.Workdir,
-		"git", "diff", "--cached", "--name-only")); staged != "staged.txt" {
-		t.Errorf("staged files after ApplyDelta = %q, want staged.txt alone", staged)
-	}
-}
-
-// TestLive_ApplyDeltaConflictRefusesUntouched pins the refusal half of the
-// DeltaApplier contract on a real daemon: a delta that collides with the
-// parent's own changes to the same path fails the call and leaves the
-// workspace untouched — no conflict markers, no partial application — and the
-// delta still merges cleanly onto an unmoved parent afterwards, which is what
-// "consumes nothing" means physically.
-func TestLive_ApplyDeltaConflictRefusesUntouched(t *testing.T) {
-	cfg := loadLiveConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
-	defer cancel()
-
-	parent := newLiveSandbox(t, ctx, cfg)
-	if err := parent.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	bootstrapGit(t, ctx, parent, cfg.Workdir)
-	baseline := captureLive(t, ctx, parent)
-
-	child := newLiveSandbox(t, ctx, cfg)
-	if err := child.Apply(ctx, baseline); err != nil {
-		t.Fatalf("child Apply(baseline): %v", err)
-	}
-	mustExec(t, ctx, child, cfg.Workdir, "sh", "-c", "printf 'child version\\n' > shared.txt")
-	delta := captureLive(t, ctx, child)
-
-	// The parent claims the same path with different content — uncommitted,
-	// so the collision is an add/add one that only the merge can see.
-	mustExec(t, ctx, parent, cfg.Workdir, "sh", "-c", "printf 'parent version\\n' > shared.txt")
-
-	err := parent.ApplyDelta(ctx, delta)
-	if err == nil {
-		t.Fatal("ApplyDelta over a colliding path must fail")
-	}
-	if !strings.Contains(err.Error(), "shared.txt") {
-		t.Errorf("refusal = %v, want it to name the conflicting path", err)
-	}
-	if got, readErr := parent.ReadFile(ctx, "shared.txt"); readErr != nil || string(got) != "parent version\n" {
-		t.Fatalf("parent shared.txt after refusal = %q, %v; want the parent's content, untouched", got, readErr)
-	}
-
-	// The refusal consumed nothing: an unmoved parent still merges the delta.
-	fresh := newLiveSandbox(t, ctx, cfg)
-	if err := fresh.Apply(ctx, baseline); err != nil {
-		t.Fatalf("fresh Apply(baseline): %v", err)
-	}
-	if err := fresh.ApplyDelta(ctx, delta); err != nil {
-		t.Fatalf("ApplyDelta onto the unmoved parent after a refusal elsewhere: %v", err)
-	}
-	if got, err := fresh.ReadFile(ctx, "shared.txt"); err != nil || string(got) != "child version\n" {
-		t.Errorf("fresh shared.txt = %q, %v; want the child's content", got, err)
 	}
 }

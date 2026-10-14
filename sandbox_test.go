@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -21,46 +22,11 @@ func opVerbs(ops []string) []string {
 	return out
 }
 
-func TestContainerdSandbox_Backend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	if got := sb.Backend(); got != BackendName {
-		t.Errorf("Backend() = %q, want %q", got, BackendName)
-	}
-}
-
-// TestContainerdSandbox_Capabilities pins the declared contract. These are the
-// values callers branch on, so a false here would make the operation unavailable
-// even though it is implemented.
-func TestContainerdSandbox_Capabilities(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	caps := sb.Capabilities()
-
-	if !caps.Lifecycle {
-		t.Error("Lifecycle must be true: Create and Destroy manage real resources")
-	}
-	if !caps.Exec {
-		t.Error("Exec must be true")
-	}
-	if !caps.FileIO {
-		t.Error("FileIO must be true")
-	}
-	if !caps.Diff {
-		t.Error("Diff must be true")
-	}
-	if !caps.Isolated {
-		t.Error("Isolated must be true: the workspace is not the host filesystem")
-	}
-	if caps.Containment != ContainContained {
-		t.Errorf("Containment = %q, want %q (a container is not a VM boundary)",
-			caps.Containment, ContainContained)
-	}
-}
-
 func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
-	sb, snap, tasks, log := newTestSandbox(t, "")
+	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if sb.ID() == "" {
@@ -84,9 +50,9 @@ func TestCreate_ProvisionsBaseSnapshotAndStartsTask(t *testing.T) {
 // operation fails with a chdir error that reads as a broken sandbox rather than
 // a missing directory.
 func TestCreate_ProvisionsWorkdir(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -114,7 +80,7 @@ func TestCreate_ValidatesImage(t *testing.T) {
 	snap := newFakeSnapshotter(log)
 	sb := NewWithBackend(Config{}, snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
 
-	err := sb.Create(context.Background(), SandboxSpec{})
+	err := sb.Create(context.Background())
 	if err == nil {
 		t.Fatal("Create without Config.Image must fail")
 	}
@@ -132,10 +98,10 @@ func TestCreate_ValidatesImage(t *testing.T) {
 // snapshotter rejects writes to committed layers and the fake task service writes
 // on every Exec, so skipping the stop makes this test fail.
 func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
-	sb, snap, tasks, log := newTestSandbox(t, "abc123")
+	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
 
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	log.mu.Lock()
@@ -162,10 +128,7 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 	}
 
 	// The committed layer is read-only and still present.
-	key, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("stateSnapshotKey: %v", err)
-	}
+	key := state.SnapshotKey
 	if !snap.has(key) {
 		t.Errorf("committed layer %s should still exist", key)
 	}
@@ -174,51 +137,10 @@ func TestCapture_StopsTaskBeforeCommitAndRestartsAfter(t *testing.T) {
 	}
 }
 
-func TestCapture_RecordsStateAndGitHead(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "deadbeef")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if state.Backend != BackendName {
-		t.Errorf("Backend = %q, want %q", state.Backend, BackendName)
-	}
-	if state.Revision == "" {
-		t.Error("Revision should hold the committed snapshot key")
-	}
-	if state.Data[StateKeyGitHead] != "deadbeef" {
-		t.Errorf("git_head = %v, want deadbeef", state.Data[StateKeyGitHead])
-	}
-	if state.Data[StateKeyParentKey] != "rootfs-image-digest" {
-		t.Errorf("parent = %v, want the image rootfs", state.Data[StateKeyParentKey])
-	}
-	if state.Data[StateKeyImage] != "example/dev:latest" {
-		t.Errorf("image = %v, want example/dev:latest", state.Data[StateKeyImage])
-	}
-
-	// A non-git workspace simply omits the baseline rather than failing.
-	sb2, _, _, _ := newTestSandbox(t, "")
-	if err := sb2.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	state2, err := sb2.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture (no git): %v", err)
-	}
-	if _, ok := state2.Data[StateKeyGitHead]; ok {
-		t.Error("git_head should be absent for a non-git workspace")
-	}
-}
-
 func TestCapture_RepeatedCapturesChain(t *testing.T) {
-	sb, snap, _, _ := newTestSandbox(t, "abc")
+	sb, snap, _, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -231,14 +153,14 @@ func TestCapture_RepeatedCapturesChain(t *testing.T) {
 		t.Fatalf("second Capture: %v", err)
 	}
 
-	k1, _ := stateSnapshotKey(first)
-	k2, _ := stateSnapshotKey(second)
+	k1 := first.SnapshotKey
+	k2 := second.SnapshotKey
 	if k1 == k2 {
 		t.Fatal("each capture must produce a distinct committed layer")
 	}
 	// The second capture's parent is the first committed layer, forming a chain.
-	if second.Data[StateKeyParentKey] != k1 {
-		t.Errorf("second parent = %v, want %v", second.Data[StateKeyParentKey], k1)
+	if second.ParentKey != k1 {
+		t.Errorf("second parent = %v, want %v", second.ParentKey, k1)
 	}
 	// Both committed layers survive, so either can be resumed.
 	if !snap.has(k1) || !snap.has(k2) {
@@ -247,7 +169,7 @@ func TestCapture_RepeatedCapturesChain(t *testing.T) {
 }
 
 func TestCapture_BeforeCreateFails(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	if _, err := sb.Capture(context.Background()); err == nil {
 		t.Fatal("Capture before Create must fail")
 	}
@@ -256,12 +178,12 @@ func TestCapture_BeforeCreateFails(t *testing.T) {
 // TestDestroy_RemovesActiveLayerKeepsStates pins the state-durability half of
 // the teardown contract: the active layer is the sandbox's private writable
 // layer and dies with it, while committed layers are states handed to callers
-// and must survive — a caller may Apply one long after Destroy, and the kernel
-// contract says states have no lifecycle.
+// and must survive — a caller may Apply one long after Destroy, and states
+// have no lifecycle.
 func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
-	sb, snap, tasks, log := newTestSandbox(t, "abc")
+	sb, snap, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	first, err := sb.Capture(ctx)
@@ -272,14 +194,8 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	k1, err := stateSnapshotKey(first)
-	if err != nil {
-		t.Fatalf("first state: %v", err)
-	}
-	k2, err := stateSnapshotKey(second)
-	if err != nil {
-		t.Fatalf("second state: %v", err)
-	}
+	k1 := first.SnapshotKey
+	k2 := second.SnapshotKey
 	log.mu.Lock()
 	log.ops = nil
 	log.mu.Unlock()
@@ -322,12 +238,12 @@ func TestDestroy_RemovesActiveLayerKeepsStates(t *testing.T) {
 	}
 }
 
-// TestDestroy_IsIdempotent pins the contract the kernel relies on: Discard,
-// Merge, and Halt may all call Destroy, and a second call must not error.
+// TestDestroy_IsIdempotent pins the contract the host relies on: discard,
+// merge, and halt paths may all call Destroy, and a second call must not error.
 func TestDestroy_IsIdempotent(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := sb.Destroy(ctx); err != nil {
@@ -337,7 +253,7 @@ func TestDestroy_IsIdempotent(t *testing.T) {
 		t.Errorf("second Destroy = %v, want nil", err)
 	}
 	// Destroy on a never-created sandbox is also fine.
-	fresh, _, _, _ := newTestSandbox(t, "")
+	fresh, _, _, _ := newTestSandbox(t)
 	if err := fresh.Destroy(ctx); err != nil {
 		t.Errorf("Destroy on unused sandbox = %v, want nil", err)
 	}
@@ -348,11 +264,11 @@ func TestDestroy_IsIdempotent(t *testing.T) {
 // and states have no lifecycle. Disk comes back through ReleaseState, not by
 // Apply deciding a state is garbage on the caller's behalf.
 func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
-	sb, snap, _, _ := newTestSandbox(t, "abc")
+	sb, snap, _, _ := newTestSandbox(t)
 	fl := &fakeLeases{}
 	sb.leases = fl
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -364,14 +280,8 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Capture: %v", err)
 	}
-	k1, err := stateSnapshotKey(first)
-	if err != nil {
-		t.Fatalf("first state: %v", err)
-	}
-	k2, err := stateSnapshotKey(second)
-	if err != nil {
-		t.Fatalf("second state: %v", err)
-	}
+	k1 := first.SnapshotKey
+	k2 := second.SnapshotKey
 
 	// Resume the older state. The second committed layer is no longer an
 	// ancestor of anything this sandbox runs on, but it is still a state.
@@ -400,9 +310,9 @@ func TestApply_KeepsLaterLayersAsStates(t *testing.T) {
 }
 
 func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
-	sb, _, tasks, log := newTestSandbox(t, "abc")
+	sb, _, tasks, log := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
@@ -428,19 +338,8 @@ func TestApply_StartsTaskOnResumedLayer(t *testing.T) {
 	}
 }
 
-func TestApply_RejectsForeignBackend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	err := sb.Apply(context.Background(), WorkspaceState{Backend: "git"})
-	if err == nil {
-		t.Fatal("Apply must reject a git workspace state")
-	}
-	if !strings.Contains(err.Error(), "git") {
-		t.Errorf("error should name the offending backend: %v", err)
-	}
-}
-
 func TestExec_BeforeCreateFails(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
+	sb, _, _, _ := newTestSandbox(t)
 	if _, err := sb.Exec(context.Background(), ExecRequest{Command: "true"}); err == nil {
 		t.Fatal("Exec before Create must fail")
 	}
@@ -449,9 +348,9 @@ func TestExec_BeforeCreateFails(t *testing.T) {
 // TestReadFile_PassesPathAsPositionalArgument pins the injection defence: the
 // path must never be interpolated into the shell script.
 func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -491,9 +390,9 @@ func TestReadFile_PassesPathAsPositionalArgument(t *testing.T) {
 // end on an exec's stdin FIFO for the process's lifetime, so a stdin reader
 // never sees EOF and depending on one hangs until the context expires.
 func TestWriteFile_EncodesContentInArgs(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -563,7 +462,7 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 	sb := NewWithBackend(Config{Image: "example/dev:latest", WriteChunkBytes: 4}, snap, tasks, images)
 
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -613,9 +512,9 @@ func TestWriteFile_SplitsAcrossExecs(t *testing.T) {
 // zero bytes must still create the file rather than being a no-op, so a caller
 // clearing a file gets the same result as writing content.
 func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "")
+	sb, _, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	before := len(tasks.allReqs)
@@ -635,149 +534,34 @@ func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 	}
 }
 
-func TestDiff_RequiresGitBaseline(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	// A state with no git_head cannot be diffed semantically.
-	state := snapshotState("example/dev:latest", "some-layer", "")
-	if _, _, err := sb.Diff(ctx, state, 0); err == nil {
-		t.Fatal("Diff without a git baseline must fail")
-	}
-	// A foreign state is rejected before anything else.
-	if _, _, err := sb.Diff(ctx, WorkspaceState{Backend: "git"}, 0); err == nil {
-		t.Fatal("Diff must reject a foreign state")
-	}
-}
-
-func TestDiff_TruncatesAndReportsFiles(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "deadbeef")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-
-	diff, _, err := sb.Diff(ctx, state, 1)
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if !strings.Contains(diff, "[diff truncated]") {
-		t.Errorf("diff = %q, want a truncation marker", diff)
-	}
-
-	full, _, err := sb.Diff(ctx, state, 0)
-	if err != nil {
-		t.Fatalf("Diff (unbounded): %v", err)
-	}
-	if strings.Contains(full, "[diff truncated]") {
-		t.Errorf("unbounded diff should not be truncated: %q", full)
-	}
-}
-
-// TestDiff_StagesIntoScratchIndex pins the non-mutating mechanism at the script
-// level, so the invariant is visible without a live daemon. The live suite
-// proves the end-to-end behaviour; this keeps a regression from landing in the
-// first place.
-func TestDiff_StagesIntoScratchIndex(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "deadbeef")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if _, _, err := sb.Diff(ctx, state, 0); err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-
-	var sawDiff bool
-	for _, req := range tasks.allReqs {
-		if req.Command != "sh" || len(req.Args) < 2 {
-			continue
-		}
-		script := req.Args[1]
-		if !strings.Contains(script, "git diff --cached") {
-			continue
-		}
-		sawDiff = true
-		if !strings.Contains(script, "GIT_INDEX_FILE") {
-			t.Error("Diff must stage into a scratch GIT_INDEX_FILE")
-		}
-		// The real index is the seed, and seeding is a read: cp from it, never
-		// into it.
-		if !strings.Contains(script, "cp -- .git/index") {
-			t.Error("Diff should seed the scratch index from the real one")
-		}
-		if strings.Contains(script, "git reset") {
-			t.Error("Diff must not unwind with git reset: that restores the index " +
-				"to HEAD, not to the state it was found in")
-		}
-	}
-	if !sawDiff {
-		t.Fatal("Diff issued no scratch-index script")
-	}
-}
-
 func TestSnapshotState_RoundTrip(t *testing.T) {
 	state := snapshotState("example/dev:latest", "layer-7", "layer-3")
 
-	if state.Backend != BackendName {
-		t.Errorf("Backend = %q, want %q", state.Backend, BackendName)
+	if state.SnapshotKey != "layer-7" {
+		t.Errorf("SnapshotKey = %q, want layer-7", state.SnapshotKey)
 	}
-	if state.Revision != "layer-7" {
-		t.Errorf("Revision = %q, want the snapshot key", state.Revision)
+	if state.ParentKey != "layer-3" {
+		t.Errorf("ParentKey = %q, want layer-3", state.ParentKey)
 	}
-	if state.Data[StateKeyParentKey] != "layer-3" {
-		t.Errorf("parent = %v, want layer-3", state.Data[StateKeyParentKey])
-	}
-
-	key, err := stateSnapshotKey(state)
-	if err != nil {
-		t.Fatalf("stateSnapshotKey: %v", err)
-	}
-	if key != "layer-7" {
-		t.Errorf("key = %q, want layer-7", key)
+	if state.Image != "example/dev:latest" {
+		t.Errorf("Image = %q, want example/dev:latest", state.Image)
 	}
 
-	// The state must digest stably, so trace records and drift detection work.
-	d1, err := state.Digest()
-	if err != nil {
-		t.Fatalf("Digest: %v", err)
-	}
-	d2, err := snapshotState("example/dev:latest", "layer-7", "layer-3").Digest()
-	if err != nil {
-		t.Fatalf("Digest (second): %v", err)
-	}
-	if d1 != d2 {
-		t.Errorf("digest is not stable: %s vs %s", d1, d2)
-	}
 }
 
-func TestStateSnapshotKey_RejectsBadStates(t *testing.T) {
-	t.Run("foreign backend", func(t *testing.T) {
-		_, err := stateSnapshotKey(WorkspaceState{
-			Backend:  "git",
-			Revision: "abc123",
-			Data:     map[string]any{"head_sha": "abc123"},
-		})
-		if err == nil {
-			t.Fatal("a git state must be rejected")
+func TestZeroValueStatesAreRejected(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	t.Run("apply", func(t *testing.T) {
+		if err := sb.Apply(ctx, WorkspaceState{}); err == nil {
+			t.Fatal("Apply accepted a state with no snapshot key")
 		}
 	})
 
-	t.Run("missing snapshot key", func(t *testing.T) {
-		_, err := stateSnapshotKey(WorkspaceState{Backend: BackendName, Data: map[string]any{}})
-		if err == nil {
-			t.Fatal("a state without a snapshot key must be rejected")
+	t.Run("release", func(t *testing.T) {
+		if err := sb.ReleaseState(ctx, WorkspaceState{}); err == nil {
+			t.Fatal("ReleaseState accepted a state with no snapshot key")
 		}
 	})
 }
@@ -827,371 +611,22 @@ func TestRequireBackend_WithoutDaemon(t *testing.T) {
 	}
 }
 
-// TestApply_RecordsDeltaBaseAndCaptureCarriesDelta pins the delta plumbing: an
-// Apply of a state that carries a git HEAD records it as the sandbox's delta
-// base, and every Capture from then on stores the base plus the patch against
-// it, so the state can settle through ApplyDelta onto a moved workspace.
-func TestApply_RecordsDeltaBaseAndCaptureCarriesDelta(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	baseline, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("baseline Capture: %v", err)
-	}
-	baseline.Data[StateKeyGitHead] = "basehead"
-
-	if err := sb.Apply(ctx, baseline); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture after Apply: %v", err)
-	}
-	if got := state.Data[StateKeyDeltaBase]; got != "basehead" {
-		t.Errorf("delta_base = %v, want the applied state's git HEAD", got)
-	}
-	patchB64, _ := state.Data[StateKeyDeltaPatch].(string)
-	if patchB64 == "" {
-		t.Fatal("delta_patch should be present when the range has changes")
-	}
-	patch, err := base64.StdEncoding.DecodeString(patchB64)
-	if err != nil {
-		t.Fatalf("delta_patch is not valid base64: %v", err)
-	}
-	if !strings.Contains(string(patch), "diff --git") {
-		t.Errorf("delta_patch = %q, want a git patch", string(patch))
-	}
-}
-
-// TestCapture_CleanDeltaOmitsPatch pins the clean-capture encoding: the base
-// rides in the state, the patch does not, and ApplyDelta reads that as a no-op.
-func TestCapture_CleanDeltaOmitsPatch(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "abc")
-	tasks.deltaPatchStdout = "\n"
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	baseline, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("baseline Capture: %v", err)
-	}
-	baseline.Data[StateKeyGitHead] = "basehead"
-	if err := sb.Apply(ctx, baseline); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if got := state.Data[StateKeyDeltaBase]; got != "basehead" {
-		t.Errorf("delta_base = %v, want basehead", got)
-	}
-	if _, ok := state.Data[StateKeyDeltaPatch]; ok {
-		t.Error("delta_patch should be absent for a clean capture")
-	}
-}
-
-// TestCapture_WithoutBaseCarriesNoDelta pins that a sandbox which never applied
-// a git state produces states with no delta payload, and that this is not an
-// error: those states settle Select-only.
-func TestCapture_WithoutBaseCarriesNoDelta(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "deadbeef")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if _, ok := state.Data[StateKeyDeltaBase]; ok {
-		t.Error("delta_base should be absent without an applied git baseline")
-	}
-	if _, ok := state.Data[StateKeyDeltaPatch]; ok {
-		t.Error("delta_patch should be absent without an applied git baseline")
-	}
-}
-
-// TestApplyDelta_RejectsForeignBackend mirrors Apply's backend check: a git
-// state can never be merged here.
-func TestApplyDelta_RejectsForeignBackend(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	err := sb.ApplyDelta(context.Background(), WorkspaceState{Backend: "git"})
-	if err == nil {
-		t.Fatal("ApplyDelta must reject a git workspace state")
-	}
-	if !strings.Contains(err.Error(), "git") {
-		t.Errorf("error should name the offending backend: %v", err)
-	}
-}
-
-// TestApplyDelta_UnbasedDeltaIsUnsupported pins the refusal for a delta that
-// carries no base: ErrUnsupported, not a silent no-op, so a caller that needs
-// the merge verb can fail loudly at selection time.
-func TestApplyDelta_UnbasedDeltaIsUnsupported(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	err := sb.ApplyDelta(context.Background(), WorkspaceState{
-		Backend: BackendName,
-		Data:    map[string]any{StateKeySnapshotKey: "k"},
-	})
-	if !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("ApplyDelta without a base = %v, want ErrUnsupported", err)
-	}
-}
-
-// TestApplyDelta_CleanCaptureIsNoOp pins the no-op path: a base with no changes
-// merges nothing and runs no container execs at all.
-func TestApplyDelta_CleanCaptureIsNoOp(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "abc")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	afterCreate := len(tasks.allReqs)
-	err := sb.ApplyDelta(ctx, WorkspaceState{
-		Backend: BackendName,
-		Data:    map[string]any{StateKeyDeltaBase: "basehead"},
-	})
-	if err != nil {
-		t.Fatalf("ApplyDelta (clean capture): %v", err)
-	}
-	if got := len(tasks.allReqs); got != afterCreate {
-		t.Errorf("clean-capture no-op ran %d execs, want %d (none beyond Create's)", got, afterCreate)
-	}
-}
-
-// TestApplyDelta_AppliesPatchAndCleansUp pins the happy path's shape: the patch
-// is staged to a temp file, the merge script runs, and the temp file is removed.
-func TestApplyDelta_AppliesPatchAndCleansUp(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "abc")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	patch := base64.StdEncoding.EncodeToString([]byte("diff --git a/f b/f\n+child\n"))
-	delta := WorkspaceState{
-		Backend: BackendName,
-		Data: map[string]any{
-			StateKeyDeltaBase:  "basehead",
-			StateKeyDeltaPatch: patch,
-		},
-	}
-	if err := sb.ApplyDelta(ctx, delta); err != nil {
-		t.Fatalf("ApplyDelta: %v", err)
-	}
-
-	var staged, merged, removed bool
-	for _, req := range tasks.allReqs {
-		script := ""
-		if len(req.Args) >= 2 {
-			script = req.Args[1]
-		}
-		switch {
-		case strings.Contains(script, "base64 -d"):
-			staged = true
-		case strings.Contains(script, "git merge-tree"):
-			merged = true
-		case strings.Contains(script, "rm -f --"):
-			removed = true
-		}
-	}
-	if !staged {
-		t.Error("the delta patch should be staged through WriteFile")
-	}
-	if !merged {
-		t.Error("the merge script should have run")
-	}
-	if !removed {
-		t.Error("the staged patch file should be removed after the merge")
-	}
-}
-
-// TestApplyDelta_ConflictRefusesWithPaths pins the refused-merge path: the
-// script's conflict sentinel surfaces with the conflicting paths named, so a
-// caller can tell a refusal (nothing consumed) from an operational failure.
-func TestApplyDelta_ConflictRefusesWithPaths(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "abc")
-	tasks.mergeConflict = true
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	patch := base64.StdEncoding.EncodeToString([]byte("diff --git a/f.txt b/f.txt\n+child\n"))
-	err := sb.ApplyDelta(ctx, WorkspaceState{
-		Backend: BackendName,
-		Data: map[string]any{
-			StateKeyDeltaBase:  "basehead",
-			StateKeyDeltaPatch: patch,
-		},
-	})
-	if err == nil {
-		t.Fatal("a conflicting delta must fail the call")
-	}
-	if !strings.Contains(err.Error(), "conflicting paths") || !strings.Contains(err.Error(), "f.txt") {
-		t.Errorf("error = %v, want it to name the conflicting paths", err)
-	}
-}
-
-// TestApplyDelta_BeforeCreateFails mirrors the other lifecycle guards: a merge
-// needs a running task to exec in.
-func TestApplyDelta_BeforeCreateFails(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "")
-	patch := base64.StdEncoding.EncodeToString([]byte("diff --git a/f b/f\n+child\n"))
-	err := sb.ApplyDelta(context.Background(), WorkspaceState{
-		Backend: BackendName,
-		Data: map[string]any{
-			StateKeyDeltaBase:  "basehead",
-			StateKeyDeltaPatch: patch,
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), "before Create") {
-		t.Fatalf("ApplyDelta before Create = %v, want a lifecycle error", err)
-	}
-}
-
-// applyBasedState applies a state carrying a git HEAD so the sandbox records a
-// delta base, ready for the failure-path tests below.
-func applyBasedState(t *testing.T, ctx context.Context, sb *ContainerdSandbox) {
-	t.Helper()
-	baseline, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("baseline Capture: %v", err)
-	}
-	baseline.Data[StateKeyGitHead] = "basehead"
-	if err := sb.Apply(ctx, baseline); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-}
-
-// TestCapture_BaseWithoutGitHeadFailsAndUnpins pins the loud refusal: once a
-// base is recorded, a capture that cannot read the workspace's git HEAD fails
-// rather than handing out a state with no delta payload, and it drops the pin
-// on the committed layer first — no state is handed out, so nothing else could
-// ever release it.
-func TestCapture_BaseWithoutGitHeadFailsAndUnpins(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "abc")
-	fl := &fakeLeases{}
-	sb.leases = fl
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	applyBasedState(t, ctx, sb)
-
-	// The workspace stops being a readable repository between Apply and the
-	// next Capture.
-	tasks.gitHead = ""
-	_, err := sb.Capture(ctx)
-	if err == nil || !strings.Contains(err.Error(), "read git HEAD") {
-		t.Fatalf("Capture without a readable HEAD = %v, want a loud refusal", err)
-	}
-
-	// added - removed counts the pins still held; the failed capture must have
-	// dropped the pin it just took, leaving only the baseline's.
-	if len(fl.added)-len(fl.removed) != 1 {
-		t.Errorf("pins added=%d removed=%d; want exactly the baseline's pin left held", len(fl.added), len(fl.removed))
-	}
-}
-
-// TestCapture_DeltaFailureFailsAndUnpins pins the delta-generation refusal and
-// its pin drop: the state never reaches the caller, so the pin on its layer
-// must not outlive the call.
-func TestCapture_DeltaFailureFailsAndUnpins(t *testing.T) {
-	sb, _, tasks, _ := newTestSandbox(t, "abc")
-	fl := &fakeLeases{}
-	sb.leases = fl
-	tasks.runErr["sh"] = errors.New("delta script boom")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	applyBasedState(t, ctx, sb)
-
-	_, err := sb.Capture(ctx)
-	if err == nil || !strings.Contains(err.Error(), "capture delta") {
-		t.Fatalf("Capture with a failing delta script = %v, want a loud refusal", err)
-	}
-	if len(fl.added)-len(fl.removed) != 1 {
-		t.Errorf("pins added=%d removed=%d; want exactly the baseline's pin left held", len(fl.added), len(fl.removed))
-	}
-}
-
-// TestApply_StateWithoutGitHeadClearsBase pins the rebind rule: applying a
-// state with no git HEAD moves the sandbox to a workspace that may not contain
-// the old base's repository, so the base must not survive.
-func TestApply_StateWithoutGitHeadClearsBase(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	applyBasedState(t, ctx, sb)
-
-	plain, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("plain Capture: %v", err)
-	}
-	delete(plain.Data, StateKeyGitHead)
-	if err := sb.Apply(ctx, plain); err != nil {
-		t.Fatalf("Apply (no git head): %v", err)
-	}
-
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture after rebind: %v", err)
-	}
-	if _, ok := state.Data[StateKeyDeltaBase]; ok {
-		t.Error("delta_base should not survive applying a state with no git HEAD")
-	}
-}
-
-// TestCreate_ResetsBase pins the generation reset: a sandbox reused through
-// Create after a previous life that applied a git state must not diff the new
-// workspace against the old repository's HEAD.
-func TestCreate_ResetsBase(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
-	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	applyBasedState(t, ctx, sb)
-
-	// The supported reuse flow is Create -> Destroy -> Create.
-	if err := sb.Destroy(ctx); err != nil {
-		t.Fatalf("Destroy before re-Create: %v", err)
-	}
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
-		t.Fatalf("re-Create: %v", err)
-	}
-	state, err := sb.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture after re-Create: %v", err)
-	}
-	if _, ok := state.Data[StateKeyDeltaBase]; ok {
-		t.Error("delta_base should not survive Create: the new generation's workspace may not contain the old base's repository")
-	}
-}
-
-// TestCapture_ConcurrentWithApply drives the data race the base field's
-// locked read exists for: Capture snapshots baseGitHead while Apply reassigns
-// it. Errors are expected and ignored — the point is that -race sees the
-// unsynchronized read, not lifecycle success.
+// TestCapture_ConcurrentWithApply drives concurrent lifecycle operations:
+// both hold the exclusive op-level lock, so they serialize — an in-flight
+// Capture finishes before an Apply rebinding the sandbox starts, by
+// construction rather than by luck. Errors are expected and ignored; the
+// point is that the lock makes the interleaving safe, not lifecycle
+// success.
 func TestCapture_ConcurrentWithApply(t *testing.T) {
-	sb, _, _, _ := newTestSandbox(t, "abc")
+	sb, _, _, _ := newTestSandbox(t)
 	ctx := context.Background()
-	if err := sb.Create(ctx, SandboxSpec{}); err != nil {
+	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := sb.Capture(ctx)
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	state.Data[StateKeyGitHead] = "basehead"
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -1208,4 +643,135 @@ func TestCapture_ConcurrentWithApply(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// startTaskFailsOnce wraps a taskService whose next StartTask fails once, so a
+// test can break exactly one roll-forward and observe the recovery — unlike
+// failingStartTask, which keeps failing and turns the recovery restart into a
+// second failure.
+type startTaskFailsOnce struct {
+	taskService
+	failNext bool
+}
+
+func (f *startTaskFailsOnce) StartTask(ctx context.Context, id, key string) error {
+	if f.failNext {
+		f.failNext = false
+		return errors.New("shim down")
+	}
+	return f.taskService.StartTask(ctx, id, key)
+}
+
+// TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers pins the failure
+// path after Prepare succeeds: the prepared successor must be removed (Destroy
+// would otherwise leak it — it removes only the current activeKey), the task
+// must restart on the old active layer, and the sandbox must stay usable —
+// the recovery restart itself is asserted, not just a later Capture.
+func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
+	sb, snap, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	before := len(snap.keys())
+	onActive := tasks.current
+
+	// Break exactly the roll-forward's StartTask; the recovery restart must
+	// go through the same fake and succeed.
+	sb.tasks = &startTaskFailsOnce{taskService: sb.tasks, failNext: true}
+
+	if err := sb.Apply(ctx, state); err == nil {
+		t.Fatal("Apply succeeded although the successor task could not start")
+	}
+	if tasks.current != onActive {
+		t.Fatalf("after the failed Apply the task runs on %q, want the old active %q: "+
+			"the sandbox must recover in place, not stay stopped", tasks.current, onActive)
+	}
+	if len(snap.keys()) != before {
+		t.Errorf("snapshot count = %d after the failed Apply, want %d: the prepared successor must not leak",
+			len(snap.keys()), before)
+	}
+
+	// The promised later Apply, on the recovered sandbox.
+	if err := sb.Apply(ctx, state); err != nil {
+		t.Fatalf("Apply after the recovered Apply: %v", err)
+	}
+}
+
+// TestApply_PreservesForeignLineageInCapture pins the cross-sandbox fork
+// flow: a fresh sandbox applying a state captured by another sandbox records
+// the applied layer as its lineage, so the next Capture's ParentKey names the
+// applied state's snapshot rather than falling back to the image rootfs.
+func TestApply_PreservesForeignLineageInCapture(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	ctx := context.Background()
+
+	parent := NewWithBackend(Config{Image: "example/dev:latest"}, snap, newFakeTasks(log, snap), images, WithLeases(&fakeLeases{}))
+	if err := parent.Create(ctx); err != nil {
+		t.Fatalf("Create (parent): %v", err)
+	}
+	state, err := parent.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture (parent): %v", err)
+	}
+
+	child := NewWithBackend(Config{Image: "example/dev:latest"}, snap, newFakeTasks(log, snap), images, WithLeases(&fakeLeases{}))
+	if err := child.Apply(ctx, state); err != nil {
+		t.Fatalf("cross-sandbox Apply: %v", err)
+	}
+	after, err := child.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture (child): %v", err)
+	}
+	if after.ParentKey != state.SnapshotKey {
+		t.Errorf("ParentKey after a cross-sandbox Apply = %q, want the applied state's %q",
+			after.ParentKey, state.SnapshotKey)
+	}
+}
+
+// TestWorkspaceOpDelaysLifecycle pins the lock wiring the serialization
+// contract rests on: workspace operations hold the shared op-level lock, so
+// an in-flight one delays a waiting lifecycle operation until it returns —
+// and the reverse path completes once the shared holder lets go. A regression
+// that put Exec under the exclusive lock, or Capture under the shared one,
+// fails here rather than in a tenant's workload.
+func TestWorkspaceOpDelaysLifecycle(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Simulate an in-flight workspace operation by holding the shared lock
+	// the way Exec does — no fake collaboration needed; the point is the
+	// lock, not the exec.
+	sb.opMu.RLock()
+
+	captured := make(chan error, 1)
+	go func() { _, err := sb.Capture(ctx); captured <- err }()
+
+	select {
+	case <-captured:
+		sb.opMu.RUnlock()
+		t.Fatal("Capture completed while a workspace operation held the shared lock")
+	case <-time.After(50 * time.Millisecond):
+		// Still blocked: the exclusive lock is waiting. Let it through and
+		// confirm it completes.
+		sb.opMu.RUnlock()
+		select {
+		case err := <-captured:
+			if err != nil {
+				t.Fatalf("Capture after the shared holder released: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Capture did not complete after the shared holder released")
+		}
+	}
 }

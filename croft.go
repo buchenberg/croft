@@ -43,20 +43,20 @@
 //
 // # The image contract
 //
-// Diff and ApplyDelta run git inside the container, so the image must provide
-// sh, stat, GNU find, and git; a workspace that is not a git repository simply
-// cannot be diffed or merged semantically and degrades to snapshot-only
-// states. Hosts should probe the image for this contract before selecting the
-// backend.
+// The workspace's file operations shell out inside the container, so the
+// image must provide a shell and the small coreutils croft itself uses:
+// mkdir (Create provisions the workdir), and cat, dirname, printf,
+// base64, and chmod (ReadFile and WriteFile).
 //
 // # Status
 //
-// The snapshot lifecycle, teardown ordering, layer pruning, file I/O, and diff
-// are implemented and unit-tested against containerd's real
+// The snapshot lifecycle, teardown ordering, layer pruning, and file I/O are
+// implemented and unit-tested against containerd's real
 // snapshots.Snapshotter interface, using an in-memory fake that enforces the
 // same invariants as the overlayfs snapshotter: a key cannot be prepared twice,
-// a parent must be committed, only a committed layer can be committed once, a
-// committed layer is read-only, and a layer with children cannot be removed.
+// a parent must be committed, only an active layer can be committed (exactly
+// once — an already committed layer is rejected), a committed layer is
+// read-only, and a layer with children cannot be removed.
 //
 // The daemon adapter (client.go) compiles but has not been exercised on every
 // supported daemon configuration; the live test suite runs it against a real
@@ -90,66 +90,9 @@ package croft
 
 import (
 	"context"
-	"errors"
 	"io/fs"
 	"time"
 )
-
-// ErrUnsupported is returned by an optional capability that a sandbox does not
-// implement. Callers should check Capabilities (or type-assert the optional
-// interface) before calling; the error exists so a misconfigured caller fails
-// loudly instead of silently doing nothing.
-var ErrUnsupported = errors.New("croft: capability not supported")
-
-// Containment classifies how strongly a workspace is contained. The string
-// values are a stable wire format, recorded by hosts in traces and state
-// metadata.
-type Containment string
-
-const (
-	// ContainFull is a boundary a kernel exploit cannot cross (a VM).
-	ContainFull Containment = "full"
-	// ContainContained is namespaces plus a separate rootfs: strong, but a
-	// kernel exploit escapes it.
-	ContainContained Containment = "contained"
-	// ContainBuffered is a mediated, non-executable copy of host content.
-	ContainBuffered Containment = "buffered"
-	// ContainUncontained is direct mutation of the host filesystem.
-	ContainUncontained Containment = "uncontained"
-)
-
-// SandboxCapabilities declares what a sandbox supports. Callers use it to
-// decide whether an optional operation is available before invoking it.
-type SandboxCapabilities struct {
-	// Lifecycle reports whether Create and Destroy manage real resources.
-	Lifecycle bool
-	// Exec reports whether Exec is implemented.
-	Exec bool
-	// FileIO reports whether ReadFile and WriteFile are implemented.
-	FileIO bool
-	// Diff reports whether Diff is implemented.
-	Diff bool
-	// Isolated reports whether the workspace is isolated from the host
-	// filesystem. A false value means the sandbox mutates the host tree in
-	// place.
-	Isolated bool
-	// Containment is the witness-level containment classification, for
-	// hosts that record it in traces and retained contexts.
-	Containment Containment
-}
-
-// SandboxSpec carries per-call runtime options for Create. Backend-specific
-// configuration (image, namespace, credentials) belongs on Config, not here.
-type SandboxSpec struct {
-	// Workdir is the workspace path for backends that mount or check out into
-	// a caller-chosen directory. Ignored by backends that infer their own.
-	Workdir string
-	// Env is the environment for commands run during Create (for example a
-	// bootstrap step). It is not the agent's execution environment.
-	Env map[string]string
-	// Timeout bounds the Create operation. Zero means the sandbox default.
-	Timeout time.Duration
-}
 
 // ExecRequest describes one command execution inside a sandbox.
 type ExecRequest struct {
@@ -170,31 +113,24 @@ type ExecResult struct {
 }
 
 // Sandbox is an isolated workspace: it owns a filesystem boundary and can
-// provision it, capture it, resume it, diff it, and execute in it.
+// provision it, capture it, resume it, and execute in it.
 //
 // The capture/apply pair is the state lifecycle: Capture returns a WorkspaceState
 // that outlives the sandbox (the snapshot is pinned against the daemon's
 // garbage collector), Apply rebinds a sandbox to a previously captured state,
 // and any sandbox configured the same way can apply it — that is how a state
-// crosses from one sandbox to another.
+// crosses from one sandbox to another. ReleaseState is the only discard verb.
 //
 // Every method takes a context so remote daemons honor cancellation and
 // deadlines.
 //
-// Non-mutating contract: Capture and Diff must leave the caller's workspace
-// metadata unchanged on return. For the in-container git repository that means
-// the index must be left as it was found.
+// Non-mutating contract: Capture must leave the caller's workspace metadata
+// unchanged on return.
 type Sandbox interface {
-	// Backend returns the backend identifier ("containerd" for this
-	// package's implementation).
-	Backend() string
-
-	// Capabilities reports what this sandbox supports.
-	Capabilities() SandboxCapabilities
-
 	// Create provisions the workspace: resolves the image rootfs, prepares
-	// the base active snapshot, and starts the task.
-	Create(ctx context.Context, spec SandboxSpec) error
+	// the base active snapshot, and starts the task. The caller bounds the
+	// operation with the context.
+	Create(ctx context.Context) error
 
 	// Destroy releases resources this sandbox provisioned. It must never
 	// destroy resources it did not create.
@@ -204,10 +140,10 @@ type Sandbox interface {
 	// snapshot, pins it, and continues on a fresh layer. Non-mutating to
 	// the caller's workspace metadata.
 	//
-	// Contract caveat: the state's identity is the snapshot key, which is
+	// Contract caveat: the state's identity is its snapshot key, which is
 	// sequence-derived, so two captures of identical content produce
-	// different states. Digest equality means identity, not content
-	// equality; a content-derived state identity is a recorded follow-up.
+	// different states — identity, not content equality. A content-derived
+	// state identity is a recorded follow-up.
 	Capture(ctx context.Context) (WorkspaceState, error)
 
 	// Apply resumes the workspace from a previously captured state by
@@ -216,10 +152,10 @@ type Sandbox interface {
 	// states; reclaim them with ReleaseState.
 	Apply(ctx context.Context, ws WorkspaceState) error
 
-	// Diff returns the unified diff and changed file paths between ws and
-	// the current workspace, using the in-container git repository. Requires
-	// the image contract's git. maxLines <= 0 means unbounded. Non-mutating.
-	Diff(ctx context.Context, ws WorkspaceState, maxLines int) (diff string, files []string, err error)
+	// ReleaseState drops the pin holding a captured state's snapshot. The
+	// daemon's garbage collector reclaims the layer once nothing references
+	// it; until then the state stays valid. Idempotent.
+	ReleaseState(ctx context.Context, ws WorkspaceState) error
 
 	// Exec runs a command in the sandbox and returns its result.
 	Exec(ctx context.Context, req ExecRequest) (ExecResult, error)
@@ -229,22 +165,4 @@ type Sandbox interface {
 
 	// WriteFile writes a file inside the sandbox workspace.
 	WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error
-}
-
-// DeltaApplier is an optional Sandbox capability: applying a captured state's
-// changes onto a workspace that has moved past the state's base, without
-// resetting it. Apply is a full reset and is wrong for that case.
-//
-// The delta payload is recorded at Capture (a git binary patch from the
-// delta's recorded base to the captured working tree), so one argument is
-// enough. A conflicting delta fails the call and leaves the workspace
-// untouched; a delta with no changes is a no-op. A state captured without a
-// git base cannot be merged and reports ErrUnsupported rather than pretending.
-//
-// Callers detect the capability with a type assertion, so adding it is an
-// implementation decision, not a breaking change.
-type DeltaApplier interface {
-	// ApplyDelta merges the changes captured in delta onto the current
-	// workspace.
-	ApplyDelta(ctx context.Context, delta WorkspaceState) error
 }

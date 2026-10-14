@@ -7,30 +7,29 @@ the fakes cannot reach everything a real daemon does:
   interface using an in-memory fake that enforces the overlayfs invariants: a
   key cannot be prepared twice, a parent must be committed, only an active
   layer can be committed (exactly once — an already committed layer is
-  rejected), a committed layer is read-only, and a layer with children
-  cannot be removed.
+  rejected), a committed layer is read-only, and a layer with children cannot
+  be removed. Concurrency runs under `-race`.
 - **Live suite** — the whole lifecycle against a real daemon, env-gated so
   `go test ./...` stays green without one.
 
 ## What the live suite verifies
 
-- **Delta merges.** `ApplyDelta` merges a captured delta onto a workspace
-  that moved past the delta's base: `Apply` records the applied state's git
-  HEAD as the sandbox's delta base, every `Capture` carries a git binary
-  patch from that base to the captured tree, and the merge runs at the tree
-  level (`git merge-tree --write-tree`) in the object database — a
-  conflicting delta refuses with the working tree untouched, and a clean
-  one lands as unstaged changes that leave the caller's staged work alone.
-- **State durability.** Every `Capture` pins its committed layer under the
-  namespace-scoped states lease that outlives any sandbox, `Destroy` removes
+- **Full lifecycle.** Create from a public image, write, exec, capture, apply
+  (rollback), destroy — the acceptance sequence, on a real daemon, with
+  process state lost at Capture stated and observed.
+- **State durability.** Every Capture pins its committed layer under the
+  namespace-scoped states lease that outlives any sandbox, Destroy removes
   only the sandbox's private active layer, and `ReleaseState` is the
-  deliberate reclaim path — disk comes back when the caller says so, not
-  when a sandbox happens to die. The recycle path — capture, destroy, then
-  apply the captured state, and the pre-capture write is present in the
-  re-provisioned workspace — is pinned live
-  (`TestLive_ApplyAfterDestroyRecyclesState`).
-- **Leases and non-mutation.** Leases hold snapshots against the daemon's
-  garbage collector, and Diff never mutates the caller's git index.
+  deliberate reclaim path — disk comes back when the caller says so, not when
+  a sandbox happens to die.
+- **The recycle path.** Capture → destroy → apply, with the pre-capture write
+  present in the re-provisioned workspace — states outlive sandboxes, proven
+  end to end (`TestLive_ApplyAfterDestroyRecyclesState`).
+- **Leases.** The sandbox lease holds snapshots against the daemon's garbage
+  collector across the whole lifecycle; namespace isolation is asserted
+  against the daemon itself (the fakes have no namespaces).
+- **Exec semantics.** Streams are separated, exit codes surface without
+  errors, duration is populated, and stdin is refused rather than blocked.
 
 ## Running the live suite
 
@@ -57,7 +56,6 @@ because that suite runs as root.
 
 ## Honesty notes
 
-- Unsupported operations return `ErrUnsupported` rather than pretending;
-  `Capabilities` reports the support matrix.
+- Unsupported operations fail loudly rather than pretending.
 - "Runs in a container" is not a security claim on its own: containment is
   namespaces plus a separate rootfs, strong but not a VM boundary.

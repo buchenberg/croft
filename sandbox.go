@@ -17,10 +17,6 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 )
 
-// BackendName is the identifier reported by Backend and stored in
-// WorkspaceState.Backend.
-const BackendName = "containerd"
-
 // sandboxLeaseLabel marks leases this adapter owns.
 //
 // A lease is the only thing keeping a sandbox's snapshots alive between
@@ -43,35 +39,9 @@ const (
 	defaultWriteChunkBytes = 512 * 1024
 )
 
-// WorkspaceState.Data keys. Pinning the encoding here means a git backend's
-// states can never be mistaken for these, and vice versa: Apply rejects a state
-// whose Backend is not BackendName.
-const (
-	// StateKeySnapshotKey is the committed snapshot this state resumes from.
-	StateKeySnapshotKey = "snapshot_key"
-	// StateKeyParentKey is the committed snapshot this one was prepared from,
-	// recording the fork lineage.
-	StateKeyParentKey = "parent_key"
-	// StateKeyImage is the image the sandbox was provisioned from.
-	StateKeyImage = "image"
-	// StateKeyGitHead is the in-container git HEAD at capture time, when the
-	// workspace is a git repository. Diff needs it as a baseline.
-	StateKeyGitHead = "git_head"
-	// StateKeyDeltaBase is the git HEAD the sandbox last applied (the fork
-	// baseline for an isolated child), recorded so the captured state carries
-	// its own delta base. ApplyDelta needs it as the merge base.
-	StateKeyDeltaBase = "delta_base"
-	// StateKeyDeltaPatch is the base64 (StdEncoding) git binary patch from
-	// StateKeyDeltaBase to the captured working tree, present only when that
-	// range has changes. An absent key with a present StateKeyDeltaBase is a
-	// clean capture: nothing to merge.
-	StateKeyDeltaPatch = "delta_patch"
-)
-
 // ErrNotImplemented is returned when the containerd surface could not be
-// connected. It is deliberately distinct from ErrUnsupported:
-// Capabilities declares these operations supported, so reporting "unsupported"
-// would be false.
+// connected — the operation is supported, the daemon connection is what
+// failed, so reporting anything else would be false.
 var ErrNotImplemented = errors.New("containerd sandbox: not implemented")
 
 // Config configures the containerd backend.
@@ -84,7 +54,7 @@ type Config struct {
 	// containerd users on the same host.
 	Namespace string
 
-	// Image is the base image provisioned for the root scope. Required: a
+	// Image is the base image provisioned for the workspace. Required: a
 	// sandbox with no base filesystem has nothing to run.
 	Image string
 
@@ -145,8 +115,6 @@ type taskService interface {
 	// StopTask stops and deletes task id. It must be idempotent so Destroy and
 	// Capture are safe to retry.
 	StopTask(ctx context.Context, id string) error
-	// Running reports whether task id exists and is running.
-	Running(ctx context.Context, id string) (bool, error)
 	// Exec runs a command inside task id.
 	Exec(ctx context.Context, id string, req ExecRequest) (ExecResult, error)
 }
@@ -157,9 +125,19 @@ type imageService interface {
 	RootfsSnapshot(ctx context.Context, ref string) (string, error)
 }
 
-// ContainerdSandbox is a workspace substrate backed by containerd.
+// ContainerdSandbox is a workspace backed by containerd.
 //
-// One instance corresponds to one workspace. Safe for concurrent use.
+// One instance corresponds to one workspace. Safe for concurrent use:
+// lifecycle operations (Create, Destroy, Capture, Apply) hold an
+// exclusive op-level lock, workspace operations (Exec, ReadFile,
+// WriteFile, ReleaseState) a shared one — an in-flight Exec finishes
+// before a Capture can commit the layer it is writing to, by
+// construction rather than by luck. opMu is the outermost lock, and where
+// the inner locks nest, leaseMu precedes mu (see client.go's lease
+// lifecycle); opMu guards only the public API surface, so tests may drive
+// the impls directly where a lock would be noise. Waiting for
+// opMu does not honor context cancellation: a hung Exec delays a
+// waiting Destroy until it returns, the standard Go trade.
 // leaseRef carries the sandbox's current containerd lease id.
 //
 // It is written by Create and Destroy and read on every snapshotter call, so it
@@ -189,6 +167,11 @@ type ContainerdSandbox struct {
 	snap   snapshots.Snapshotter
 	tasks  taskService
 	images imageService
+
+	// opMu serializes the public API: exclusive for lifecycle operations
+	// (Create, Destroy, Capture, Apply), shared for workspace operations
+	// (Exec, ReadFile, WriteFile, ReleaseState). See the struct doc.
+	opMu sync.RWMutex
 	// leases is the daemon's lease manager. Nil when the collaborators were
 	// substituted (tests): a fake snapshotter has no garbage collector to hold
 	// anything back from, so there is nothing to lease.
@@ -220,14 +203,6 @@ type ContainerdSandbox struct {
 	// parent key — not teardown: committed layers are states, outlive the
 	// sandbox, and are never removed by Destroy or Apply.
 	committedChain []string
-	// baseGitHead is the git HEAD recorded in the state this sandbox last
-	// applied — the fork baseline for an isolated child. Captures diff against
-	// it (deltaPatchScript) so the states they hand out can settle through
-	// ApplyDelta. Empty when no applied state carried a git HEAD, which means
-	// captures carry no delta payload and their settlement verb is Select only.
-	// Create resets it and Apply reassigns it, so it never outlives the
-	// workspace it describes.
-	baseGitHead string
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
 }
@@ -235,28 +210,6 @@ type ContainerdSandbox struct {
 // The compile-time assertion is load-bearing: if Sandbox gains or
 // changes a method, this package stops building until the adapter matches.
 var _ Sandbox = (*ContainerdSandbox)(nil)
-
-// StateReleaser is the optional state-discard surface this backend adds beyond
-// Sandbox. A WorkspaceState has no lifecycle — a state
-// outlives the sandbox that captured it — and the lease pin that makes that
-// true holds daemon disk. This is how a caller gives it back deliberately.
-//
-// Callers type-assert to it:
-//
-//	if r, ok := sb.(StateReleaser); ok { _ = r.ReleaseState(ctx, state) }
-//
-// Promoting it into core's Sandbox interface is a separate, deliberate
-// library-API decision (every backend would have to answer what discarding a
-// state means); the assertion above is the tripwire that forces that
-// conversation.
-type StateReleaser interface {
-	// ReleaseState drops the pin holding ws's snapshot. The daemon's garbage
-	// collector reclaims the layer once no other snapshot, container, or lease
-	// references it; until then the state stays valid.
-	ReleaseState(ctx context.Context, ws WorkspaceState) error
-}
-
-var _ StateReleaser = (*ContainerdSandbox)(nil)
 
 // New returns a sandbox bound to cfg, backed by a real containerd client. The
 // client is connected lazily on first use.
@@ -292,23 +245,6 @@ func WithLeases(mgr leases.Manager) BackendOption {
 	return func(s *ContainerdSandbox) { s.leases = mgr }
 }
 
-// Backend reports the backend identifier.
-func (s *ContainerdSandbox) Backend() string { return BackendName }
-
-// Capabilities reports the backend's support matrix.
-func (s *ContainerdSandbox) Capabilities() SandboxCapabilities {
-	return SandboxCapabilities{
-		Lifecycle: true,
-		Exec:      true,
-		FileIO:    true,
-		Diff:      true,
-		Isolated:  true,
-		// Namespaces plus a separate rootfs, but not a VM boundary: a kernel
-		// exploit escapes it, so this is not ContainFull.
-		Containment: ContainContained,
-	}
-}
-
 // ID returns the current container identity, or "" before Create. It changes
 // across Apply, so callers must not cache it.
 func (s *ContainerdSandbox) ID() string {
@@ -318,17 +254,18 @@ func (s *ContainerdSandbox) ID() string {
 }
 
 // Create provisions the base snapshot from Config.Image and starts the task.
-func (s *ContainerdSandbox) Create(ctx context.Context, spec SandboxSpec) error {
+// The caller sets its own deadline on the context; the whole operation —
+// daemon connection, lease acquisition, image resolution — runs under it.
+func (s *ContainerdSandbox) Create(ctx context.Context) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.createImpl(ctx)
+}
+
+// createImpl is Create's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	if s.cfg.Image == "" {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
-	}
-	// SandboxSpec.Timeout documents that it bounds the whole Create, so it has to
-	// be in force before the daemon connection and the lease RPC — not after
-	// them. A blocked lease service would otherwise hang past the caller's limit.
-	if spec.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
-		defer cancel()
 	}
 	if err := s.requireBackend(ctx); err != nil {
 		return err
@@ -386,11 +323,6 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec SandboxSpec) error 
 	s.rootfsKey = rootfsKey
 	s.activeKey = active
 	s.committedChain = nil
-	// A fresh generation has no delta base: the previous one's git HEAD is a
-	// commit in a repository this workspace may not even contain, and a
-	// capture diffing against it would emit a state whose delta_base is
-	// unresolvable at ApplyDelta time.
-	s.baseGitHead = ""
 	s.seq = 0
 	s.mu.Unlock()
 
@@ -411,6 +343,13 @@ func (s *ContainerdSandbox) Create(ctx context.Context, spec SandboxSpec) error 
 // than a wave of not-found errors. The image rootfs snapshot is never removed —
 // it belongs to the image.
 func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.destroyImpl(ctx)
+}
+
+// destroyImpl is Destroy's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) destroyImpl(ctx context.Context) error {
 	if s.snap == nil || s.tasks == nil {
 		return nil
 	}
@@ -458,13 +397,19 @@ func (s *ContainerdSandbox) Destroy(ctx context.Context) error {
 // Stopping the task loses in-container process state. That is the price of a
 // coherent snapshot with this API.
 func (s *ContainerdSandbox) Capture(ctx context.Context) (WorkspaceState, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.captureImpl(ctx)
+}
+
+// captureImpl is Capture's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, error) {
 	if err := s.requireBackend(ctx); err != nil {
 		return WorkspaceState{}, err
 	}
 
 	s.mu.Lock()
 	id, active, parent := s.id, s.activeKey, s.parentKeyLocked()
-	base := s.baseGitHeadLocked()
 	// active empty with an id set is the cleanly-stopped state advance leaves
 	// behind when a successor could not be started: there is no running layer
 	// to commit, so this is the same "not created (anymore)" case.
@@ -513,42 +458,7 @@ func (s *ContainerdSandbox) Capture(ctx context.Context) (WorkspaceState, error)
 		return WorkspaceState{}, err
 	}
 
-	state := snapshotState(s.cfg.Image, committed, parent)
-	// Record the in-container git HEAD so Diff has a baseline. Without a
-	// recorded delta base, absence is not an error: a non-git workspace simply
-	// cannot be diffed semantically.
-	//
-	// With a base, absence is an error. Apply recorded a git HEAD, so the
-	// workspace was a repository at that point; a HEAD that cannot be read now
-	// means something is wrong that a delta cannot be built on, and the
-	// delta-generation failure below exists for the same reason: a sealed
-	// output whose state cannot settle-apply surfaces the gap only after a
-	// merge was approved, which is too late to fix. Refusing at capture keeps
-	// the gap at sealing time, where the caller still holds the scope. Both
-	// refusals drop the state pin first: the caller is handed no state, so
-	// nothing else can ever call ReleaseState, and the pin would hold the
-	// layer on disk until namespace teardown.
-	head, headErr := s.gitHead(ctx, id)
-	if headErr != nil || head == "" {
-		if base == "" {
-			return state, nil
-		}
-		_ = s.unpinState(context.WithoutCancel(ctx), committed)
-		return WorkspaceState{}, fmt.Errorf("containerd sandbox: capture: read git HEAD for delta base %s: %v", base, headErr)
-	}
-	state.Data[StateKeyGitHead] = head
-	if base != "" {
-		res, err := s.shell(ctx, deltaPatchScript, base)
-		if err != nil {
-			_ = s.unpinState(context.WithoutCancel(ctx), committed)
-			return WorkspaceState{}, fmt.Errorf("containerd sandbox: capture delta against base %s: %w", base, err)
-		}
-		state.Data[StateKeyDeltaBase] = base
-		if patch := res.Stdout; strings.TrimSpace(patch) != "" {
-			state.Data[StateKeyDeltaPatch] = base64.StdEncoding.EncodeToString([]byte(patch))
-		}
-	}
-	return state, nil
+	return snapshotState(s.cfg.Image, committed, parent), nil
 }
 
 // advance is Capture's successor path, shared by the success case and the
@@ -593,14 +503,21 @@ func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n
 // sandbox's active layer, but they survive: each was handed to a caller as a
 // WorkspaceState, and states outlive sandboxes. Reclaim them with ReleaseState
 // when the caller is done with them. Only the abandoned active layer is
-// removed. Single-use per state: the sandbox now runs on the given committed
-// layer, so applying a different state moves it again. This differs from the
-// git backend, whose states are freely reusable.
+// removed. Applying a different state moves the sandbox again: a state's
+// layer becomes whatever runs next, and callers must not assume two sandboxes
+// applying the same state share identity.
 func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error {
-	committed, err := stateSnapshotKey(ws)
-	if err != nil {
-		return err
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.applyImpl(ctx, ws)
+}
+
+// applyImpl is Apply's body; opMu is already held (exclusive).
+func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) error {
+	if ws.SnapshotKey == "" {
+		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
+	committed := ws.SnapshotKey
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
@@ -642,19 +559,44 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 	}
 	_ = mounts
 	if err := s.tasks.StartTask(ctx, id, next); err != nil {
-		return fmt.Errorf("containerd sandbox: start task after apply: %w", err)
+		// The prepared successor leaks otherwise — Destroy removes only the
+		// current activeKey — so it is removed here, cancel-free. The old
+		// active layer still exists at this point (its removal happens only on
+		// success below), so the task restarts on it, on the same cancel-free
+		// context (StartTask may have failed *because* the caller's context
+		// expired), and the sandbox is left usable rather than stopped. With
+		// no prior active (the first Apply before Create) there is no task to
+		// restart and the sandbox stays cleanly stopped. A removal failure is
+		// surfaced — the layer would otherwise leak with no key to find it
+		// by — and a restart failure is reported too, since both mean the
+		// sandbox did not recover cleanly.
+		cleanupCtx := context.WithoutCancel(ctx)
+		startErr := fmt.Errorf("containerd sandbox: start task after apply: %w", err)
+		if rerr := s.snap.Remove(cleanupCtx, next); rerr != nil {
+			startErr = errors.Join(startErr, fmt.Errorf("remove prepared successor %s: %w", next, rerr))
+		}
+		if active != "" {
+			if rerr := s.restart(cleanupCtx, id, active); rerr != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("restart on %s: %w", active, rerr))
+			}
+		}
+		return startErr
+	}
+
+	// The applied state's committed layer is now an ancestor of this
+	// sandbox's active layer, so it belongs in the chain — including when the
+	// state came from another sandbox's lineage, where splitChain finds
+	// nothing to retain and the chain would otherwise be empty, leaving the
+	// next Capture to mis-record its parent as the image rootfs. When the key
+	// was found in the chain, kept already ends with it; append only once.
+	if n := len(kept); n == 0 || kept[n-1] != committed {
+		kept = append(kept, committed)
 	}
 
 	s.mu.Lock()
 	s.id = id
 	s.activeKey = next
 	s.committedChain = kept
-	// The applied state's git HEAD becomes this sandbox's delta base: captures
-	// from here on diff against it, so the states they produce can settle
-	// through ApplyDelta. A state without one (a non-git workspace) clears the
-	// base: Apply rebinds the sandbox to that state's workspace, so any earlier
-	// base is a commit in a repository this workspace may not contain.
-	s.baseGitHead, _ = ws.Data[StateKeyGitHead].(string)
 	s.mu.Unlock()
 
 	// Best effort: the abandoned active layer is this sandbox's private
@@ -672,9 +614,7 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 //
 // This is the state-discard half of the "a WorkspaceState has no lifecycle"
 // contract: the state stays valid for exactly as long as the caller
-// wants it, and disk comes back when the caller says so. It is deliberately not
-// part of Sandbox — see StateReleaser — because promoting a discard
-// operation into the Sandbox interface is a library-level API decision.
+// wants it, and disk comes back when the caller says so.
 //
 // Idempotent: releasing an already-released state is a no-op.
 //
@@ -684,83 +624,22 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 // state. A mismatched release reports success (the target resource is simply
 // not found) while the real pin persists.
 func (s *ContainerdSandbox) ReleaseState(ctx context.Context, ws WorkspaceState) error {
-	key, err := stateSnapshotKey(ws)
-	if err != nil {
-		return err
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.releaseStateImpl(ctx, ws)
+}
+
+// releaseStateImpl is ReleaseState's body; opMu is already held (shared).
+func (s *ContainerdSandbox) releaseStateImpl(ctx context.Context, ws WorkspaceState) error {
+	if ws.SnapshotKey == "" {
+		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
+	key := ws.SnapshotKey
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
 	return s.unpinState(ctx, key)
 }
-
-// ApplyDelta implements DeltaApplier: it merges the changes captured
-// in delta onto the current workspace without resetting it, so a parent that
-// moved since the fork still lands the child's work. Settlement's apply verb
-// (settlement.go, SettleApply) calls this after the overlap guard has refused
-// same-path parent changes.
-//
-// The delta payload was recorded at Capture: a git binary patch from the
-// delta's own base (the git HEAD of the state the capturing sandbox last
-// applied) to its working tree. The merge itself runs at the tree level in the
-// object database (applyDeltaScript), so a conflicting delta refuses with the
-// working tree untouched — the DeltaApplier contract — and a clean one lands
-// as unstaged working tree changes, leaving the caller's staging state alone.
-//
-// A delta with no changes is a no-op. A state captured without a base (a
-// sandbox that never applied a git state) cannot be merged and returns
-// ErrUnsupported rather than pretending: its scope settles Select-only.
-func (s *ContainerdSandbox) ApplyDelta(ctx context.Context, delta WorkspaceState) error {
-	if delta.Backend != BackendName {
-		return fmt.Errorf("containerd sandbox: cannot apply delta from backend %q", delta.Backend)
-	}
-	base, _ := delta.Data[StateKeyDeltaBase].(string)
-	patchB64, _ := delta.Data[StateKeyDeltaPatch].(string)
-	if base == "" {
-		return fmt.Errorf("containerd sandbox: delta was captured without a recorded git base, so its changes cannot be merged onto a moved workspace: %w", ErrUnsupported)
-	}
-	if patchB64 == "" {
-		return nil // clean capture: nothing to merge
-	}
-	patch, err := base64.StdEncoding.DecodeString(patchB64)
-	if err != nil {
-		return fmt.Errorf("containerd sandbox: delta patch is not valid base64: %w", err)
-	}
-	if err := s.requireBackend(ctx); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	id := s.id
-	s.mu.Unlock()
-	if id == "" {
-		return fmt.Errorf("containerd sandbox: ApplyDelta before Create")
-	}
-
-	// The patch travels through a temp file rather than an argument: delta
-	// payloads are argument-sized only for small workspaces, and WriteFile's
-	// chunked exec already handles arbitrary sizes.
-	patchPath := "/tmp/croft-delta-" + newSandboxID() + ".patch"
-	// The removal is registered before the write and runs cancel-free: a
-	// chunked WriteFile can fail partway, and a merge failure or a context
-	// expiry mid-apply leaves the caller's context done — an rm on that
-	// context would never run, so every failure would leave another
-	// source-bearing patch file in the container.
-	defer func() {
-		_, _ = s.shell(context.WithoutCancel(ctx), "rm -f -- \"$1\"", patchPath)
-	}()
-	if err := s.WriteFile(ctx, patchPath, patch, 0o600); err != nil {
-		return fmt.Errorf("containerd sandbox: stage delta patch: %w", err)
-	}
-
-	if _, err := s.execShell(ctx, nil, applyDeltaScript, patchPath, base); err != nil {
-		// execShell flattens the exit code into the error text; exit 3 is the
-		// script's conflict sentinel and names the paths in stderr.
-		return fmt.Errorf("containerd sandbox: apply delta: %w", err)
-	}
-	return nil
-}
-
-var _ DeltaApplier = (*ContainerdSandbox)(nil)
 
 // splitChain partitions a committed-layer chain at key: layers up to and
 // including key are retained (they remain ancestors of a layer prepared from
@@ -777,183 +656,15 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 	return nil, chain
 }
 
-// diffNamesMarker separates Diff's two outputs inside one staging pass, so the
-// changed-file list and the unified diff always describe the same workspace
-// state. It is safe as a delimiter because git quotes paths containing control
-// characters, so no filename can produce a bare newline-wrapped marker line.
-const diffNamesMarker = "__croft_diff_names__"
-
-// diffScript stages the working tree into a throwaway index once, then prints
-// the changed file list followed by the unified diff, separated by
-// diffNamesMarker. $1 is the baseline commit.
-//
-// One exec rather than two. Calling this twice would stage twice, and a write to
-// the workspace between the two calls would make the returned file list and diff
-// describe different states — a race the earlier mutating implementation did not
-// have, because it staged once into the real index. This keeps both the
-// single-staging consistency and the non-mutation.
-//
-// This mirrors sandbox_git.go's stagedIndex: seed the scratch from the real
-// index when one exists, so git's stat cache survives and `git add -A` only
-// hashes what changed; otherwise fall back to read-tree, because an empty index
-// would report every tracked file as newly added. The real index is only ever
-// read, never written, which is what makes Diff non-mutating.
-//
-// mktemp -d gives the scratch a 0700 directory rather than a bare file in a
-// shared temp dir, and the trap removes it even when a command fails.
-var diffScript = `set -e
-head=$1
-dir=$(mktemp -d)
-trap 'rm -rf -- "$dir"' EXIT
-export GIT_INDEX_FILE="$dir/index"
-if [ -f .git/index ]; then
-  cp -- .git/index "$GIT_INDEX_FILE"
-elif git rev-parse --verify -q HEAD >/dev/null 2>&1; then
-  git read-tree HEAD
-fi
-git add -A
-git diff --cached --name-only "$head"
-printf '\n` + diffNamesMarker + `\n'
-git diff --cached "$head"`
-
-// deltaPatchScript emits the git binary patch from $1 (the recorded delta base)
-// to the current working tree, untracked files included. Capture stores it in
-// StateKeyDeltaPatch so ApplyDelta can merge the state onto a workspace that has
-// moved since the base.
-//
-// The staging mirrors diffScript — scratch GIT_INDEX_FILE seeded from the real
-// index when one exists — for the same non-mutation and stat-cache reasons.
-// `--binary` carries binary file changes, which a plain text diff would mark
-// "Binary files differ" and drop.
-var deltaPatchScript = `set -e
-head=$1
-dir=$(mktemp -d)
-trap 'rm -rf -- "$dir"' EXIT
-export GIT_INDEX_FILE="$dir/index"
-if [ -f .git/index ]; then
-  cp -- .git/index "$GIT_INDEX_FILE"
-elif git rev-parse --verify -q HEAD >/dev/null 2>&1; then
-  git read-tree HEAD
-fi
-git add -A
-git diff --binary --cached "$head"`
-
-// applyDeltaScript merges the delta ($1 = patch file, $2 = its recorded base)
-// onto the current workspace without ever touching it on conflict.
-//
-// The merge runs at the tree level, purely in the object database:
-//
-//	theirs = the delta's content, reconstructed by applying the patch to the
-//	         recorded base (the patch's preimages are the base's blobs)
-//	ours   = the working tree as it stands, untracked included
-//	base   = the recorded base's tree
-//
-// git merge-tree --write-tree merges the three and exits nonzero on conflict,
-// having written nothing anywhere near the working tree — the refusal is
-// atomic by construction. On success the merged tree exists, and the merge is
-// materialized as a patch whose preimage is ours, i.e. exactly the working
-// tree: `git apply` (no --index, no --3way) then lands it as unstaged working
-// tree changes and cannot conflict, because the conflict was already answered.
-//
-// Exit 3 is the conflict sentinel so the caller can tell a refused merge (the
-// workspace untouched, the delta unconsumed) from an operational failure.
-// merge-tree prints the conflicted paths on stdout when it conflicts; the
-// script forwards them to stderr for the error message.
-//
-// Seeding the ours index from the real one (cp .git/index) keeps git's stat
-// cache so `git add -A` only rehashes what changed; add -A then overwrites
-// every entry from the working tree, which is what makes ours the working tree
-// rather than the index. The staged-vs-unstaged distinction is deliberately
-// flattened: the merge is content-level, and materialization through plain
-// `git apply` leaves the caller's staging state alone.
-var applyDeltaScript = `set -e
-patch=$1
-base=$2
-dir=$(mktemp -d)
-trap 'rm -rf -- "$dir"' EXIT
-export GIT_INDEX_FILE="$dir/theirs"
-git read-tree "$base"
-git apply --cached "$patch"
-theirs=$(git write-tree)
-export GIT_INDEX_FILE="$dir/ours"
-if [ -f .git/index ]; then
-  cp -- .git/index "$GIT_INDEX_FILE"
-else
-  git read-tree HEAD
-fi
-git add -A
-ours=$(git write-tree)
-unset GIT_INDEX_FILE
-basetree=$(git rev-parse "$base^{tree}")
-set +e
-merged=$(git merge-tree --write-tree --merge-base="$basetree" "$ours" "$theirs" 2>"$dir/mt.err")
-code=$?
-set -e
-if [ "$code" -eq 1 ]; then
-  printf 'conflicting paths:\n%s\n' "$merged" >&2
-  exit 3
-fi
-if [ "$code" -ne 0 ]; then
-  cat "$dir/mt.err" >&2
-  exit 1
-fi
-git diff --binary "$ours" "$merged" > "$dir/merge.patch"
-if [ -s "$dir/merge.patch" ]; then
-  git apply "$dir/merge.patch"
-fi`
-
-// Diff returns the unified diff and changed file paths between ws and the
-// current workspace, using the in-container git repository.
-//
-// Non-mutating: staging happens in a scratch GIT_INDEX_FILE (diffScript), so a
-// caller's pre-staged changes survive the call, as the Sandbox contract in
-// sandbox.go requires. This used to stage with `git add -A` and unwind with
-// `git reset`, which restored the index to HEAD rather than to the state it was
-// found in and silently dropped the caller's staged work. Fixed 2026-10-05 and
-// pinned by TestLive_DiffPreservesPreStagedChanges.
-//
-// Both outputs come from one staging pass, so they cannot describe different
-// workspace states. See diffScript; pinned by TestDiff_StagesOncePerCall.
-func (s *ContainerdSandbox) Diff(ctx context.Context, ws WorkspaceState, maxLines int) (string, []string, error) {
-	if _, err := stateSnapshotKey(ws); err != nil {
-		return "", nil, err
-	}
-	head, _ := ws.Data[StateKeyGitHead].(string)
-	if head == "" {
-		return "", nil, fmt.Errorf("containerd sandbox: diff needs a git workspace; state has no %q", StateKeyGitHead)
-	}
-
-	s.mu.Lock()
-	id := s.id
-	s.mu.Unlock()
-	if id == "" {
-		return "", nil, fmt.Errorf("containerd sandbox: Diff before Create")
-	}
-
-	res, err := s.shell(ctx, diffScript, head)
-	if err != nil {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: %w", err)
-	}
-	namesPart, full, ok := strings.Cut(res.Stdout, "\n"+diffNamesMarker+"\n")
-	if !ok {
-		return "", nil, fmt.Errorf("containerd sandbox: diff: output has no %q separator, so the "+
-			"file list and the diff cannot be told apart", diffNamesMarker)
-	}
-	var files []string
-	if trimmed := strings.TrimSpace(namesPart); trimmed != "" {
-		files = strings.Split(trimmed, "\n")
-	}
-	if maxLines > 0 {
-		lines := strings.Split(full, "\n")
-		if len(lines) > maxLines {
-			full = strings.Join(lines[:maxLines], "\n") + "\n...[diff truncated]"
-		}
-	}
-	return full, files, nil
-}
-
 // Exec runs a command inside the sandbox.
 func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResult, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.execImpl(ctx, req)
+}
+
+// execImpl is Exec's body; opMu is already held (shared).
+func (s *ContainerdSandbox) execImpl(ctx context.Context, req ExecRequest) (ExecResult, error) {
 	if err := s.requireBackend(ctx); err != nil {
 		return ExecResult{}, err
 	}
@@ -975,6 +686,13 @@ func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResu
 // the read runs in-container. The path is passed as a positional argument rather
 // than interpolated into the script so it cannot alter the command.
 func (s *ContainerdSandbox) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.readFileImpl(ctx, path)
+}
+
+// readFileImpl is ReadFile's body; opMu is already held (shared).
+func (s *ContainerdSandbox) readFileImpl(ctx context.Context, path string) ([]byte, error) {
 	if err := s.requireBackend(ctx); err != nil {
 		return nil, err
 	}
@@ -1010,6 +728,13 @@ func (s *ContainerdSandbox) ReadFile(ctx context.Context, path string) ([]byte, 
 // first exec truncates, so retrying after a partial failure cannot append to
 // stale content.
 func (s *ContainerdSandbox) WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.writeFileImpl(ctx, path, data, perm)
+}
+
+// writeFileImpl is WriteFile's body; opMu is already held (shared).
+func (s *ContainerdSandbox) writeFileImpl(ctx context.Context, path string, data []byte, perm fs.FileMode) error {
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}
@@ -1077,39 +802,10 @@ func (s *ContainerdSandbox) parentKeyLocked() string {
 	return s.rootfsKey
 }
 
-// baseGitHeadLocked returns the recorded delta base. Caller holds s.mu.
-func (s *ContainerdSandbox) baseGitHeadLocked() string { return s.baseGitHead }
-
 // restart starts a task on an existing snapshot, used to recover when a capture
 // fails midway with the task already stopped.
 func (s *ContainerdSandbox) restart(ctx context.Context, id, activeKey string) error {
 	return s.tasks.StartTask(ctx, id, activeKey)
-}
-
-// gitHead returns the workspace's git HEAD, or "" when it is not a repository.
-func (s *ContainerdSandbox) gitHead(ctx context.Context, id string) (string, error) {
-	out, err := s.run(ctx, id, "git", "rev-parse", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
-}
-
-// run executes a command with the workspace as its working directory.
-func (s *ContainerdSandbox) run(ctx context.Context, id, command string, args ...string) (string, error) {
-	res, err := s.tasks.Exec(ctx, id, ExecRequest{
-		Command: command,
-		Args:    args,
-		Cwd:     s.cfg.workdir(),
-	})
-	if err != nil {
-		return "", err
-	}
-	if res.ExitCode != 0 {
-		return res.Stdout, fmt.Errorf("%s %s: exit %d: %s",
-			command, strings.Join(args, " "), res.ExitCode, strings.TrimSpace(res.Stderr))
-	}
-	return res.Stdout, nil
 }
 
 // shell runs a POSIX shell script with positional arguments.
@@ -1159,7 +855,7 @@ func (s *ContainerdSandbox) requireBackend(ctx context.Context) error {
 	if s.backendReady() {
 		return nil
 	}
-	s.connectOnce.Do(func() { s.connectErr = s.connect(ctx) })
+	s.connectOnce.Do(func() { s.connectErr = s.connect() })
 	if s.connectErr != nil {
 		return s.connectErr
 	}
@@ -1195,29 +891,12 @@ func newSandboxID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// snapshotState encodes a committed snapshot as a backend-neutral workspace
-// state. Capture returns this shape and Apply consumes it.
+// snapshotState encodes a committed snapshot as a workspace state. Capture
+// returns this shape and Apply consumes it.
 func snapshotState(image, snapshotKey, parentKey string) WorkspaceState {
 	return WorkspaceState{
-		Backend:  BackendName,
-		Revision: snapshotKey,
-		Data: map[string]any{
-			StateKeySnapshotKey: snapshotKey,
-			StateKeyParentKey:   parentKey,
-			StateKeyImage:       image,
-		},
+		SnapshotKey: snapshotKey,
+		ParentKey:   parentKey,
+		Image:       image,
 	}
-}
-
-// stateSnapshotKey extracts the committed snapshot key from a state, rejecting
-// states produced by another backend so a git state can never be applied here.
-func stateSnapshotKey(ws WorkspaceState) (string, error) {
-	if ws.Backend != BackendName {
-		return "", fmt.Errorf("containerd sandbox: cannot use a %q workspace state", ws.Backend)
-	}
-	key, _ := ws.Data[StateKeySnapshotKey].(string)
-	if key == "" {
-		return "", fmt.Errorf("containerd sandbox: workspace state is missing %q", StateKeySnapshotKey)
-	}
-	return key, nil
 }
