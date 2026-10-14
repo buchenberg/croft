@@ -256,9 +256,12 @@ func changeMode(hdr *tar.Header) fs.FileMode {
 // The blob is unreferenced content the daemon's GC may collect at any time,
 // so the call pins it under a short-lived per-call lease (labeled
 // croft.lease:"diff", findable by a future reclaim sweep) for exactly the
-// caller's read window. drop removes the pin, best-effort deletes the blob,
-// and deletes the lease — it runs on every failure path, cancel-free, exactly
-// like Capture's unpin-on-failure branches.
+// caller's read window. drop removes the pin and deletes the lease — it runs
+// on every failure path, cancel-free, exactly like Capture's unpin-on-failure
+// branches. The blob itself is NOT deleted eagerly: concurrent calls may
+// compute the same blob (same state + workspace → same digest), and eager
+// deletion would break the other call's Read. The lease deletion unpins the
+// blob; the daemon's GC reclaims it once nothing references it.
 //
 // The lower side mounts through a View: committed snapshots refuse Mounts
 // ("not active or view: failed precondition", Task 0 finding), and the view
@@ -350,6 +353,12 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 	// Pin the blob against the daemon's GC for the caller's read window. The
 	// "content" resource type is the Task 0 spike's finding: the digest
 	// serves as the lease resource id.
+	//
+	// The blob is NOT deleted eagerly in drop: concurrent calls may compute
+	// the same blob (same state + workspace → same digest), and eager
+	// deletion would break the other call's Read. The lease deletion in
+	// drop unpins the blob; the daemon's GC reclaims it once nothing
+	// references it.
 	if mgr != nil {
 		res := leases.Resource{ID: desc.Digest.String(), Type: "content"}
 		if err := mgr.AddResource(ctx, leases.Lease{ID: leaseID}, res); err != nil {
@@ -360,7 +369,6 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 		drop = func() {
 			dctx := context.WithoutCancel(ctx)
 			_ = mgr.DeleteResource(dctx, leases.Lease{ID: leaseID}, res)
-			_ = s.diff.Delete(dctx, desc)
 			innerDrop()
 		}
 	}
@@ -692,6 +700,11 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 					if res.ExitCode != 0 {
 						c.Kind = ChangeAdd
 						continue // adds have no pre-image
+					}
+					// Directories have no content to read — they render
+					// as markers (or nothing, for modifies).
+					if c.IsDir {
+						continue
 					}
 					// Fall through to the pre-image read below.
 

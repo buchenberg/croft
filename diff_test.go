@@ -145,8 +145,10 @@ func viewKeys(snap *fakeSnapshotter) []string {
 }
 
 // TestDiffBlob_SuccessPinsAndDrops pins the full lifecycle: the blob is
-// leased, the content resource is added, and drop removes the pin, deletes
-// the blob, deletes the lease, and the view is gone.
+// leased, the content resource is added, and drop removes the pin and
+// deletes the lease (the blob itself is left for the daemon's GC — eager
+// deletion would break concurrent calls that computed the same blob).
+// The view is gone.
 func TestDiffBlob_SuccessPinsAndDrops(t *testing.T) {
 	sb, snap, fl, fds := newDiffTestSandbox(t)
 	ctx := context.Background()
@@ -199,9 +201,11 @@ func TestDiffBlob_SuccessPinsAndDrops(t *testing.T) {
 		t.Error("drop did not remove the content resource pin")
 	}
 
-	deletedBlobs := fds.deletedDigests()
-	if len(deletedBlobs) != 1 || deletedBlobs[0] != desc.Digest {
-		t.Errorf("deleted blobs = %v, want [%s]", deletedBlobs, desc.Digest)
+	// The blob is NOT deleted eagerly: concurrent calls may compute the
+	// same blob, and eager deletion would break the other call's Read.
+	// The lease deletion unpins it; the daemon's GC reclaims it.
+	if deletedBlobs := fds.deletedDigests(); len(deletedBlobs) != 0 {
+		t.Errorf("deleted blobs = %v, want none (GC reclaims the blob after the lease is gone)", deletedBlobs)
 	}
 }
 
@@ -363,9 +367,9 @@ func TestDiffBlob_CancelledContextStillDrops(t *testing.T) {
 	if !contentUnpinOn(fl, ids[0], desc.Digest.String()) {
 		t.Error("drop did not remove the content pin after cancellation")
 	}
-	deletedBlobs := fds.deletedDigests()
-	if len(deletedBlobs) != 1 || deletedBlobs[0] != desc.Digest {
-		t.Errorf("deleted blobs = %v, want [%s]: drop must delete the blob after cancellation", deletedBlobs, desc.Digest)
+	// The blob is not deleted eagerly (GC reclaims it after the lease is gone).
+	if deletedBlobs := fds.deletedDigests(); len(deletedBlobs) != 0 {
+		t.Errorf("deleted blobs = %v, want none", deletedBlobs)
 	}
 }
 
@@ -1387,10 +1391,12 @@ func TestChanges_NoDiffService(t *testing.T) {
 	}
 }
 
-// TestChanges_BlobDroppedAfterRead pins that the diff blob's lease and
-// content pin are released after Changes reads the blob — the blob's
-// lifecycle is bounded by the call.
-func TestChanges_BlobDroppedAfterRead(t *testing.T) {
+// TestChanges_BlobPinDroppedAfterRead pins that the diff blob's lease and
+// content pin are released after Changes reads the blob — the blob's pin
+// lifecycle is bounded by the call. The blob itself is not deleted eagerly
+// (concurrent calls may share it); the daemon's GC reclaims it after the
+// lease is gone.
+func TestChanges_BlobPinDroppedAfterRead(t *testing.T) {
 	sb, _, _, fl, fds := changesTestSandbox(t)
 	ctx := context.Background()
 
@@ -1422,10 +1428,11 @@ func TestChanges_BlobDroppedAfterRead(t *testing.T) {
 		t.Errorf("deleted leases = %v, want [%s]: the blob pin must be dropped after Read", deleted, ids[0])
 	}
 
-	// The blob was deleted from the content store.
-	deletedBlobs := fds.deletedDigests()
-	if len(deletedBlobs) != 1 || deletedBlobs[0] != fds.desc.Digest {
-		t.Errorf("deleted blobs = %v, want [%s]", deletedBlobs, fds.desc.Digest)
+	// The blob is NOT deleted eagerly: concurrent calls may compute the
+	// same blob, and eager deletion would break the other call's Read.
+	// The lease deletion unpins it; the daemon's GC reclaims it.
+	if deletedBlobs := fds.deletedDigests(); len(deletedBlobs) != 0 {
+		t.Errorf("deleted blobs = %v, want none (GC reclaims after the lease is gone)", deletedBlobs)
 	}
 }
 
