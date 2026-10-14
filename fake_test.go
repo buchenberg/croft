@@ -263,12 +263,15 @@ type fakeTasks struct {
 	stopped int
 
 	// catFiles maps resolved path → content for `cat -- "$1"` execs.
-	// catMissing is a set of paths cat reports as absent (exit 1).
+	// missingPaths is a set of resolved paths that do not exist in the
+	// fake's filesystem model: cat reports them absent (exit 1), and
+	// test -e reports them missing (exit 1). By default every path exists.
 	// lsDirs maps resolved dir → entry names for `ls -A1 -- "$1"` execs.
-	// These let reader-task tests assert content without a filesystem model.
-	catFiles   map[string]string
-	catMissing map[string]bool
-	lsDirs     map[string][]string
+	// These let reader-task and Changes tests assert behavior without a
+	// filesystem model.
+	catFiles     map[string]string
+	missingPaths map[string]bool
+	lsDirs       map[string][]string
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -278,13 +281,13 @@ type fakeTasks struct {
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
 	return &fakeTasks{
-		log:        log,
-		snap:       snap,
-		runErr:     map[string]error{},
-		current:    map[string]string{},
-		catFiles:   map[string]string{},
-		catMissing: map[string]bool{},
-		lsDirs:     map[string][]string{},
+		log:          log,
+		snap:         snap,
+		runErr:       map[string]error{},
+		current:      map[string]string{},
+		catFiles:     map[string]string{},
+		missingPaths: map[string]bool{},
+		lsDirs:       map[string][]string{},
 	}
 }
 
@@ -361,9 +364,10 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 	f.allReqs = append(f.allReqs, req)
 	runErr, hasRunErr := f.runErr[req.Command]
 	// Snapshot the programmable responses under the lock.
-	catContent, catOK := f.catFiles[f.shArg(req)]
-	catGone := f.catMissing[f.shArg(req)]
-	lsListing, lsOK := f.lsDirs[f.shArg(req)]
+	arg := f.shArg(req)
+	catContent, catOK := f.catFiles[arg]
+	pathGone := f.missingPaths[arg]
+	lsListing, lsOK := f.lsDirs[arg]
 	f.mu.Unlock()
 
 	if hasRunErr {
@@ -372,7 +376,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 
 	switch req.Command {
 	case "sh":
-		return f.shExec(req, catOK, catContent, catGone, lsOK, lsListing), nil
+		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing), nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
 	}
@@ -387,16 +391,16 @@ func (f *fakeTasks) shArg(req ExecRequest) string {
 	return ""
 }
 
-// shExec dispatches the programmable cat/ls responses and falls back to the
-// canned "file-contents" for everything else.
-func (f *fakeTasks) shExec(req ExecRequest, catOK bool, catContent string, catGone bool, lsOK bool, lsListing []string) ExecResult {
+// shExec dispatches the programmable cat/ls/test responses and falls back to
+// the canned "file-contents" for everything else.
+func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string) ExecResult {
 	if len(req.Args) < 2 {
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
 	switch req.Args[1] {
 	case `cat -- "$1"`:
-		if catGone {
-			return ExecResult{ExitCode: 1, Stderr: "cat: " + f.shArg(req) + ": No such file or directory"}
+		if pathGone {
+			return ExecResult{ExitCode: 1, Stderr: "cat: " + arg + ": No such file or directory"}
 		}
 		if catOK {
 			return ExecResult{ExitCode: 0, Stdout: catContent}
@@ -407,6 +411,11 @@ func (f *fakeTasks) shExec(req ExecRequest, catOK bool, catContent string, catGo
 			return ExecResult{ExitCode: 0, Stdout: strings.Join(lsListing, "\n")}
 		}
 		return ExecResult{ExitCode: 0, Stdout: ""}
+	case `test -e "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1}
+		}
+		return ExecResult{ExitCode: 0}
 	default:
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}

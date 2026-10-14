@@ -165,4 +165,14 @@ type Sandbox interface {
 
 	// WriteFile writes a file inside the sandbox workspace.
 	WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error
+
+	// Changes reports the differences between ws and the current workspace.
+	// Paths are workspace-relative, slash-separated, and sorted. Returns
+	// ErrStateUnavailable once ws's layer has been released.
+	//
+	// Changes is read-only against the workspace: it never stops or restarts
+	// the task, never commits, never writes. It takes the shared operation
+	// lock, so it cannot interleave with Capture/Apply/Destroy — it always
+	// sees a quiescent workspace.
+	Changes(ctx context.Context, ws WorkspaceState) ([]Change, error)
 }

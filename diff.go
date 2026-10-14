@@ -3,6 +3,7 @@ package croft
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -465,4 +466,109 @@ func (s *ContainerdSandbox) readDirAt(ctx context.Context, ws WorkspaceState, di
 		return nil, err
 	}
 	return names, nil
+}
+
+// Changes reports the differences between ws and the current workspace.
+//
+// It takes the shared operation lock: Capture/Apply/Destroy hold the
+// exclusive lock, so Changes always sees a quiescent workspace and its
+// reader tasks cannot be stopped mid-exec by a lifecycle op.
+func (s *ContainerdSandbox) Changes(ctx context.Context, ws WorkspaceState) ([]Change, error) {
+	s.opMu.RLock()
+	defer s.opMu.RUnlock()
+	return s.changesImpl(ctx, ws)
+}
+
+// changesImpl is Changes without the lock.
+func (s *ContainerdSandbox) changesImpl(ctx context.Context, ws WorkspaceState) ([]Change, error) {
+	if ws.SnapshotKey == "" {
+		return nil, fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
+	}
+	if err := s.requireBackend(ctx); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	id := s.id
+	active := s.activeKey
+	s.mu.Unlock()
+	if id == "" || active == "" {
+		return nil, fmt.Errorf("containerd sandbox: Changes before Create")
+	}
+
+	// Compute the daemon-side diff blob, read it, and drop the pin. drop is
+	// cancel-free, so it runs even if Read fails or the context is cancelled.
+	desc, drop, err := s.diffBlob(ctx, ws)
+	if err != nil {
+		return nil, err
+	}
+	blob, readErr := s.diff.Read(ctx, desc)
+	drop()
+	if readErr != nil {
+		return nil, fmt.Errorf("containerd sandbox: read diff blob: %w", readErr)
+	}
+
+	// Parse the blob into changes and opaque dirs.
+	changes, opaques, err := parseChangeTar(bytes.NewReader(blob), s.cfg.workdir())
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve opaque dirs (defensive .wh..wh..opq path): enumerate the state's
+	// contents and emit a ChangeDelete for each file the opaque dir hid.
+	for _, op := range opaques {
+		names, err := s.readDirAt(ctx, ws, op.path)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range names {
+			changes = append(changes, Change{
+				Path: path.Join(op.path, name),
+				Kind: ChangeDelete,
+			})
+		}
+	}
+
+	// Determine ChangeAdd vs ChangeModify: the parser reports ChangeModify
+	// for all ordinary entries (both adds and modifies arrive as ordinary
+	// tar entries). Check existence in the lower tree — a path absent from
+	// the state is an add.
+	hasModifies := false
+	for _, c := range changes {
+		if c.Kind == ChangeModify {
+			hasModifies = true
+			break
+		}
+	}
+	if hasModifies {
+		err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+			for i := range changes {
+				if changes[i].Kind != ChangeModify {
+					continue
+				}
+				resolved := s.resolve(changes[i].Path)
+				res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+					Command: "sh",
+					Args:    []string{"-c", `test -e "$1"`, "croft", resolved},
+					Cwd:     s.cfg.workdir(),
+				})
+				if err != nil {
+					return fmt.Errorf("containerd sandbox: check %s at state: %w", changes[i].Path, err)
+				}
+				if res.ExitCode != 0 {
+					changes[i].Kind = ChangeAdd
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Re-sort: opaque-dir deletes and add/modify reclassification may have
+	// changed the order.
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+
+	return changes, nil
 }

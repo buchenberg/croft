@@ -18,11 +18,14 @@ import (
 )
 
 // fakeDiffService is a programmable stand-in for the daemon-side diff
-// collaborator. It records deletions so tests can assert the blob lifecycle.
+// collaborator. It records deletions so tests can assert the blob lifecycle,
+// and serves a programmable blob from Read so Changes/Diff tests can drive
+// the parser from inline tars.
 type fakeDiffService struct {
 	mu         sync.Mutex
 	compareErr error
 	desc       ocispec.Descriptor
+	blob       []byte
 	deleted    []digest.Digest
 }
 
@@ -46,7 +49,9 @@ func (f *fakeDiffService) Compare(_ context.Context, _, _ []mount.Mount) (ocispe
 }
 
 func (f *fakeDiffService) Read(_ context.Context, _ ocispec.Descriptor) ([]byte, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.blob, nil
 }
 
 func (f *fakeDiffService) Delete(_ context.Context, desc ocispec.Descriptor) error {
@@ -935,7 +940,7 @@ func TestReadFilesAt_MissingFileFails(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 
-	tasks.catMissing["/workspace/gone.txt"] = true
+	tasks.missingPaths["/workspace/gone.txt"] = true
 
 	_, err = sb.ReadFilesAt(ctx, state, []string{"gone.txt"})
 	if err == nil || !strings.Contains(err.Error(), "read gone.txt at state") {
@@ -1138,5 +1143,338 @@ func TestReadFilesAt_ReaderSnapshotKeyShape(t *testing.T) {
 	// still has its original sequence number.
 	if !strings.Contains(state.SnapshotKey, "/committed/") {
 		t.Errorf("state snapshot key %q does not look like a committed layer", state.SnapshotKey)
+	}
+}
+
+// changesTestSandbox wires a sandbox over the fakes with a diff service,
+// ready for Changes tests. Returns the fake diff service so tests can
+// program the blob, and the fake tasks so tests can program missingPaths.
+func changesTestSandbox(t *testing.T) (*ContainerdSandbox, *fakeSnapshotter, *fakeTasks, *fakeLeases, *fakeDiffService) {
+	t.Helper()
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	tasks := newFakeTasks(log, snap)
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	fl := &fakeLeases{}
+	fds := newFakeDiffService()
+	sb := NewWithBackend(Config{Image: "example/dev:latest"}, snap, tasks, images,
+		WithLeases(fl), WithDiffService(fds))
+	return sb, snap, tasks, fl, fds
+}
+
+// TestChanges_AddModifyDelete is the load-bearing Changes test: a tar with
+// an add, a modify, and a delete produces the three kinds, with the add
+// distinguished by its absence from the lower tree.
+func TestChanges_AddModifyDelete(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob: an add, a modify, and a delete (whiteout).
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/added.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("added\n")},
+		tarEntry{name: "workspace/base-modified.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("after\n")},
+		tarEntry{name: "workspace/.wh.base-deleted.txt", mode: 0, typeflag: tar.TypeReg},
+	)
+	// added.txt does not exist in the lower tree — it is an add.
+	tasks.missingPaths["/workspace/added.txt"] = true
+
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "added.txt", Kind: ChangeAdd, Mode: 0o644, Size: 6},
+		{Path: "base-deleted.txt", Kind: ChangeDelete},
+		{Path: "base-modified.txt", Kind: ChangeModify, Mode: 0o644, Size: 6},
+	})
+}
+
+// TestChanges_ModeOnlyIsModify pins that a mode-only change (same content,
+// different mode) is ChangeModify, not ChangeAdd: the path exists in the
+// lower tree.
+func TestChanges_ModeOnlyIsModify(t *testing.T) {
+	sb, _, _, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The path exists in the lower tree (not in missingPaths), so test -e
+	// returns 0 and the change stays ChangeModify even though only the
+	// mode differs.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/modeonly.txt", mode: 0o600, typeflag: tar.TypeReg, content: []byte("same\n")},
+	)
+
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "modeonly.txt", Kind: ChangeModify, Mode: 0o600, Size: 5},
+	})
+}
+
+// TestChanges_NewDirectoryIsAdd pins that a new directory and its contents
+// are ChangeAdd (absent from the lower tree).
+func TestChanges_NewDirectoryIsAdd(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/newdir/", mode: 0o755, typeflag: tar.TypeDir},
+		tarEntry{name: "workspace/newdir/n.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("n\n")},
+	)
+	tasks.missingPaths["/workspace/newdir"] = true
+	tasks.missingPaths["/workspace/newdir/n.txt"] = true
+
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "newdir", Kind: ChangeAdd, IsDir: true, Mode: 0o755 | fs.ModeDir},
+		{Path: "newdir/n.txt", Kind: ChangeAdd, Mode: 0o644, Size: 2},
+	})
+}
+
+// TestChanges_OpaqueDirResolution pins the defensive .wh..wh..opq path:
+// the parser collects the opaque dir, Changes enumerates the state's
+// contents via readDirAt, and emits a ChangeDelete for each hidden file.
+func TestChanges_OpaqueDirResolution(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob has an opaque marker and a new file in the opaque dir.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/opaque-dir/.wh..wh..opq", mode: 0, typeflag: tar.TypeReg},
+		tarEntry{name: "workspace/opaque-dir/new.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\n")},
+	)
+	// The state's opaque-dir had two files, now hidden by the opaque marker.
+	tasks.lsDirs["/workspace/opaque-dir"] = []string{"old-a.txt", "old-b.txt"}
+	// new.txt does not exist in the lower tree — it is an add.
+	tasks.missingPaths["/workspace/opaque-dir/new.txt"] = true
+
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "opaque-dir/new.txt", Kind: ChangeAdd, Mode: 0o644, Size: 4},
+		{Path: "opaque-dir/old-a.txt", Kind: ChangeDelete},
+		{Path: "opaque-dir/old-b.txt", Kind: ChangeDelete},
+	})
+}
+
+// TestChanges_NoChanges pins that an empty diff (no entries beyond the
+// workdir root) produces an empty change list.
+func TestChanges_NoChanges(t *testing.T) {
+	sb, _, _, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob has only the workdir root — no changes.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir},
+	)
+
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Errorf("changes = %v, want empty", changes)
+	}
+}
+
+// TestChanges_BeforeCreate pins the guard: Changes before Create has no
+// active layer to diff against.
+func TestChanges_BeforeCreate(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	_, err := sb.Changes(ctx, WorkspaceState{SnapshotKey: "anything"})
+	if err == nil || !strings.Contains(err.Error(), "Changes before Create") {
+		t.Fatalf("err = %v, want a Changes-before-Create error", err)
+	}
+}
+
+// TestChanges_ReleasedStateIsUnavailable pins ErrStateUnavailable for a
+// state whose layer has been released.
+func TestChanges_ReleasedStateIsUnavailable(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	_, err := sb.Changes(ctx, WorkspaceState{SnapshotKey: "croft/ghost/committed/1"})
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("err = %v, want ErrStateUnavailable", err)
+	}
+}
+
+// TestChanges_EmptyStateKey pins the guard: a state without a snapshot key
+// is a bug, not a no-op.
+func TestChanges_EmptyStateKey(t *testing.T) {
+	sb, _, _, _, _ := changesTestSandbox(t)
+	ctx := context.Background()
+
+	_, err := sb.Changes(ctx, WorkspaceState{})
+	if err == nil || !strings.Contains(err.Error(), "no snapshot key") {
+		t.Fatalf("err = %v, want a no-snapshot-key error", err)
+	}
+}
+
+// TestChanges_NoDiffService pins the nil-collaborator error.
+func TestChanges_NoDiffService(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	_, err = sb.Changes(ctx, state)
+	if err == nil || !strings.Contains(err.Error(), "diff service not configured") {
+		t.Fatalf("err = %v, want a diff-service-not-configured error", err)
+	}
+}
+
+// TestChanges_BlobDroppedAfterRead pins that the diff blob's lease and
+// content pin are released after Changes reads the blob — the blob's
+// lifecycle is bounded by the call.
+func TestChanges_BlobDroppedAfterRead(t *testing.T) {
+	sb, _, _, fl, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/added.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("x")},
+	)
+
+	if _, err := sb.Changes(ctx, state); err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	// The diff lease was created and deleted within the call.
+	ids := diffLeaseIDs(fl)
+	if len(ids) != 1 {
+		t.Fatalf("created %d diff leases, want 1", len(ids))
+	}
+	fl.mu.Lock()
+	deleted := append([]string(nil), fl.deleted...)
+	fl.mu.Unlock()
+	if len(deleted) != 1 || deleted[0] != ids[0] {
+		t.Errorf("deleted leases = %v, want [%s]: the blob pin must be dropped after Read", deleted, ids[0])
+	}
+
+	// The blob was deleted from the content store.
+	deletedBlobs := fds.deletedDigests()
+	if len(deletedBlobs) != 1 || deletedBlobs[0] != fds.desc.Digest {
+		t.Errorf("deleted blobs = %v, want [%s]", deletedBlobs, fds.desc.Digest)
+	}
+}
+
+// TestChanges_ConcurrentWithSharedLock pins that concurrent Changes calls
+// both succeed (shared lock) and each cleans up its own blob.
+func TestChanges_ConcurrentWithSharedLock(t *testing.T) {
+	sb, _, tasks, fl, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/added.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("x")},
+	)
+	tasks.missingPaths["/workspace/added.txt"] = true
+
+	const goroutines = 4
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+	for i := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = sb.Changes(ctx, state)
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Changes from goroutine %d: %v", i, err)
+		}
+	}
+
+	// Each call created and dropped its own diff lease.
+	ids := diffLeaseIDs(fl)
+	if len(ids) != goroutines {
+		t.Errorf("created %d diff leases across %d concurrent calls, want %d", len(ids), goroutines, goroutines)
+	}
+	fl.mu.Lock()
+	deleted := len(fl.deleted)
+	fl.mu.Unlock()
+	if deleted != goroutines {
+		t.Errorf("deleted %d leases, want %d: every call must drop its blob", deleted, goroutines)
 	}
 }
