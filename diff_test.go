@@ -1,8 +1,13 @@
 package croft
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"io/fs"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -492,5 +497,331 @@ func TestDiffBlob_ConcurrentCallsGetDistinctViews(t *testing.T) {
 	// No view leaked from any goroutine.
 	if views := viewKeys(snap); len(views) != 0 {
 		t.Errorf("view snapshots leaked after concurrent diffBlob: %v", views)
+	}
+}
+
+// tarEntry describes one entry for buildTar.
+type tarEntry struct {
+	name     string
+	mode     int64
+	typeflag byte
+	linkname string
+	devmajor int64
+	devminor int64
+	content  []byte
+}
+
+// buildTar constructs an in-memory tar from entries, for parser table tests.
+func buildTar(t *testing.T, entries ...tarEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		hdr := &tar.Header{
+			Name:     e.name,
+			Mode:     e.mode,
+			Size:     int64(len(e.content)),
+			Typeflag: e.typeflag,
+			Linkname: e.linkname,
+			Devmajor: e.devmajor,
+			Devminor: e.devminor,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write tar header %s: %v", e.name, err)
+		}
+		if len(e.content) > 0 {
+			if _, err := tw.Write(e.content); err != nil {
+				t.Fatalf("write tar content %s: %v", e.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildGzippedTar constructs an in-memory gzipped tar from entries.
+func buildGzippedTar(t *testing.T, entries ...tarEntry) []byte {
+	t.Helper()
+	plain := buildTar(t, entries...)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(plain); err != nil {
+		t.Fatalf("gzip tar: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// assertChanges compares two change lists field by field.
+func assertChanges(t *testing.T, got, want []Change) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d changes, want %d:\n got: %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("change[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseChangeTar_Golden drives the parser from the Task 0 golden tar:
+// the exact change matrix the live spike captured (add, modify, delete,
+// mode-only, new dir, opaque dir via per-file whiteouts, symlink).
+func TestParseChangeTar_Golden(t *testing.T) {
+	f, err := os.Open("testdata/change-tar/live-changes.plain.tar")
+	if err != nil {
+		t.Fatalf("open golden: %v", err)
+	}
+	defer f.Close()
+
+	changes, opaques, err := parseChangeTar(f, "/workspace")
+	if err != nil {
+		t.Fatalf("parseChangeTar: %v", err)
+	}
+
+	want := []Change{
+		{Path: "added.txt", Kind: ChangeModify, Mode: 0o644, Size: 20},
+		{Path: "base-deleted.txt", Kind: ChangeDelete},
+		{Path: "base-modeonly.txt", Kind: ChangeModify, Mode: 0o600, Size: 11},
+		{Path: "base-modified.txt", Kind: ChangeModify, Mode: 0o644, Size: 6},
+		{Path: "new-dir", Kind: ChangeModify, IsDir: true, Mode: 0o755 | fs.ModeDir},
+		{Path: "new-dir/n.txt", Kind: ChangeModify, Mode: 0o644, Size: 7},
+		{Path: "opaque-dir", Kind: ChangeModify, IsDir: true, Mode: 0o755 | fs.ModeDir},
+		{Path: "opaque-dir/a.txt", Kind: ChangeDelete},
+		{Path: "opaque-dir/b.txt", Kind: ChangeDelete},
+		{Path: "opaque-dir/c.txt", Kind: ChangeModify, Mode: 0o644, Size: 9},
+		{Path: "symlink.txt", Kind: ChangeModify, Mode: 0o777 | fs.ModeSymlink},
+	}
+	assertChanges(t, changes, want)
+
+	// The golden has no .wh..wh..opq marker (Task 0 finding: per-file
+	// whiteouts instead), so the opaque list is empty.
+	if len(opaques) != 0 {
+		t.Errorf("opaque dirs = %v, want none (the differ emits per-file whiteouts)", opaques)
+	}
+}
+
+// TestParseChangeTar_GzippedSniffsMagic pins that the parser decompresses a
+// gzipped blob (Task 0 finding: the default blob is a gzipped OCI layer).
+func TestParseChangeTar_GzippedSniffsMagic(t *testing.T) {
+	blob := buildGzippedTar(t,
+		tarEntry{name: "workspace/added.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("hello\n")},
+	)
+
+	changes, _, err := parseChangeTar(bytes.NewReader(blob), "/workspace")
+	if err != nil {
+		t.Fatalf("parseChangeTar on gzipped blob: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "added.txt", Kind: ChangeModify, Mode: 0o644, Size: 6},
+	})
+}
+
+// TestParseChangeTar_Table drives the parser's classification, prefix
+// stripping, and sorting from inline tars.
+func TestParseChangeTar_Table(t *testing.T) {
+	tests := []struct {
+		name    string
+		workdir string
+		entries []tarEntry
+		want    []Change
+		opaques []string // expected opaque dir paths
+	}{
+		{
+			name:    "empty tar",
+			workdir: "/workspace",
+			entries: nil,
+			want:    nil,
+		},
+		{
+			name:    "workdir root skipped",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir},
+				{name: "workspace/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("x")},
+			},
+			want: []Change{
+				{Path: "file.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+			},
+		},
+		{
+			name:    "outside workdir skipped",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "etc/passwd", mode: 0o644, typeflag: tar.TypeReg, content: []byte("root")},
+				{name: "workspace/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("x")},
+			},
+			want: []Change{
+				{Path: "file.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+			},
+		},
+		{
+			name:    "whiteout deletes file",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/.wh.gone.txt", mode: 0, typeflag: tar.TypeReg},
+			},
+			want: []Change{
+				{Path: "gone.txt", Kind: ChangeDelete},
+			},
+		},
+		{
+			name:    "whiteout in subdirectory",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/dir/.wh.gone.txt", mode: 0, typeflag: tar.TypeReg},
+			},
+			want: []Change{
+				{Path: "dir/gone.txt", Kind: ChangeDelete},
+			},
+		},
+		{
+			name:    "char device whiteout accepted defensively",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/.wh.gone.txt", mode: 0, typeflag: tar.TypeChar, devmajor: 0, devminor: 0},
+			},
+			want: []Change{
+				{Path: "gone.txt", Kind: ChangeDelete},
+			},
+		},
+		{
+			name:    "opaque marker collected",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/dir/.wh..wh..opq", mode: 0, typeflag: tar.TypeReg},
+				{name: "workspace/dir/new.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("n")},
+			},
+			want: []Change{
+				{Path: "dir/new.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+			},
+			opaques: []string{"dir"},
+		},
+		{
+			name:    "nested workdir prefix",
+			workdir: "/home/user/ws",
+			entries: []tarEntry{
+				{name: "home/user/ws/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("x")},
+			},
+			want: []Change{
+				{Path: "file.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+			},
+		},
+		{
+			name:    "sorted by path",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/zeta.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("z")},
+				{name: "workspace/alpha.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("a")},
+				{name: "workspace/mid.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("m")},
+			},
+			want: []Change{
+				{Path: "alpha.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+				{Path: "mid.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+				{Path: "zeta.txt", Kind: ChangeModify, Mode: 0o644, Size: 1},
+			},
+		},
+		{
+			name:    "directory entry",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/newdir/", mode: 0o755, typeflag: tar.TypeDir},
+			},
+			want: []Change{
+				{Path: "newdir", Kind: ChangeModify, IsDir: true, Mode: 0o755 | fs.ModeDir},
+			},
+		},
+		{
+			name:    "symlink entry",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "target"},
+			},
+			want: []Change{
+				{Path: "link", Kind: ChangeModify, Mode: 0o777 | fs.ModeSymlink},
+			},
+		},
+		{
+			name:    "setuid bit preserved",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/suid", mode: 0o4755, typeflag: tar.TypeReg, content: []byte("x")},
+			},
+			want: []Change{
+				{Path: "suid", Kind: ChangeModify, Mode: 0o755 | fs.ModeSetuid, Size: 1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blob := buildTar(t, tt.entries...)
+			changes, opaques, err := parseChangeTar(bytes.NewReader(blob), tt.workdir)
+			if err != nil {
+				t.Fatalf("parseChangeTar: %v", err)
+			}
+			assertChanges(t, changes, tt.want)
+
+			var gotOpaques []string
+			for _, o := range opaques {
+				gotOpaques = append(gotOpaques, o.path)
+			}
+			if len(gotOpaques) != len(tt.opaques) {
+				t.Errorf("opaque dirs = %v, want %v", gotOpaques, tt.opaques)
+			} else {
+				for i := range tt.opaques {
+					if gotOpaques[i] != tt.opaques[i] {
+						t.Errorf("opaque[%d] = %q, want %q", i, gotOpaques[i], tt.opaques[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestParseChangeTar_CorruptTar pins that a truncated tar surfaces an error,
+// not a silent partial parse.
+func TestParseChangeTar_CorruptTar(t *testing.T) {
+	// A tar header claiming 100 bytes of content but providing none.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "workspace/file.txt",
+		Mode:     0o644,
+		Size:     100,
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	// Close without writing content — the tar is truncated.
+	_ = tw.Close()
+
+	_, _, err := parseChangeTar(bytes.NewReader(buf.Bytes()), "/workspace")
+	if err == nil {
+		t.Fatal("parseChangeTar on a truncated tar: want an error, got nil")
+	}
+}
+
+// TestChangeKind_String pins the labels used in logs and test output.
+func TestChangeKind_String(t *testing.T) {
+	tests := []struct {
+		kind ChangeKind
+		want string
+	}{
+		{ChangeAdd, "add"},
+		{ChangeModify, "modify"},
+		{ChangeDelete, "delete"},
+		{ChangeKind(99), "unknown"},
+	}
+	for _, tt := range tests {
+		if got := tt.kind.String(); got != tt.want {
+			t.Errorf("ChangeKind(%d).String() = %q, want %q", int(tt.kind), got, tt.want)
+		}
 	}
 }
