@@ -170,6 +170,77 @@ func TestComputeHunks_CloseChangesMerge(t *testing.T) {
 	}
 }
 
+func TestComputeHunks_ManySpreadHunksSinglePass(t *testing.T) {
+	// 50 changes spaced 10 lines apart over 500 lines: each gap (9) exceeds
+	// 2*contextLines (6), so no merging — 50 separate hunks. This exercises
+	// the running-index bucketing: the single pass must not skip steps a
+	// later hunk needs, nor carry steps from an earlier one.
+	const n, every = 500, 10
+	old := make([]string, n)
+	new := make([]string, n)
+	for i := range n {
+		old[i] = fmt.Sprintf("line %d\n", i)
+		new[i] = old[i]
+	}
+	for i := 0; i < n; i += every {
+		new[i] = fmt.Sprintf("changed %d\n", i)
+	}
+
+	steps := diffLines(old, new)
+	groups := mergeGroups(computeChangeGroups(steps))
+	hunks := computeHunks(old, new, groups, steps)
+
+	if len(hunks) != n/every {
+		t.Fatalf("hunks = %d, want %d", len(hunks), n/every)
+	}
+	for hi, h := range hunks {
+		// Each hunk: up to 3 context, one -/+ pair, up to 3 context.
+		var minus, plus, space int
+		for _, l := range h.lines {
+			switch l.prefix {
+			case '-':
+				minus++
+			case '+':
+				plus++
+			case ' ':
+				space++
+			}
+		}
+		if minus != 1 || plus != 1 {
+			t.Errorf("hunk %d: minus=%d plus=%d, want 1/1", hi, minus, plus)
+		}
+		if space == 0 {
+			t.Errorf("hunk %d: no context lines (interior matches lost?)", hi)
+		}
+		if h.oldCount != minus+space || h.newCount != plus+space {
+			t.Errorf("hunk %d: counts old=%d new=%d inconsistent with %d-%d+%d body",
+				hi, h.oldCount, h.newCount, minus, plus, space)
+		}
+	}
+}
+
+func BenchmarkComputeHunks_ManyHunks(b *testing.B) {
+	// The shape the O(H*N) rescan made quadratic: many hunks over a large
+	// file. The single-pass bucketing keeps this linear in the step count.
+	const n, every = 100000, 10
+	old := make([]string, n)
+	new := make([]string, n)
+	for i := range n {
+		old[i] = fmt.Sprintf("line %d\n", i)
+		new[i] = old[i]
+	}
+	for i := 0; i < n; i += every {
+		new[i] = fmt.Sprintf("changed %d\n", i)
+	}
+	steps := diffLines(old, new)
+	groups := mergeGroups(computeChangeGroups(steps))
+
+	b.ResetTimer()
+	for b.Loop() {
+		computeHunks(old, new, groups, steps)
+	}
+}
+
 func TestHunkHeader(t *testing.T) {
 	tests := []struct {
 		h    hunk

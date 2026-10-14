@@ -159,8 +159,13 @@ type hunk struct {
 // unchanged lines INSIDE a merged group — between two nearby changes that
 // mergeGroups joined — render as context (' '), not as deletions+insertions.
 // Without this, merged hunks are non-minimal and diverge from `git diff`.
+//
+// Steps are globally ordered and groups are sorted and non-overlapping, so a
+// single running index buckets steps into hunk spans: the whole pass is
+// O(len(steps)), not O(hunks * steps).
 func computeHunks(oldLines, newLines []string, groups []changeGroup, steps []editStep) []hunk {
 	var hunks []hunk
+	si := 0 // running index into steps
 	for _, g := range groups {
 		oldStart := g.oldStart - contextLines
 		if oldStart < 0 {
@@ -179,15 +184,20 @@ func computeHunks(oldLines, newLines []string, groups []changeGroup, steps []edi
 			newEnd = len(newLines)
 		}
 
-		// Walk the edit steps, rendering those within this hunk's span.
-		// Matches render as context, deletes as '-', inserts as '+'.
-		// Interior matches within a merged group are preserved as context.
+		// Skip steps entirely before this hunk's span.
+		for si < len(steps) && stepBeforeSpan(steps[si], oldStart, newStart) {
+			si++
+		}
+
+		// Consume steps within the span, stopping at the first step past
+		// its end. Interior matches (from a merged group) render as
+		// context, preserving the minimal edit script.
 		var hl []hunkLine
-		for _, step := range steps {
-			inOld := step.oldLine >= oldStart && step.oldLine < oldEnd
-			inNew := step.newLine >= newStart && step.newLine < newEnd
-			if !inOld && !inNew {
-				continue
+		j := si
+		for ; j < len(steps); j++ {
+			step := steps[j]
+			if stepPastSpan(step, oldEnd, newEnd) {
+				break
 			}
 			switch step.op {
 			case opMatch:
@@ -198,6 +208,7 @@ func computeHunks(oldLines, newLines []string, groups []changeGroup, steps []edi
 				hl = append(hl, hunkLine{prefix: '+', line: step.line})
 			}
 		}
+		si = j
 
 		hunks = append(hunks, hunk{
 			oldStart: oldStart,
@@ -208,6 +219,27 @@ func computeHunks(oldLines, newLines []string, groups []changeGroup, steps []edi
 		})
 	}
 	return hunks
+}
+
+// stepBeforeSpan reports whether a step lies entirely before a hunk span.
+// Matches and deletes consume old lines (compared against oldStart);
+// inserts consume new lines (compared against newStart). For matches the
+// old-side check is sufficient: match indices advance in lockstep and the
+// span starts are the group starts pulled back by the same context width.
+func stepBeforeSpan(s editStep, oldStart, newStart int) bool {
+	if s.op == opInsert {
+		return s.newLine < newStart
+	}
+	return s.oldLine < oldStart
+}
+
+// stepPastSpan reports whether a step lies at or beyond a hunk span's end.
+// Steps are ordered, so the first step past the end ends the hunk.
+func stepPastSpan(s editStep, oldEnd, newEnd int) bool {
+	if s.op == opInsert {
+		return s.newLine >= newEnd
+	}
+	return s.oldLine >= oldEnd
 }
 
 // hunkHeader renders the @@ -l,c +l,c @@ line. Line numbers are 1-based; a

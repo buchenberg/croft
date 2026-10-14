@@ -130,6 +130,7 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
 
 Croft's direct dependencies beyond the Go standard library are
 `github.com/containerd/containerd/v2` (the daemon client),
+`github.com/containerd/errdefs` (canonical daemon error kinds),
 `github.com/sergi/go-diff` (the Myers diff engine), and the
 `github.com/opencontainers/*` spec packages (`go-digest`, `image-spec`,
 `runtime-spec`). What

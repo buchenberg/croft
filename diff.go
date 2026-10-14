@@ -56,7 +56,10 @@ type Change struct {
 	Kind ChangeKind
 	// IsDir reports whether the path is a directory.
 	IsDir bool
-	// Mode is the new mode; 0 for ChangeDelete.
+	// Mode is the new mode. For ChangeDelete the permission bits stay 0,
+	// but the type bit (ModeSymlink) may be set from the state's layer so
+	// consumers can tell a deleted symlink from a deleted regular file;
+	// deleted directories are identified by IsDir.
 	Mode fs.FileMode
 	// Size is the new size in bytes; 0 for ChangeDelete and directories.
 	Size int64
