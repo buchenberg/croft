@@ -121,9 +121,37 @@ func TestLive_DiffSpike(t *testing.T) {
 	nsCtx := namespaces.WithNamespace(ctx, cfg.Namespace)
 	snapSvc := c.SnapshotService(cfg.Snapshotter)
 
-	lower, err := snapSvc.Mounts(nsCtx, state.SnapshotKey)
+	// First finding, already pinned by this spike's first run: Mounts()
+	// refuses committed snapshots ("not active or view: failed
+	// precondition"), so the state's layer mounts only through a View — a
+	// read-only preparation of the committed snapshot. The production
+	// diffBlob helper does the same: View the lower side, Mounts the active
+	// upper, Remove the view on the way out.
+	lm := c.LeasesService()
+	lease, err := lm.Create(nsCtx, leases.WithID("croft-spike-"+newSandboxID()), leases.WithLabels(map[string]string{sandboxLeaseLabel: "diff"}))
 	if err != nil {
-		t.Fatalf("lower mounts (%s): %v", state.SnapshotKey, err)
+		t.Fatalf("create lease: %v", err)
+	}
+	leaseCtx := leases.WithLease(nsCtx, lease.ID)
+	defer func() {
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer dcancel()
+		_ = lm.Delete(dctx, lease)
+	}()
+
+	viewKey := "croft-spike-view-" + newSandboxID()
+	if _, err := snapSvc.View(leaseCtx, viewKey, state.SnapshotKey); err != nil {
+		t.Fatalf("view of committed %s: %v", state.SnapshotKey, err)
+	}
+	defer func() {
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer dcancel()
+		_ = snapSvc.Remove(dctx, viewKey)
+	}()
+
+	lower, err := snapSvc.Mounts(leaseCtx, viewKey)
+	if err != nil {
+		t.Fatalf("lower mounts (view %s of committed %s): %v", viewKey, state.SnapshotKey, err)
 	}
 	upper, err := snapSvc.Mounts(nsCtx, active)
 	if err != nil {
@@ -140,19 +168,6 @@ func TestLive_DiffSpike(t *testing.T) {
 	}
 	mustMounts("lower", lower)
 	mustMounts("upper", upper)
-
-	// Pin the diff blob under a per-call lease for the duration of the read.
-	lm := c.LeasesService()
-	lease, err := lm.Create(nsCtx, leases.WithID("croft-spike-"+newSandboxID()), leases.WithLabels(map[string]string{sandboxLeaseLabel: "diff"}))
-	if err != nil {
-		t.Fatalf("create lease: %v", err)
-	}
-	leaseCtx := leases.WithLease(nsCtx, lease.ID)
-	defer func() {
-		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-		defer dcancel()
-		_ = lm.Delete(dctx, lease)
-	}()
 
 	desc, err := c.DiffService().Compare(leaseCtx, lower, upper)
 	if err != nil {
