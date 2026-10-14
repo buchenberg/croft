@@ -6,10 +6,10 @@ the sequencing and integration layer; each phase's task-level detail lives in
 its own plan, and this roadmap carries only the decisions that cross plan
 boundaries.
 
-| Phase | Plan | Ships in |
-|---|---|---|
-| 1 — Lean core | [lean-clean-break.md](lean-clean-break.md) | croft v0.4.0 |
-| 2 — Snapshot-native diff | [snapshot-native-diff.md](snapshot-native-diff.md) | croft v0.4.0 |
+| Phase | Plan | Ships in | Status |
+|---|---|---|---|
+| 1 — Lean core | [lean-clean-break.md](lean-clean-break.md) | croft v0.4.0 | landed (PR #4) |
+| 2 — Snapshot-native diff | [snapshot-native-diff.md](snapshot-native-diff.md) | croft v0.4.0 | landed (branch `phase2/snapshot-native-diff`) |
 | 3 — Snapshot-native delta | [snapshot-native-delta.md](snapshot-native-delta.md) | croft v0.4.0 |
 | 4 — Exec I/O | [exec-io.md](exec-io.md) | croft v0.5.0 |
 | 5 — Network policy | [network-policy.md](network-policy.md) | croft v0.6.0 |

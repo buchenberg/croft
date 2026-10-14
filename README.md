@@ -20,6 +20,8 @@ ReadFile,
 WriteFile    work the workspace through the boundary
 Capture      commit the active layer, pin it as a state, continue on a fresh layer
 Apply        resume this (or any) sandbox from a captured state
+Changes      list the differences between a state and the current workspace
+Diff         render those differences as a unified text diff
 ReleaseState drop a state's pin; the daemon's GC reclaims the layer
 Destroy      stop the task, remove the active layer; committed states survive
 ```
@@ -41,6 +43,30 @@ The properties, honestly:
   captures of identical content are distinct states. Identity, not content
   equality; croft has no digest, and a host that wants a record identity
   hashes the three-field struct itself.
+
+## Diffing states
+
+Two states can be compared without applying either. `Changes` returns the
+sorted difference between a captured state and the current workspace as a
+`[]Change` (add / modify / delete, with mode and size); `Diff` renders that
+difference as a unified text diff — `---`/`+++` headers, `@@` hunks, binary
+files as "Binary files … differ", mode-only changes as `old mode`/`new mode`
+pairs, symlinks as target lines. Both are read-only: they never stop or
+restart the task, never commit, never write.
+
+```go
+state, _ := sb.Capture(ctx)
+// ... work happens ...
+changes, _ := sb.Changes(ctx, state)  // what differs?
+text, _ := sb.Diff(ctx, state)        // unified diff, for display
+files, _ := sb.ReadFilesAt(ctx, state, []string{"config.yaml"}) // pre-images
+```
+
+`ReadFilesAt` is a concrete method on `ContainerdSandbox` (not on the
+`Sandbox` interface): it reads files from a state's committed layer without
+applying it, via a throwaway reader task. A state whose layer has been
+released makes `Changes`, `Diff`, and `ReadFilesAt` return
+`ErrStateUnavailable`.
 
 ## Quick start
 
@@ -64,7 +90,9 @@ The workspace's file operations shell out inside the container, so the image
 must provide a shell (`/bin/sh` — also the keep-alive command's default) and
 the small coreutils croft itself uses: `mkdir` (Create provisions the
 workdir), and `cat`, `dirname`, `printf`, `base64`, and `chmod` (ReadFile and
-WriteFile). BusyBox and coreutils both carry all of them.
+WriteFile). The diff machinery adds `ls` and `readlink` (reader tasks read
+pre-images, enumerate directories, and resolve symlink targets from a
+captured state). BusyBox and coreutils both carry all of them.
 
 ## Scale envelope
 
@@ -100,7 +128,12 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
   go test -count=1 -v -run TestLive_ ./...
 ```
 
-Croft has no dependencies beyond containerd and the Go standard library. What
+Croft's direct dependencies beyond the Go standard library are
+`github.com/containerd/containerd/v2` (the daemon client),
+`github.com/containerd/errdefs` (canonical daemon error kinds),
+`github.com/sergi/go-diff` (the Myers diff engine), and the
+`github.com/opencontainers/*` spec packages (`go-digest`, `image-spec`,
+`runtime-spec`). What
 the live suite verifies — and how to run it against a real daemon — is in
 [docs/verification.md](docs/verification.md); how the pieces fit together is
 in [docs/overview.md](docs/overview.md).

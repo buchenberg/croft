@@ -9,6 +9,11 @@
 // same sandbox or a fresh one — or hand to another sandbox entirely, which is
 // the fork primitive: states outlive the sandboxes that capture them.
 //
+// Two states can be compared without applying either: Changes reports the
+// sorted difference between a captured state and the current workspace as a
+// []Change, and Diff renders that difference as a unified text diff. Both are
+// read-only against the workspace and never stop or restart the task.
+//
 // # Design constraints
 //
 // Each of these contradicts a naive implementation, so read them before
@@ -46,22 +51,28 @@
 // The workspace's file operations shell out inside the container, so the
 // image must provide a shell and the small coreutils croft itself uses:
 // mkdir (Create provisions the workdir), and cat, dirname, printf,
-// base64, and chmod (ReadFile and WriteFile).
+// base64, and chmod (ReadFile and WriteFile). The diff machinery adds
+// ls and readlink: reader tasks use them to read pre-images, enumerate
+// directories, and resolve symlink targets from a captured state.
 //
 // # Status
 //
-// The snapshot lifecycle, teardown ordering, layer pruning, and file I/O are
-// implemented and unit-tested against containerd's real
-// snapshots.Snapshotter interface, using an in-memory fake that enforces the
-// same invariants as the overlayfs snapshotter: a key cannot be prepared twice,
-// a parent must be committed, only an active layer can be committed (exactly
-// once — an already committed layer is rejected), a committed layer is
-// read-only, and a layer with children cannot be removed.
+// The snapshot lifecycle, teardown ordering, layer pruning, file I/O, and the
+// snapshot-native diff machinery (Changes, Diff, ReadFilesAt) are implemented
+// and unit-tested against containerd's real snapshots.Snapshotter interface,
+// using an in-memory fake that enforces the same invariants as the overlayfs
+// snapshotter: a key cannot be prepared twice, a parent must be committed,
+// only an active layer can be committed (exactly once — an already committed
+// layer is rejected), a committed layer is read-only, and a layer with
+// children cannot be removed.
 //
 // The daemon adapter (client.go) compiles but has not been exercised on every
 // supported daemon configuration; the live test suite runs it against a real
-// containerd when one is reachable. Treat container and OCI spec construction
-// and the exec round-trip as verified only where the live suite has run.
+// containerd when one is reachable. The live suite covers the full lifecycle
+// and the diff path end to end (Changes, Diff, ReadFilesAt against a real
+// daemon-side diff service). Treat container and OCI spec construction, the
+// exec round-trip, and the daemon-side diff service as verified only where
+// the live suite has run.
 //
 // # Lifecycle
 //
@@ -86,6 +97,18 @@
 // namespace teardown — in that order of specificity. Destroy deliberately does
 // not remove committed layers: every one was returned to a caller as a state,
 // and a sibling sandbox may be running on a child of the same layer.
+//
+// # Diffing states
+//
+// Changes and Diff compare a captured state against the current workspace
+// without applying either side. The daemon's diff service computes the
+// change-set blob daemon-side; croft pins it under a short-lived per-call
+// lease, parses the tar into a sorted []Change, and — for Diff — reads
+// pre-images through a throwaway reader task and renders a unified text
+// diff with a Myers diff engine. Both operations take the shared operation
+// lock: they never interleave with Capture/Apply/Destroy, so they always see
+// a quiescent workspace. A state whose layer has been released surfaces
+// ErrStateUnavailable.
 package croft
 
 import (
@@ -165,4 +188,22 @@ type Sandbox interface {
 
 	// WriteFile writes a file inside the sandbox workspace.
 	WriteFile(ctx context.Context, path string, data []byte, perm fs.FileMode) error
+
+	// Changes reports the differences between ws and the current workspace.
+	// Paths are workspace-relative, slash-separated, and sorted. Returns
+	// ErrStateUnavailable once ws's layer has been released.
+	//
+	// Changes is read-only against the workspace: it never stops or restarts
+	// the task, never commits, never writes. It takes the shared operation
+	// lock, so it cannot interleave with Capture/Apply/Destroy — it always
+	// sees a quiescent workspace.
+	Changes(ctx context.Context, ws WorkspaceState) ([]Change, error)
+
+	// Diff returns a unified text diff between ws and the current
+	// workspace. Binary files render as "Binary files ... differ"; mode-only
+	// changes as "old mode"/"new mode" pairs; symlinks as target lines.
+	// Returns ErrStateUnavailable once ws's layer has been released.
+	//
+	// Like Changes, Diff is read-only and takes the shared operation lock.
+	Diff(ctx context.Context, ws WorkspaceState) (string, error)
 }

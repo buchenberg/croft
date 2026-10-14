@@ -88,6 +88,7 @@ func (s *ContainerdSandbox) connect() error {
 	s.leases = c.LeasesService()
 	s.images = images
 	s.tasks = &containerdTasks{client: c, ns: ns, cfg: s.cfg, images: images}
+	s.diff = &containerdDiff{client: c, ns: ns}
 	return nil
 }
 
@@ -310,6 +311,10 @@ func (n namespaceSnapshotter) Mounts(ctx context.Context, key string) ([]mount.M
 	return n.Snapshotter.Mounts(n.ctx(ctx), key)
 }
 
+func (n namespaceSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	return n.Snapshotter.View(n.ctx(ctx), key, parent, opts...)
+}
+
 // containerdImages resolves an image reference to the snapshot key holding its
 // unpacked rootfs.
 //
@@ -373,6 +378,45 @@ func (i *containerdImages) image(ctx context.Context, ref string) (containerd.Im
 
 // containerdTasks manages one sandbox's containers and commands.
 //
+// containerdDiff adapts the client's diff service to the sandbox's
+// diffService, wrapping every context with the configured namespace the same
+// way the other collaborators do. Compare runs daemon-side over the caller's
+// mount sets; Read fetches the produced blob from the daemon's content
+// store. The blob itself is not pinned here — callers lease it for the
+// duration (Task 0's finding: unpinned content is collectable).
+type containerdDiff struct {
+	client *containerd.Client
+	ns     string
+}
+
+func (d *containerdDiff) Compare(ctx context.Context, lower, upper []mount.Mount) (v1.Descriptor, error) {
+	return d.client.DiffService().Compare(namespaces.WithNamespace(ctx, d.ns), lower, upper)
+}
+
+func (d *containerdDiff) Read(ctx context.Context, desc v1.Descriptor) ([]byte, error) {
+	ctx = namespaces.WithNamespace(ctx, d.ns)
+	store := d.client.ContentStore()
+	ra, err := store.ReaderAt(ctx, desc)
+	if err != nil {
+		return nil, fmt.Errorf("containerd sandbox: read diff blob %s: %w", desc.Digest, err)
+	}
+	defer ra.Close()
+	b, err := io.ReadAll(io.NewSectionReader(ra, 0, ra.Size()))
+	if err != nil {
+		return nil, fmt.Errorf("containerd sandbox: read diff blob %s: %w", desc.Digest, err)
+	}
+	return b, nil
+}
+
+func (d *containerdDiff) Delete(ctx context.Context, desc v1.Descriptor) error {
+	ctx = namespaces.WithNamespace(ctx, d.ns)
+	err := d.client.ContentStore().Delete(ctx, desc.Digest)
+	if err != nil && errdefs.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 // Each StartTask creates a *new* container generation, because a container's
 // rootfs snapshot is fixed at creation and Capture/Apply change it. Previous
 // generations are found through the sandbox label rather than an in-process map,
@@ -520,6 +564,17 @@ func withNumericUser(user string) oci.SpecOpts {
 
 // StartTask creates and starts a container generation rooted at snapshotKey.
 func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string) error {
+	return t.startTask(ctx, id, snapshotKey, t.initArgs())
+}
+
+// StartReaderTask starts a reader task with the inert sleep init, never the
+// configured InitArgs — an initializer must not run on (and possibly rewrite)
+// a snapshot whose whole purpose is to serve pre-images.
+func (t *containerdTasks) StartReaderTask(ctx context.Context, id, snapshotKey string) error {
+	return t.startTask(ctx, id, snapshotKey, []string{"/bin/sh", "-c", "sleep infinity"})
+}
+
+func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string, initArgs []string) error {
 	ctx = t.ctx(ctx)
 
 	img, err := t.images.image(ctx, t.cfg.Image)
@@ -531,7 +586,7 @@ func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string)
 	if err != nil {
 		return err
 	}
-	specOpts = append(specOpts, oci.WithProcessArgs(t.initArgs()...))
+	specOpts = append(specOpts, oci.WithProcessArgs(initArgs...))
 
 	containerID := generationID(id, snapshotKey)
 	opts := []containerd.NewContainerOpts{

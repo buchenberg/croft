@@ -9,6 +9,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/errdefs"
 )
 
 // opLog records the order of lifecycle operations. The ordering is the thing
@@ -109,7 +110,7 @@ func (f *fakeSnapshotter) Prepare(_ context.Context, key, parent string, _ ...sn
 	if parent != "" {
 		p, ok := f.ls[parent]
 		if !ok {
-			return nil, fmt.Errorf("prepare %s: parent %s not found", key, parent)
+			return nil, fmt.Errorf("prepare %s: parent %s: %w", key, parent, errdefs.ErrNotFound)
 		}
 		if p.kind != snapshots.KindCommitted {
 			// The real snapshotter cannot stack an active layer as a parent.
@@ -122,7 +123,24 @@ func (f *fakeSnapshotter) Prepare(_ context.Context, key, parent string, _ ...sn
 }
 
 func (f *fakeSnapshotter) View(_ context.Context, key, parent string, _ ...snapshots.Opt) ([]mount.Mount, error) {
-	return f.Mounts(context.Background(), parent)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.ls[key]; exists {
+		return nil, fmt.Errorf("view %s: snapshot already exists", key)
+	}
+	p, ok := f.ls[parent]
+	if !ok {
+		return nil, fmt.Errorf("snapshot %s: %w", parent, errdefs.ErrNotFound)
+	}
+	if p.kind != snapshots.KindCommitted {
+		return nil, fmt.Errorf("view %s: parent %s is not committed", key, parent)
+	}
+	// Writable in the fake: the write check enforces the lifecycle invariant
+	// (a task on a committed layer is a bug), not view read-only-ness. The
+	// reader task's cat/ls are reads; the fake does not distinguish.
+	f.ls[key] = &fakeLayer{kind: snapshots.KindView, parent: parent, writable: true}
+	f.log.add("view:%s<-%s", key, parent)
+	return []mount.Mount{{Type: "overlay", Source: "overlay", Target: "/mnt/" + key}}, nil
 }
 
 func (f *fakeSnapshotter) Commit(_ context.Context, name, key string, _ ...snapshots.Opt) error {
@@ -237,10 +255,42 @@ type fakeTasks struct {
 	// chunked WriteFile can be asserted on as a sequence rather than only by its
 	// last call.
 	allReqs []ExecRequest
-	// current is the layer the running task is rooted at, "" when stopped.
-	current string
+	// current maps task id → snapshot key for running tasks. A map, not a
+	// single slot: the reader tasks (ReadFilesAt, readDirAt) run concurrently
+	// with the main task, and StopTask(id) must stop only the named task.
+	current map[string]string
 	started int
 	stopped int
+
+	// catFiles maps resolved path → content for main-task `cat -- "$1"`
+	// execs (ReadFile tests, and the proof test that Diff's post-images come
+	// from the tar, not the workspace).
+	// preFiles maps resolved path → content for reader-task `cat -- "$1"`
+	// execs (pre-images in Diff and ReadFilesAt). Separate from catFiles so
+	// tests can give a file different old and new content.
+	// missingPaths is a set of resolved paths that do not exist in the
+	// fake's filesystem model: cat reports them absent (exit 1), and
+	// test -e reports them missing (exit 1). By default every path exists.
+	// lsDirs maps resolved dir → entry names for `ls -A1 -- "$1"` execs.
+	// modes maps resolved path → symbolic mode string (e.g. "-rw-r--r--")
+	// for `ls -ld -- "$1"` execs (mode-only change rendering in Diff).
+	// readlinkTargets maps resolved path → symlink target for main-task
+	// `readlink -- "$1"` execs (post-image symlink targets in Diff).
+	// preReadlinkTargets maps resolved path → symlink target for reader-task
+	// `readlink -- "$1"` execs (pre-image symlink targets in Diff).
+	// symlinks and dirs are sets of resolved paths for `test -L`/`test -d`
+	// execs (delete-type classification in Diff).
+	// These let reader-task, Changes, and Diff tests assert behavior without
+	// a filesystem model.
+	catFiles           map[string]string
+	preFiles           map[string]string
+	missingPaths       map[string]bool
+	lsDirs             map[string][]string
+	modes              map[string]string
+	readlinkTargets    map[string]string
+	preReadlinkTargets map[string]string
+	symlinks           map[string]bool
+	dirs               map[string]bool
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -249,32 +299,53 @@ type fakeTasks struct {
 }
 
 func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
-	return &fakeTasks{log: log, snap: snap, runErr: map[string]error{}}
+	return &fakeTasks{
+		log:                log,
+		snap:               snap,
+		runErr:             map[string]error{},
+		current:            map[string]string{},
+		catFiles:           map[string]string{},
+		preFiles:           map[string]string{},
+		missingPaths:       map[string]bool{},
+		lsDirs:             map[string][]string{},
+		modes:              map[string]string{},
+		readlinkTargets:    map[string]string{},
+		preReadlinkTargets: map[string]string{},
+		symlinks:           map[string]bool{},
+		dirs:               map[string]bool{},
+	}
 }
 
 func (f *fakeTasks) StartTask(_ context.Context, id, snapshotKey string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.current != "" {
-		return fmt.Errorf("start %s: task already running on %s", id, f.current)
+	if _, exists := f.current[id]; exists {
+		return fmt.Errorf("start %s: task already running on %s", id, f.current[id])
 	}
 	if !f.snap.has(snapshotKey) {
 		return fmt.Errorf("start %s: snapshot %s not found", id, snapshotKey)
 	}
-	f.current = snapshotKey
+	f.current[id] = snapshotKey
 	f.started++
 	f.log.add("start:%s", snapshotKey)
 	return nil
 }
 
+// StartReaderTask delegates to StartTask: the fake does not model init
+// commands, so inert-vs-configured makes no difference here.
+func (f *fakeTasks) StartReaderTask(ctx context.Context, id, snapshotKey string) error {
+	return f.StartTask(ctx, id, snapshotKey)
+}
+
 func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.current == "" {
+	key, exists := f.current[id]
+	if !exists {
 		return nil // idempotent
 	}
-	f.log.add("stop:%s", f.current)
-	f.current = ""
+	f.log.add("stop:%s", key)
+	delete(f.current, id)
 	f.stopped++
 	return nil
 }
@@ -284,38 +355,147 @@ func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 func (f *fakeTasks) isRunning() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.current != ""
+	return len(f.current) > 0
+}
+
+// snapshotFor returns the snapshot key the named task is rooted at, or ""
+// when no task with that id is running.
+func (f *fakeTasks) snapshotFor(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.current[id]
+}
+
+// runningIDs returns the ids of all running tasks.
+func (f *fakeTasks) runningIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.current))
+	for id := range f.current {
+		out = append(out, id)
+	}
+	return out
 }
 
 func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecResult, error) {
 	f.mu.Lock()
-	if f.current == "" {
+	current, ok := f.current[id]
+	if !ok {
 		f.mu.Unlock()
 		return ExecResult{}, fmt.Errorf("exec: no running task for %s", id)
 	}
 	// A command writes into the layer the task is rooted at. If Capture committed
 	// that layer without stopping the task, this fails.
-	if err := f.snap.write(f.current); err != nil {
+	if err := f.snap.write(current); err != nil {
 		f.mu.Unlock()
 		return ExecResult{}, err
 	}
 	f.lastReq = req
 	f.lastStdin = req.Stdin
 	f.allReqs = append(f.allReqs, req)
-	current := f.current
 	runErr, hasRunErr := f.runErr[req.Command]
+	// Snapshot the programmable responses under the lock. Reader tasks
+	// (id contains "-reader-") serve pre-images from preFiles and see
+	// missingPaths; the main task serves post-images from catFiles and
+	// always sees paths as present (the current workspace is the source
+	// of truth for post-images).
+	arg := f.shArg(req)
+	isReader := strings.Contains(id, "-reader-")
+	catContent, catOK := f.catFiles[arg]
+	if isReader {
+		catContent, catOK = f.preFiles[arg]
+	}
+	pathGone := f.missingPaths[arg] && isReader
+	lsListing, lsOK := f.lsDirs[arg]
+	modeStr, modeOK := f.modes[arg]
+	linkTarget, linkOK := f.readlinkTargets[arg]
+	if isReader {
+		linkTarget, linkOK = f.preReadlinkTargets[arg]
+	}
+	isSymlink := f.symlinks[arg]
+	isDir := f.dirs[arg]
 	f.mu.Unlock()
 
 	if hasRunErr {
 		return ExecResult{ExitCode: 1, Stderr: runErr.Error()}, nil
 	}
-	_ = current
 
 	switch req.Command {
 	case "sh":
-		return ExecResult{ExitCode: 0, Stdout: "file-contents"}, nil
+		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing, modeOK, modeStr, linkOK, linkTarget, isSymlink, isDir), nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
+	}
+}
+
+// shArg extracts $1 from a `sh -c script croft arg` request, or "".
+func (f *fakeTasks) shArg(req ExecRequest) string {
+	// Args: ["-c", script, "croft", arg1, ...]
+	if len(req.Args) >= 4 {
+		return req.Args[3]
+	}
+	return ""
+}
+
+// shExec dispatches the programmable cat/ls/test/mode/readlink responses and
+// falls back to the canned "file-contents" for everything else.
+func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string, modeOK bool, modeStr string, linkOK bool, linkTarget string, isSymlink bool, isDir bool) ExecResult {
+	if len(req.Args) < 2 {
+		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
+	}
+	switch req.Args[1] {
+	case `cat -- "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1, Stderr: "cat: " + arg + ": No such file or directory"}
+		}
+		if catOK {
+			return ExecResult{ExitCode: 0, Stdout: catContent}
+		}
+		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
+	case `ls -A1 -- "$1"`:
+		if lsOK {
+			return ExecResult{ExitCode: 0, Stdout: strings.Join(lsListing, "\n")}
+		}
+		return ExecResult{ExitCode: 0, Stdout: ""}
+	case `ls -ld -- "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1, Stderr: "ls: cannot access " + arg + ": No such file or directory"}
+		}
+		if modeOK {
+			return ExecResult{ExitCode: 0, Stdout: modeStr + " 1 0 0 0 Jan  1 00:00 " + arg + "\n"}
+		}
+		return ExecResult{ExitCode: 0, Stdout: "-rw-r--r-- 1 0 0 0 Jan  1 00:00 " + arg + "\n"}
+	case `test -e "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1}
+		}
+		return ExecResult{ExitCode: 0}
+	case `test -e "$1" || test -L "$1"`:
+		// Exists or is a symlink (even dangling) → not an add.
+		if pathGone && !isSymlink {
+			return ExecResult{ExitCode: 1}
+		}
+		return ExecResult{ExitCode: 0}
+	case `test -L "$1"`:
+		if isSymlink {
+			return ExecResult{ExitCode: 0}
+		}
+		return ExecResult{ExitCode: 1}
+	case `test -d "$1"`:
+		if isDir {
+			return ExecResult{ExitCode: 0}
+		}
+		return ExecResult{ExitCode: 1}
+	case `readlink -- "$1"`:
+		if pathGone {
+			return ExecResult{ExitCode: 1, Stderr: "readlink: " + arg + ": No such file or directory"}
+		}
+		if linkOK {
+			return ExecResult{ExitCode: 0, Stdout: linkTarget + "\n"}
+		}
+		return ExecResult{ExitCode: 0, Stdout: "target\n"}
+	default:
+		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
 }
 

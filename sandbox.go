@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 
 	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // sandboxLeaseLabel marks leases this adapter owns.
@@ -43,6 +45,12 @@ const (
 // connected — the operation is supported, the daemon connection is what
 // failed, so reporting anything else would be false.
 var ErrNotImplemented = errors.New("containerd sandbox: not implemented")
+
+// ErrStateUnavailable is returned when a WorkspaceState's snapshot layer has
+// been released: the state's pin is gone and the daemon's garbage collector
+// may reclaim (or already has reclaimed) the layer. Retrying with a fresh
+// Capture is the only recovery.
+var ErrStateUnavailable = errors.New("croft: state is no longer available")
 
 // Config configures the containerd backend.
 type Config struct {
@@ -111,7 +119,14 @@ func (c Config) workdir() string {
 // thing the caller needs to pass.
 type taskService interface {
 	// StartTask creates and starts task id, rooted at the snapshot key.
+	// The init process runs Config.InitArgs (or the inert sleep default).
 	StartTask(ctx context.Context, id, snapshotKey string) error
+	// StartReaderTask creates and starts a throwaway reader task. The init
+	// process is ALWAYS the inert sleep default, never Config.InitArgs —
+	// a configured initializer could rewrite files on the reader's writable
+	// snapshot before the pre-image read, or repeat external side effects
+	// during Changes/Diff/ReadFilesAt.
+	StartReaderTask(ctx context.Context, id, snapshotKey string) error
 	// StopTask stops and deletes task id. It must be idempotent so Destroy and
 	// Capture are safe to retry.
 	StopTask(ctx context.Context, id string) error
@@ -123,6 +138,29 @@ type taskService interface {
 // unpacked rootfs, pulling and unpacking when necessary.
 type imageService interface {
 	RootfsSnapshot(ctx context.Context, ref string) (string, error)
+}
+
+// diffService is the daemon-side diff half of containerd this sandbox needs:
+// it compares two mount sets and returns the produced change-set blob.
+//
+// Compare runs daemon-side — the client never mounts anything — and returns a
+// descriptor for content the daemon wrote to its own content store. Read
+// returns those bytes; the descriptor's digest also serves as the lease
+// resource id for pinning the blob against the daemon's garbage collector
+// (the "content" resource type, per the Task 0 spike).
+type diffService interface {
+	// Compare computes the change set between lower and upper mounts and
+	// returns the descriptor of the produced blob.
+	Compare(ctx context.Context, lower, upper []mount.Mount) (ocispec.Descriptor, error)
+
+	// Read returns the bytes of a blob Compare produced. Callers pin the
+	// blob for the duration (the daemon's GC may collect unpinned content).
+	Read(ctx context.Context, desc ocispec.Descriptor) ([]byte, error)
+
+	// Delete removes a blob Compare produced from the daemon's content
+	// store. Best-effort: a blob already collected by the daemon's GC is
+	// success.
+	Delete(ctx context.Context, desc ocispec.Descriptor) error
 }
 
 // ContainerdSandbox is a workspace backed by containerd.
@@ -172,6 +210,13 @@ type ContainerdSandbox struct {
 	// (Create, Destroy, Capture, Apply), shared for workspace operations
 	// (Exec, ReadFile, WriteFile, ReleaseState). See the struct doc.
 	opMu sync.RWMutex
+
+	// diff compares snapshot layers daemon-side. Nil until connect wires
+	// the real adapter, and nil forever on a NewWithBackend sandbox built
+	// without WithDiffService — the change-set operations report that as a
+	// configuration error, the same fail-loud convention as a nil lease
+	// manager.
+	diff diffService
 	// leases is the daemon's lease manager. Nil when the collaborators were
 	// substituted (tests): a fake snapshotter has no garbage collector to hold
 	// anything back from, so there is nothing to lease.
@@ -205,6 +250,14 @@ type ContainerdSandbox struct {
 	committedChain []string
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
+	// diffSeq orders diff-view snapshot keys within this sandbox. Separate
+	// from seq: state identity is sequence-derived, and diff views must not
+	// move the capture sequence.
+	diffSeq uint64
+	// readSeq orders reader snapshot keys within this sandbox. Separate from
+	// seq for the same reason: reader snapshots are throwaway and must not
+	// move the capture sequence.
+	readSeq uint64
 }
 
 // The compile-time assertion is load-bearing: if Sandbox gains or
@@ -243,6 +296,15 @@ type BackendOption func(*ContainerdSandbox)
 // durable (see NewWithBackend).
 func WithLeases(mgr leases.Manager) BackendOption {
 	return func(s *ContainerdSandbox) { s.leases = mgr }
+}
+
+// WithDiffService supplies the daemon-side diff collaborator for hosts
+// embedding the sandbox over an existing containerd client — pass the
+// sandbox's own adapter or an equivalent namespace-wrapped
+// client.DiffService(). Without it, a NewWithBackend sandbox has no
+// change-set operations.
+func WithDiffService(ds diffService) BackendOption {
+	return func(s *ContainerdSandbox) { s.diff = ds }
 }
 
 // ID returns the current container identity, or "" before Create. It changes

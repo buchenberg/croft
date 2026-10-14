@@ -9,6 +9,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/containerd/containerd/v2/core/mount"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // opVerbs strips keys from an op log, so assertions are about operation ordering
@@ -662,6 +665,12 @@ func (f *startTaskFailsOnce) StartTask(ctx context.Context, id, key string) erro
 	return f.taskService.StartTask(ctx, id, key)
 }
 
+// StartReaderTask passes through without consuming the fail flag: the
+// wrapper exists to break a roll-forward restart, not reader tasks.
+func (f *startTaskFailsOnce) StartReaderTask(ctx context.Context, id, key string) error {
+	return f.taskService.StartReaderTask(ctx, id, key)
+}
+
 // TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers pins the failure
 // path after Prepare succeeds: the prepared successor must be removed (Destroy
 // would otherwise leak it — it removes only the current activeKey), the task
@@ -678,7 +687,7 @@ func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 	before := len(snap.keys())
-	onActive := tasks.current
+	onActive := tasks.snapshotFor(sb.id)
 
 	// Break exactly the roll-forward's StartTask; the recovery restart must
 	// go through the same fake and succeed.
@@ -687,9 +696,9 @@ func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
 	if err := sb.Apply(ctx, state); err == nil {
 		t.Fatal("Apply succeeded although the successor task could not start")
 	}
-	if tasks.current != onActive {
+	if got := tasks.snapshotFor(sb.id); got != onActive {
 		t.Fatalf("after the failed Apply the task runs on %q, want the old active %q: "+
-			"the sandbox must recover in place, not stay stopped", tasks.current, onActive)
+			"the sandbox must recover in place, not stay stopped", got, onActive)
 	}
 	if len(snap.keys()) != before {
 		t.Errorf("snapshot count = %d after the failed Apply, want %d: the prepared successor must not leak",
@@ -773,5 +782,32 @@ func TestWorkspaceOpDelaysLifecycle(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("Capture did not complete after the shared holder released")
 		}
+	}
+}
+
+// stubDiff stands in for the daemon-side diff collaborator in wiring tests.
+type stubDiff struct{}
+
+func (stubDiff) Compare(_ context.Context, lower, upper []mount.Mount) (ocispec.Descriptor, error) {
+	return ocispec.Descriptor{}, nil
+}
+
+func (stubDiff) Read(_ context.Context, _ ocispec.Descriptor) ([]byte, error) { return nil, nil }
+
+func (stubDiff) Delete(_ context.Context, _ ocispec.Descriptor) error { return nil }
+
+// TestWithDiffServiceWiresTheCollaborator pins the option's contract: a
+// NewWithBackend sandbox has no diff service unless the option supplies one,
+// and the option supplies exactly the collaborator it is given. The
+// change-set operations' nil check rides on this.
+func TestWithDiffServiceWiresTheCollaborator(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	if sb.diff != nil {
+		t.Error("a NewWithBackend sandbox built without WithDiffService must have no diff service")
+	}
+
+	wired := NewWithBackend(Config{Image: "example/dev:latest"}, nil, nil, nil, WithDiffService(stubDiff{}))
+	if wired.diff == nil {
+		t.Error("WithDiffService must wire the diff collaborator")
 	}
 }

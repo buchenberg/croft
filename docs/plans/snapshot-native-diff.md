@@ -35,6 +35,11 @@ OCI layer blob into the content store. Key properties:
   its own snapshot storage, so the *client* never mounts anything. Unprivileged
   and remote-daemon operation survive (the property `FIFODir` exists to
   protect; sandbox.go `FIFODir` doc).
+- **Task 0 finding: committed snapshots cannot be mounted directly** —
+  `Mounts()` refuses them ("not active or view: failed precondition"). The
+  blob helper prepares a `View` of the state's layer, mounts that, and
+  removes it cancel-free on the way out. Active snapshots (the upper side)
+  mount directly.
 - Mounting the **active** snapshot a second time while the task runs on it is
   a read-only overlay multi-mount — safe on overlayfs. Other snapshotters are
   out of scope (same caveat as commit semantics, sandbox.go `Snapshotter` doc).
@@ -50,12 +55,31 @@ short-lived per-call lease and drops it on the way out (Part 3, Task 2).
 
 - Added/modified: ordinary tar entries; path, mode, and size come from the
   header.
+- **Task 0 finding: the blob is a gzipped OCI layer**
+  (`application/vnd.oci.image.layer.v1.tar+gzip`), not a plain tar. The
+  reader sniffs the gzip magic and decompresses, whatever media type the
+  daemon chose. The blob is also **timestamp-nondeterministic** — the upper
+  files' wall-clock mtimes ride in the headers, so identical change sets
+  digest differently; nothing downstream (caching, identity) may key on it.
 - Deleted: whiteout entries for files present in `lower` and absent in
   `upper` — so `Delete` is accurate without consulting the old tree.
-- Opaque directories (`rm -rf` + recreate): the blob carries an opaque-dir
-  marker but not the *old* directory's file list. Resolving it into
-  deletions-plus-additions needs one enumeration from the ws side — supplied
-  by the reader task (1.3).
+  **Task 0 finding: the form is `.wh.`-prefixed regular files** (mode 0,
+  size 0, mtime 0 — AUFS-style), not char devices. The parser accepts both
+  forms defensively.
+- Opaque directories (`rm -rf` + recreate): **Task 0 finding: the walking
+  differ emits per-file whiteouts for the old contents**
+  (`opaque-dir/.wh.a.txt`, `opaque-dir/.wh.b.txt`) plus the new files — no
+  opaque marker appeared. The `.wh..wh..opq` marker and its reader-task
+  enumeration are handled defensively but are not the expected path on this
+  differ.
+- **Task 0 findings on shape:** entries arrive prefixed with the
+  in-container workdir (`workspace/...`) and in walk order, not sorted — the
+  parser strips the `Config.Workdir` prefix, skips the workdir-root entry
+  itself (its metadata is croft's provisioning, not user data), and sorts
+  the change list by path. Mode-only changes are reported with unchanged
+  content, so `Diff`'s content-identical filter compares content *and*
+  mode. Symlink targets ride in the tar `Linkname` field. No PAX records
+  were observed from this differ.
 - **Known walker heuristic, resolved deliberately:** the walk compares mode +
   size + mtime, so `touch`-only changes report as Modified with identical
   content. `Changes` keeps walker truth and documents the caveat; `Diff`
@@ -84,7 +108,9 @@ The old `Diff` returned git-formatted text. Post-lean nothing consumes patch
 format (delta machinery is gone), so the renderer targets plain `diff -u`
 style: `---`/`+++` headers (`/dev/null` for adds/deletes), no timestamps,
 3 context lines, `\ No newline at end of file`, hunks from a hand-rolled
-Myers line diff (~150 LOC — README:106 keeps the zero-dependency rule).
+Myers line diff via `github.com/sergi/go-diff` (loosened 2026-10-14: the
+zero-dependency rule was relaxed for the diff engine — go-diff is small,
+battle-tested, and saves the O(N·M) DP table on large files).
 Non-UTF8 or oversized bodies render as a `Binary files ... differ` line.
 `maxLines` truncation keeps its existing semantics (sandbox.go:946-950,
 `...[diff truncated]`).
@@ -154,9 +180,16 @@ goldens, not off memory of containerd internals.
   to whatever Task 0 found.
 - Wire it in `connect` (client.go:86-93 block) with namespace injection;
   add `WithDiffService` option; document the nil-collaborator error.
-- Extend the test fake to a `fakeDiffService` that computes the change set
-  from the fake snapshotter's in-memory trees and emits a tar in the golden
-  format.
+- The test fake: **discovery while implementing (2026-10-14) — the fake
+  snapshotter has no filesystem model** (layers are `{kind, parent,
+  writable, writes}` and the fake's exec answers canned strings), so the
+  original "compute from the fake's in-memory trees" is impossible as
+  written. The fake becomes a programmable file tree instead: croft's
+  WriteFile records into it, `cat` serves from it, and tests drive
+  deletions/mode changes/symlinks through small fake helpers; the
+  `fakeDiffService` walks two recorded trees and emits a tar in the golden
+  format. Real differ semantics stay live-tested — the fake pins croft's
+  orchestration, not the daemon's walker.
 
 ### Task 2 — Blob lifecycle
 - `diffBlob(ctx, ws) (descriptor, drop func(), error)`: mount both sides
@@ -211,10 +244,10 @@ goldens, not off memory of containerd internals.
   empty after the call).
 
 ### Task 6 — `Diff` renderer (droppable milestone)
-- `textdiff.go`: Myers line diff + unified renderer (context 3,
-  `/dev/null` headers, no timestamps, `\ No newline` handling, binary/
-  oversize line via `maxDiffInlineBytes` constant — promote to `Config`
-  only if a host asks).
+- `textdiff.go`: Myers line diff (via `github.com/sergi/go-diff`) +
+  unified renderer (context 3, `/dev/null` headers, no timestamps,
+  `\ No newline` handling, binary/oversize line via `maxDiffInlineBytes`
+  constant — promote to `Config` only if a host asks).
 - Flow: `Changes` → partition → pre-images via `ReadFilesAt(ws, ...)`,
   post-images via one-exec-per-`cat` against the current task (plain
   `tasks.Exec`, no second container) → filter content-identical modifies →

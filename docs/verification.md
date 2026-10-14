@@ -30,6 +30,12 @@ the fakes cannot reach everything a real daemon does:
   against the daemon itself (the fakes have no namespaces).
 - **Exec semantics.** Streams are separated, exit codes surface without
   errors, duration is populated, and stdin is refused rather than blocked.
+- **Snapshot-native diff.** `Changes` reports the full change matrix (add,
+  modify, delete, mode-only, new directory, opaque directory, symlink)
+  through the production API against a real daemon-side diff service;
+  `Diff` renders a unified text diff; `ReadFilesAt` reads pre-images from a
+  captured state; and a released state surfaces `ErrStateUnavailable`
+  (`TestLive_Changes*`, `TestLive_Diff*`, `TestLive_ReadFilesAt`).
 
 ## Running the live suite
 
