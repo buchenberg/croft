@@ -108,7 +108,9 @@ The old `Diff` returned git-formatted text. Post-lean nothing consumes patch
 format (delta machinery is gone), so the renderer targets plain `diff -u`
 style: `---`/`+++` headers (`/dev/null` for adds/deletes), no timestamps,
 3 context lines, `\ No newline at end of file`, hunks from a hand-rolled
-Myers line diff (~150 LOC — README:106 keeps the zero-dependency rule).
+Myers line diff via `github.com/sergi/go-diff` (loosened 2026-10-14: the
+zero-dependency rule was relaxed for the diff engine — go-diff is small,
+battle-tested, and saves the O(N·M) DP table on large files).
 Non-UTF8 or oversized bodies render as a `Binary files ... differ` line.
 `maxLines` truncation keeps its existing semantics (sandbox.go:946-950,
 `...[diff truncated]`).
@@ -242,10 +244,10 @@ goldens, not off memory of containerd internals.
   empty after the call).
 
 ### Task 6 — `Diff` renderer (droppable milestone)
-- `textdiff.go`: Myers line diff + unified renderer (context 3,
-  `/dev/null` headers, no timestamps, `\ No newline` handling, binary/
-  oversize line via `maxDiffInlineBytes` constant — promote to `Config`
-  only if a host asks).
+- `textdiff.go`: Myers line diff (via `github.com/sergi/go-diff`) +
+  unified renderer (context 3, `/dev/null` headers, no timestamps,
+  `\ No newline` handling, binary/oversize line via `maxDiffInlineBytes`
+  constant — promote to `Config` only if a host asks).
 - Flow: `Changes` → partition → pre-images via `ReadFilesAt(ws, ...)`,
   post-images via one-exec-per-`cat` against the current task (plain
   `tasks.Exec`, no second container) → filter content-identical modifies →

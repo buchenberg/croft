@@ -105,7 +105,7 @@
 // change-set blob daemon-side; croft pins it under a short-lived per-call
 // lease, parses the tar into a sorted []Change, and — for Diff — reads
 // pre-images through a throwaway reader task and renders a unified text
-// diff with a stdlib-only engine. Both operations take the shared operation
+// diff with a Myers diff engine. Both operations take the shared operation
 // lock: they never interleave with Capture/Apply/Destroy, so they always see
 // a quiescent workspace. A state whose layer has been released surfaces
 // ErrStateUnavailable.

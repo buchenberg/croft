@@ -2,6 +2,7 @@ package croft
 
 import (
 	"bytes"
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
@@ -37,7 +38,10 @@ func TestDiffLines_Modify(t *testing.T) {
 	new := []string{"a\n", "X\n", "c\n"}
 	steps := diffLines(old, new)
 
-	// Expect: match a, delete b, insert X, match c.
+	// A shortest edit script: match a, delete b, insert X, match c.
+	// (Myers may emit insert-before-delete; both are valid shortest scripts.
+	// The hunk layer groups consecutive non-match steps, so order within a
+	// group does not matter.)
 	want := []diffOp{opMatch, opDelete, opInsert, opMatch}
 	if len(steps) != len(want) {
 		t.Fatalf("steps = %v, want %d steps", steps, len(want))
@@ -45,6 +49,54 @@ func TestDiffLines_Modify(t *testing.T) {
 	for i, w := range want {
 		if steps[i].op != w {
 			t.Errorf("step[%d].op = %v, want %v", i, steps[i].op, w)
+		}
+	}
+}
+
+// TestDiffLines_LargeFile verifies the Myers engine on a larger input:
+// 500 lines with a few scattered changes. This exercises the O(ND) path
+// that the LCS DP would handle at O(N·M) cost.
+func TestDiffLines_LargeFile(t *testing.T) {
+	const n = 500
+	old := make([]string, n)
+	new := make([]string, n)
+	for i := range n {
+		old[i] = fmt.Sprintf("line %d\n", i)
+		new[i] = old[i]
+	}
+	// Three scattered changes: modify line 10, delete line 250, modify line 499.
+	new[10] = "line 10 changed\n"
+	new[250] = "" // will be removed by building a shorter slice
+	// Rebuild new without line 250.
+	new = append(new[:250], new[251:]...)
+	new[len(new)-1] = "line 499 changed\n"
+
+	steps := diffLines(old, new)
+
+	// Verify the edit script is consistent: applying it to old yields new.
+	var got []string
+	oldIdx := 0
+	for _, s := range steps {
+		switch s.op {
+		case opMatch, opDelete:
+			if s.line != old[oldIdx] {
+				t.Fatalf("step %v: line %q != old[%d] %q", s.op, s.line, oldIdx, old[oldIdx])
+			}
+			oldIdx++
+		}
+		switch s.op {
+		case opMatch:
+			got = append(got, s.line)
+		case opInsert:
+			got = append(got, s.line)
+		}
+	}
+	if len(got) != len(new) {
+		t.Fatalf("reconstructed %d lines, want %d", len(got), len(new))
+	}
+	for i := range new {
+		if got[i] != new[i] {
+			t.Fatalf("reconstructed[%d] = %q, want %q", i, got[i], new[i])
 		}
 	}
 }

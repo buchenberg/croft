@@ -128,7 +128,10 @@ sudo env CROFT_CONTAINERD_ADDR=/run/containerd/containerd.sock \
   go test -count=1 -v -run TestLive_ ./...
 ```
 
-Croft has no dependencies beyond containerd and the Go standard library. What
+Croft's only dependencies beyond containerd and the Go standard library
+are `github.com/sergi/go-diff` (the Myers diff engine) and
+`github.com/opencontainers/go-digest` (OCI digest types, pulled in by
+containerd). What
 the live suite verifies — and how to run it against a real daemon — is in
 [docs/verification.md](docs/verification.md); how the pieces fit together is
 in [docs/overview.md](docs/overview.md).

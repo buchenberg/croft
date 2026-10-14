@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io/fs"
 	"strings"
+
+	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// This file is the stdlib-only text diff engine: an LCS-based edit script,
-// hunk grouping with context, and a unified-diff renderer. No external
-// dependencies — go-diff is deliberately not added.
+// This file is the text diff engine: a Myers O(ND) edit script (via
+// github.com/sergi/go-diff), hunk grouping with context, and a unified-diff
+// renderer.
 
 // contextLines is the number of unchanged lines shown around each change
 // group in a unified diff hunk.
@@ -32,54 +34,47 @@ type editStep struct {
 	line    string // the line content (with trailing newline, if any)
 }
 
-// diffLines computes the edit script between a and b using LCS dynamic
-// programming. For small files (the common case for code changes), O(N*M)
-// is fine; the Myers O(ND) algorithm would be faster for large files with
-// few changes, but the DP approach is simpler and correct.
+// diffLines computes the edit script between a and b using the Myers O(ND)
+// algorithm (via github.com/sergi/go-diff). The lines are joined, encoded
+// line-to-char for O(ND) performance on the encoded text, diffed, and
+// decoded back to line-level diffs. The result is a shortest edit script:
+// a sequence of match/delete/insert steps.
 func diffLines(a, b []string) []editStep {
-	m, n := len(a), len(b)
-	if m == 0 && n == 0 {
+	if len(a) == 0 && len(b) == 0 {
 		return nil
 	}
 
-	// dp[i][j] = LCS length of a[:i] and b[:j].
-	dp := make([][]int, m+1)
-	for i := range dp {
-		dp[i] = make([]int, n+1)
-	}
-	for i := 1; i <= m; i++ {
-		for j := 1; j <= n; j++ {
-			if a[i-1] == b[j-1] {
-				dp[i][j] = dp[i-1][j-1] + 1
-			} else if dp[i-1][j] >= dp[i][j-1] {
-				dp[i][j] = dp[i-1][j]
-			} else {
-				dp[i][j] = dp[i][j-1]
+	dmp := diffmatchpatch.New()
+
+	// Join lines (each already carries its trailing newline, if any).
+	textA := strings.Join(a, "")
+	textB := strings.Join(b, "")
+
+	// Line-to-char encoding: each unique line becomes one rune, so the
+	// char-level Myers diff runs at line granularity in O(ND) where N and D
+	// are line counts, not byte counts.
+	charsA, charsB, lineArray := dmp.DiffLinesToChars(textA, textB)
+	diffs := dmp.DiffMain(charsA, charsB, false)
+	diffs = dmp.DiffCharsToLines(diffs, lineArray)
+
+	// Convert to edit steps, tracking line indices.
+	var steps []editStep
+	oldIdx, newIdx := 0, 0
+	for _, d := range diffs {
+		for _, line := range splitLines([]byte(d.Text)) {
+			switch d.Type {
+			case diffmatchpatch.DiffEqual:
+				steps = append(steps, editStep{op: opMatch, oldLine: oldIdx, newLine: newIdx, line: line})
+				oldIdx++
+				newIdx++
+			case diffmatchpatch.DiffDelete:
+				steps = append(steps, editStep{op: opDelete, oldLine: oldIdx, newLine: -1, line: line})
+				oldIdx++
+			case diffmatchpatch.DiffInsert:
+				steps = append(steps, editStep{op: opInsert, oldLine: -1, newLine: newIdx, line: line})
+				newIdx++
 			}
 		}
-	}
-
-	// Backtrack from (m, n) to (0, 0), building the script backwards.
-	var steps []editStep
-	i, j := m, n
-	for i > 0 || j > 0 {
-		switch {
-		case i > 0 && j > 0 && a[i-1] == b[j-1]:
-			steps = append(steps, editStep{op: opMatch, oldLine: i - 1, newLine: j - 1, line: a[i-1]})
-			i--
-			j--
-		case j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]):
-			steps = append(steps, editStep{op: opInsert, oldLine: -1, newLine: j - 1, line: b[j-1]})
-			j--
-		default:
-			steps = append(steps, editStep{op: opDelete, oldLine: i - 1, newLine: -1, line: a[i-1]})
-			i--
-		}
-	}
-
-	// Reverse: the backtrack built the script in reverse order.
-	for i, j := 0, len(steps)-1; i < j; i, j = i+1, j-1 {
-		steps[i], steps[j] = steps[j], steps[i]
 	}
 	return steps
 }
