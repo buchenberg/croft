@@ -220,10 +220,21 @@ func TestRenderUnified_Identical(t *testing.T) {
 	}
 }
 
-func TestRenderUnified_EmptyToEmpty(t *testing.T) {
+func TestRenderUnified_EmptyAdd(t *testing.T) {
+	// An add of an empty file: headers with a 0-line hunk.
 	got := renderUnified("empty.txt", nil, nil, true, false)
-	if got != "" {
-		t.Errorf("renderUnified empty-to-empty = %q, want empty", got)
+	want := "--- /dev/null\n+++ b/empty.txt\n@@ -0,0 +0,0 @@\n"
+	if got != want {
+		t.Errorf("renderUnified empty add:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestRenderUnified_EmptyDelete(t *testing.T) {
+	// A delete of an empty file: headers with a 0-line hunk.
+	got := renderUnified("empty.txt", nil, nil, false, true)
+	want := "--- a/empty.txt\n+++ /dev/null\n@@ -0,0 +0,0 @@\n"
+	if got != want {
+		t.Errorf("renderUnified empty delete:\n got: %q\nwant: %q", got, want)
 	}
 }
 

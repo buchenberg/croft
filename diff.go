@@ -591,9 +591,22 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 		return "", err
 	}
 
+	// Determine the type of each ChangeDelete in the lower tree. Whiteouts
+	// carry no type information (Change.Mode is 0 for deletes), so without
+	// this a deleted symlink would render its target's content (cat follows
+	// the link) and a deleted directory would fail the pre-image read (cat
+	// on a directory errors). One reader task, two test execs per delete.
+	if err := s.classifyDeletes(ctx, ws, changes); err != nil {
+		return "", err
+	}
+
 	// Collect pre-image paths: ChangeModify and ChangeDelete need pre-images.
+	// Directories have no content to read — they render as markers.
 	var prePaths []string
 	for _, c := range changes {
+		if c.IsDir {
+			continue
+		}
 		if c.Kind == ChangeModify || c.Kind == ChangeDelete {
 			prePaths = append(prePaths, c.Path)
 		}
@@ -617,6 +630,61 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 	}
 
 	return out.String(), nil
+}
+
+// classifyDeletes determines the type of each ChangeDelete in the lower
+// tree, setting IsDir and the ModeSymlink type bit on the change so
+// renderChange can route correctly. Directories render as markers; symlinks
+// render as target lines. Without this, a deleted symlink would render its
+// target's content and a deleted directory would fail the pre-image read.
+func (s *ContainerdSandbox) classifyDeletes(ctx context.Context, ws WorkspaceState, changes []Change) error {
+	hasDeletes := false
+	for _, c := range changes {
+		if c.Kind == ChangeDelete {
+			hasDeletes = true
+			break
+		}
+	}
+	if !hasDeletes {
+		return nil
+	}
+
+	return s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
+		for i := range changes {
+			if changes[i].Kind != ChangeDelete {
+				continue
+			}
+			resolved := s.resolve(changes[i].Path)
+
+			// Symlink? Render as a target line.
+			res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+				Command: "sh",
+				Args:    []string{"-c", `test -L "$1"`, "croft", resolved},
+				Cwd:     s.cfg.workdir(),
+			})
+			if err != nil {
+				return fmt.Errorf("containerd sandbox: classify %s at state: %w", changes[i].Path, err)
+			}
+			if res.ExitCode == 0 {
+				changes[i].Mode |= fs.ModeSymlink
+				continue
+			}
+
+			// Directory? Render as a marker, skip the pre-image read.
+			res, err = s.tasks.Exec(ctx, readerID, ExecRequest{
+				Command: "sh",
+				Args:    []string{"-c", `test -d "$1"`, "croft", resolved},
+				Cwd:     s.cfg.workdir(),
+			})
+			if err != nil {
+				return fmt.Errorf("containerd sandbox: classify %s at state: %w", changes[i].Path, err)
+			}
+			if res.ExitCode == 0 {
+				changes[i].IsDir = true
+			}
+		}
+		return nil
+	})
 }
 
 // renderChange renders one change's diff section.
@@ -731,9 +799,16 @@ func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *string
 		}
 	}
 
-	out.WriteString(renderUnified(c.Path,
-		[]byte(oldTarget+"\n"), []byte(newTarget+"\n"),
-		isAdd, isDelete))
+	// Build the content slices: a side with no target (delete has no new
+	// side, add has no old side) is nil, not a single empty line.
+	var oldContent, newContent []byte
+	if oldTarget != "" {
+		oldContent = []byte(oldTarget + "\n")
+	}
+	if newTarget != "" {
+		newContent = []byte(newTarget + "\n")
+	}
+	out.WriteString(renderUnified(c.Path, oldContent, newContent, isAdd, isDelete))
 	return nil
 }
 

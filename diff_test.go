@@ -1851,3 +1851,137 @@ func TestDiff_MultiFile(t *testing.T) {
 		t.Errorf("Diff multi-file:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+// TestDiff_DeletedSymlinkRendersTarget pins that a deleted symlink renders
+// its target as a one-line deletion, not its target file's content. Without
+// delete-type classification, cat would follow the link and the diff would
+// show the wrong content.
+func TestDiff_DeletedSymlinkRendersTarget(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob: a whiteout for a symlink.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/.wh.link", mode: 0, typeflag: tar.TypeReg},
+	)
+	// The deleted path was a symlink (classifyDeletes sets ModeSymlink).
+	tasks.symlinks["/workspace/link"] = true
+	// Its target in the state's layer.
+	tasks.preReadlinkTargets["/workspace/link"] = "oldtarget"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/link
++++ /dev/null
+@@ -1 +0,0 @@
+-oldtarget
+`
+	if got != want {
+		t.Errorf("Diff deleted symlink:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_DeletedDirectoryRendersMarker pins that a deleted directory
+// renders as a marker, not a failure. Without delete-type classification,
+// the pre-image read would cat the directory and fail.
+func TestDiff_DeletedDirectoryRendersMarker(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob: a whiteout for a directory.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/.wh.olddir", mode: 0, typeflag: tar.TypeReg},
+	)
+	// The deleted path was a directory (classifyDeletes sets IsDir).
+	tasks.dirs["/workspace/olddir"] = true
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "deleted directory: olddir\n"
+	if got != want {
+		t.Errorf("Diff deleted directory:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_EmptyFileAdd pins that an add of an empty file renders headers
+// with a 0-line hunk, not silence.
+func TestDiff_EmptyFileAdd(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The blob: an empty file (size 0).
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/empty.txt", mode: 0o644, typeflag: tar.TypeReg, content: nil},
+	)
+	tasks.missingPaths["/workspace/empty.txt"] = true // absent from lower → ChangeAdd
+	tasks.catFiles["/workspace/empty.txt"] = ""       // post-image is empty
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "--- /dev/null\n+++ b/empty.txt\n@@ -0,0 +0,0 @@\n"
+	if got != want {
+		t.Errorf("Diff empty add:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_NoNewlineMarker pins the \ No newline at end of file marker.
+func TestDiff_NoNewlineMarker(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/f.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new")},
+	)
+	tasks.preFiles["/workspace/f.txt"] = "old" // no trailing newline
+	tasks.catFiles["/workspace/f.txt"] = "new" // no trailing newline
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	if !strings.Contains(got, "\\ No newline at end of file") {
+		t.Errorf("Diff: missing \\ No newline marker in %q", got)
+	}
+}

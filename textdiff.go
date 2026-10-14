@@ -272,11 +272,43 @@ func renderUnified(path string, oldContent, newContent []byte, isAdd, isDelete b
 	steps := diffLines(oldLines, newLines)
 	groups := mergeGroups(computeChangeGroups(steps))
 	hunks := computeHunks(oldLines, newLines, groups)
+
 	if len(hunks) == 0 {
-		return ""
+		// No line-level changes. For an add or delete of an empty file, the
+		// headers still appear with a 0-line hunk; for identical content,
+		// nothing is emitted (the caller should not have called us).
+		if !isAdd && !isDelete {
+			return ""
+		}
+		if len(oldLines) > 0 || len(newLines) > 0 {
+			return "" // changes but no hunks: shouldn't happen
+		}
+		var out strings.Builder
+		writeUnifiedHeaders(&out, path, isAdd, isDelete)
+		out.WriteString("@@ -0,0 +0,0 @@\n")
+		return out.String()
 	}
 
 	var out strings.Builder
+	writeUnifiedHeaders(&out, path, isAdd, isDelete)
+	for _, h := range hunks {
+		out.WriteString(hunkHeader(h))
+		out.WriteByte('\n')
+		for _, hl := range h.lines {
+			out.WriteByte(hl.prefix)
+			out.WriteString(hl.line)
+			if !strings.HasSuffix(hl.line, "\n") {
+				// The unified-diff convention: a line without a trailing
+				// newline is followed by the marker line.
+				out.WriteString("\n\\ No newline at end of file\n")
+			}
+		}
+	}
+	return out.String()
+}
+
+// writeUnifiedHeaders writes the ---/+++ header pair.
+func writeUnifiedHeaders(out *strings.Builder, path string, isAdd, isDelete bool) {
 	if isAdd {
 		out.WriteString("--- /dev/null\n")
 	} else {
@@ -287,18 +319,6 @@ func renderUnified(path string, oldContent, newContent []byte, isAdd, isDelete b
 	} else {
 		out.WriteString("+++ b/" + path + "\n")
 	}
-	for _, h := range hunks {
-		out.WriteString(hunkHeader(h))
-		out.WriteByte('\n')
-		for _, hl := range h.lines {
-			out.WriteByte(hl.prefix)
-			out.WriteString(hl.line)
-			if !strings.HasSuffix(hl.line, "\n") {
-				out.WriteByte('\n')
-			}
-		}
-	}
-	return out.String()
 }
 
 // parseSymbolicMode converts an ls -l symbolic mode string (e.g.

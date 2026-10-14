@@ -277,6 +277,8 @@ type fakeTasks struct {
 	// `readlink -- "$1"` execs (post-image symlink targets in Diff).
 	// preReadlinkTargets maps resolved path → symlink target for reader-task
 	// `readlink -- "$1"` execs (pre-image symlink targets in Diff).
+	// symlinks and dirs are sets of resolved paths for `test -L`/`test -d`
+	// execs (delete-type classification in Diff).
 	// These let reader-task, Changes, and Diff tests assert behavior without
 	// a filesystem model.
 	catFiles           map[string]string
@@ -286,6 +288,8 @@ type fakeTasks struct {
 	modes              map[string]string
 	readlinkTargets    map[string]string
 	preReadlinkTargets map[string]string
+	symlinks           map[string]bool
+	dirs               map[string]bool
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -306,6 +310,8 @@ func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
 		modes:              map[string]string{},
 		readlinkTargets:    map[string]string{},
 		preReadlinkTargets: map[string]string{},
+		symlinks:           map[string]bool{},
+		dirs:               map[string]bool{},
 	}
 }
 
@@ -399,6 +405,8 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 	if isReader {
 		linkTarget, linkOK = f.preReadlinkTargets[arg]
 	}
+	isSymlink := f.symlinks[arg]
+	isDir := f.dirs[arg]
 	f.mu.Unlock()
 
 	if hasRunErr {
@@ -407,7 +415,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 
 	switch req.Command {
 	case "sh":
-		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing, modeOK, modeStr, linkOK, linkTarget), nil
+		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing, modeOK, modeStr, linkOK, linkTarget, isSymlink, isDir), nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
 	}
@@ -424,7 +432,7 @@ func (f *fakeTasks) shArg(req ExecRequest) string {
 
 // shExec dispatches the programmable cat/ls/test/mode/readlink responses and
 // falls back to the canned "file-contents" for everything else.
-func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string, modeOK bool, modeStr string, linkOK bool, linkTarget string) ExecResult {
+func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string, modeOK bool, modeStr string, linkOK bool, linkTarget string, isSymlink bool, isDir bool) ExecResult {
 	if len(req.Args) < 2 {
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
@@ -455,6 +463,16 @@ func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent s
 			return ExecResult{ExitCode: 1}
 		}
 		return ExecResult{ExitCode: 0}
+	case `test -L "$1"`:
+		if isSymlink {
+			return ExecResult{ExitCode: 0}
+		}
+		return ExecResult{ExitCode: 1}
+	case `test -d "$1"`:
+		if isDir {
+			return ExecResult{ExitCode: 0}
+		}
+		return ExecResult{ExitCode: 1}
 	case `readlink -- "$1"`:
 		if pathGone {
 			return ExecResult{ExitCode: 1, Stderr: "readlink: " + arg + ": No such file or directory"}
