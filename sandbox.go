@@ -119,7 +119,14 @@ func (c Config) workdir() string {
 // thing the caller needs to pass.
 type taskService interface {
 	// StartTask creates and starts task id, rooted at the snapshot key.
+	// The init process runs Config.InitArgs (or the inert sleep default).
 	StartTask(ctx context.Context, id, snapshotKey string) error
+	// StartReaderTask creates and starts a throwaway reader task. The init
+	// process is ALWAYS the inert sleep default, never Config.InitArgs —
+	// a configured initializer could rewrite files on the reader's writable
+	// snapshot before the pre-image read, or repeat external side effects
+	// during Changes/Diff/ReadFilesAt.
+	StartReaderTask(ctx context.Context, id, snapshotKey string) error
 	// StopTask stops and deletes task id. It must be idempotent so Destroy and
 	// Capture are safe to retry.
 	StopTask(ctx context.Context, id string) error

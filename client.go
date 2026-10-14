@@ -564,6 +564,17 @@ func withNumericUser(user string) oci.SpecOpts {
 
 // StartTask creates and starts a container generation rooted at snapshotKey.
 func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string) error {
+	return t.startTask(ctx, id, snapshotKey, t.initArgs())
+}
+
+// StartReaderTask starts a reader task with the inert sleep init, never the
+// configured InitArgs — an initializer must not run on (and possibly rewrite)
+// a snapshot whose whole purpose is to serve pre-images.
+func (t *containerdTasks) StartReaderTask(ctx context.Context, id, snapshotKey string) error {
+	return t.startTask(ctx, id, snapshotKey, []string{"/bin/sh", "-c", "sleep infinity"})
+}
+
+func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string, initArgs []string) error {
 	ctx = t.ctx(ctx)
 
 	img, err := t.images.image(ctx, t.cfg.Image)
@@ -575,7 +586,7 @@ func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string)
 	if err != nil {
 		return err
 	}
-	specOpts = append(specOpts, oci.WithProcessArgs(t.initArgs()...))
+	specOpts = append(specOpts, oci.WithProcessArgs(initArgs...))
 
 	containerID := generationID(id, snapshotKey)
 	opts := []containerd.NewContainerOpts{

@@ -1678,6 +1678,9 @@ func TestDiff_SymlinkModify(t *testing.T) {
 	)
 	// Old target (state, reader task). New target comes from the tar's
 	// Linkname (captured during parsing), not from the workspace.
+	// The old side must also be a symlink for the reader task's test -L
+	// to pass and trigger the readlink.
+	tasks.symlinks["/workspace/link"] = true
 	tasks.preReadlinkTargets["/workspace/link"] = "oldtarget"
 
 	got, err := sb.Diff(ctx, state)
@@ -2000,6 +2003,150 @@ func TestDiff_PostImagesComeFromTheBlob(t *testing.T) {
 `
 	if got != want {
 		t.Errorf("Diff post-images from blob:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_FileToSymlinkReplacement pins the file→symlink type replacement:
+// the old side is a regular file (not a symlink), so there is no old target
+// to read — the section renders add-like instead of failing on readlink.
+func TestDiff_FileToSymlinkReplacement(t *testing.T) {
+	sb, _, _, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// New side is a symlink. The old side exists but is NOT a symlink
+	// (tasks.symlinks is not set), so the reader task's test -L fails and
+	// no old target is read.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "newtarget"},
+	)
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/link
++++ b/link
+@@ -0,0 +1 @@
++newtarget
+`
+	if got != want {
+		t.Errorf("Diff file-to-symlink:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_DirToFileReplacement pins the dir→file type replacement: cat on
+// the old directory would fail, so the reader task's test -d check skips the
+// pre-image read and the section renders add-like.
+func TestDiff_DirToFileReplacement(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// New side is a regular file; the old side was a directory.
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/wasdir", mode: 0o644, typeflag: tar.TypeReg, content: []byte("now a file\n")},
+	)
+	tasks.dirs["/workspace/wasdir"] = true
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/wasdir
++++ b/wasdir
+@@ -0,0 +1 @@
++now a file
+`
+	if got != want {
+		t.Errorf("Diff dir-to-file:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestParseChangeTar_HardLinkResolvesContent pins that a hard-link entry
+// (TypeLink, no body) resolves its content and size from the original entry
+// archived earlier in the tar, instead of rendering as an empty file.
+func TestParseChangeTar_HardLinkResolvesContent(t *testing.T) {
+	blob := buildTar(t,
+		tarEntry{name: "workspace/original.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("shared\n")},
+		tarEntry{name: "workspace/link.txt", mode: 0o644, typeflag: tar.TypeLink, linkname: "workspace/original.txt"},
+	)
+
+	changes, _, contents, err := parseChangeTarWithContent(bytes.NewReader(blob), "/workspace")
+	if err != nil {
+		t.Fatalf("parseChangeTarWithContent: %v", err)
+	}
+
+	if got := string(contents["link.txt"]); got != "shared\n" {
+		t.Errorf("hard-link content = %q, want %q", got, "shared\n")
+	}
+
+	m := changeMap(changes)
+	c, ok := m["link.txt"]
+	if !ok {
+		t.Fatal("link.txt not in change list")
+	}
+	if c.Size != int64(len("shared\n")) {
+		t.Errorf("link.txt size = %d, want %d (resolved from the original)", c.Size, len("shared\n"))
+	}
+}
+
+// TestReadFilesAt_BeforeCreateLeasesSnapshot pins that a read before Create
+// — when there is no sandbox lease for the snapshotter wrapper to inject —
+// holds the reader snapshot under a per-reader lease, closing the GC window
+// between Prepare and StartTask. The lease is deleted when the read ends.
+func TestReadFilesAt_BeforeCreateLeasesSnapshot(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	tasks := newFakeTasks(log, snap)
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	fl := &fakeLeases{}
+	sb := NewWithBackend(Config{Image: "example/dev:latest"}, snap, tasks, images, WithLeases(fl))
+	ctx := context.Background()
+
+	snap.seed("croft/test/committed/1")
+	tasks.preFiles["/workspace/file.txt"] = "content\n"
+
+	if _, err := sb.ReadFilesAt(ctx, WorkspaceState{SnapshotKey: "croft/test/committed/1"}, []string{"file.txt"}); err != nil {
+		t.Fatalf("ReadFilesAt before Create: %v", err)
+	}
+
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+	var readerLease string
+	for _, l := range fl.created {
+		if strings.HasPrefix(l.ID, "croft-reader-") {
+			readerLease = l.ID
+		}
+	}
+	if readerLease == "" {
+		t.Fatal("no croft-reader- lease was created for a before-Create read")
+	}
+	deleted := false
+	for _, d := range fl.deleted {
+		if d == readerLease {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Errorf("reader lease %s was not deleted after the read", readerLease)
 	}
 }
 

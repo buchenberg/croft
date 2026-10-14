@@ -125,8 +125,13 @@ func parseChangeTarInternal(r io.Reader, workdir string, withContent bool) ([]Ch
 	var changes []Change
 	var opaques []opaqueDir
 	var contents map[string][]byte
+	// byTarName maps a tar-internal entry name to its change path, so a
+	// hard-link entry (TypeLink, no body — Linkname names the archived
+	// original) can resolve to the original's already-buffered content.
+	var byTarName map[string]string
 	if withContent {
 		contents = make(map[string][]byte)
+		byTarName = make(map[string]string)
 	}
 
 	tr := tar.NewReader(src)
@@ -188,9 +193,12 @@ func parseChangeTarInternal(r io.Reader, workdir string, withContent bool) ([]Ch
 
 		// Buffer the content for Diff's post-images. Regular files carry
 		// their content in the entry body; symlinks carry their target in
-		// Linkname (no body). Both are stored so Diff can render post-images
-		// without re-reading the workspace.
+		// Linkname (no body); hard links carry no body either — Linkname
+		// names the already-archived original, whose buffered content is
+		// the link's content. Both are stored so Diff can render
+		// post-images without re-reading the workspace.
 		if withContent {
+			byTarName[name] = changePath
 			switch hdr.Typeflag {
 			case tar.TypeReg:
 				if hdr.Size > 0 {
@@ -202,6 +210,19 @@ func parseChangeTarInternal(r io.Reader, workdir string, withContent bool) ([]Ch
 				}
 			case tar.TypeSymlink:
 				contents[changePath] = []byte(hdr.Linkname)
+			case tar.TypeLink:
+				// Resolve through the original entry archived earlier in
+				// the tar. If the original was not seen (forward
+				// reference, or outside the workdir), the content stays
+				// absent and the link renders as an empty add — the
+				// differ this targets does not emit hard links (Task 0
+				// finding), so this is defensive only.
+				if target, ok := byTarName[hdr.Linkname]; ok {
+					if content, ok := contents[target]; ok {
+						contents[changePath] = content
+						changes[len(changes)-1].Size = int64(len(content))
+					}
+				}
 			}
 		}
 	}
@@ -395,6 +416,16 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 // snapshot key is croft/<id>/reader/<n> — readable in the snapshotter, and
 // distinct from the capture seq (state identity is sequence-derived).
 //
+// Before Create there is no sandbox lease for namespaceSnapshotter to inject,
+// so the reader snapshot would be GC-vulnerable between Prepare and
+// StartTask. A per-reader lease (croft-reader-<rand>, labeled
+// croft.lease:"reader") closes that window; after Create the sandbox lease
+// covers the snapshot and the extra lease is skipped.
+//
+// The reader's init process is ALWAYS the inert sleep default (see
+// taskService.StartReaderTask) — a configured Config.InitArgs initializer
+// could rewrite files on the snapshot before the pre-image read.
+//
 // A state whose layer has been released surfaces as ErrStateUnavailable.
 func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceState, fn func(ctx context.Context, readerID string) error) error {
 	if ws.SnapshotKey == "" {
@@ -418,6 +449,28 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 	readerKey := s.key(id, "reader", n)
 	readerID := fmt.Sprintf("%s-reader-%d", id, n)
 
+	// Before Create there is no sandbox lease protecting the reader
+	// snapshot. Create a per-reader lease so the GC cannot reclaim the
+	// snapshot between Prepare and StartTask. After Create,
+	// namespaceSnapshotter injects the sandbox lease itself (and would
+	// overwrite this one anyway), so the lease is skipped.
+	mgr := s.leaseManager()
+	var readerLeaseID string
+	if mgr != nil && s.lease.get() == "" {
+		l, err := mgr.Create(s.stateLeaseCtx(ctx),
+			leases.WithID("croft-reader-"+newSandboxID()),
+			leases.WithLabels(map[string]string{sandboxLeaseLabel: "reader"}),
+		)
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: create reader lease: %w", err)
+		}
+		readerLeaseID = l.ID
+		ctx = leases.WithLease(s.stateLeaseCtx(ctx), readerLeaseID)
+		defer func() {
+			_ = mgr.Delete(context.WithoutCancel(ctx), leases.Lease{ID: readerLeaseID})
+		}()
+	}
+
 	// Prepare a reader snapshot from the state's committed layer.
 	if _, err := s.snap.Prepare(ctx, readerKey, ws.SnapshotKey); err != nil {
 		if errdefs.IsNotFound(err) {
@@ -429,7 +482,7 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 		_ = s.snap.Remove(context.WithoutCancel(ctx), readerKey)
 	}()
 
-	if err := s.tasks.StartTask(ctx, readerID, readerKey); err != nil {
+	if err := s.tasks.StartReaderTask(ctx, readerID, readerKey); err != nil {
 		return fmt.Errorf("containerd sandbox: start reader task: %w", err)
 	}
 	defer func() {
@@ -437,6 +490,45 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 	}()
 
 	return fn(ctx, readerID)
+}
+
+// readerTest runs a shell test expression against one resolved path in the
+// reader task, returning true when it exits 0. A shell usage error (exit > 1
+// from test) is distinguished from a false result and surfaces as an error —
+// a broken test expression must not silently classify every path as absent.
+func (s *ContainerdSandbox) readerTest(ctx context.Context, readerID, test, resolved string) (bool, error) {
+	res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+		Command: "sh",
+		Args:    []string{"-c", test, "croft", resolved},
+		Cwd:     s.cfg.workdir(),
+	})
+	if err != nil {
+		return false, err
+	}
+	if res.ExitCode > 1 {
+		return false, fmt.Errorf("exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	return res.ExitCode == 0, nil
+}
+
+// readerExecOut runs a shell command against one resolved path in the reader
+// task and returns its raw stdout on success, or an error carrying the exit
+// code and stderr. The output is NOT trimmed — for cat it is file content
+// where a trailing newline is significant; readlink call sites strip the
+// newline readlink appends explicitly.
+func (s *ContainerdSandbox) readerExecOut(ctx context.Context, readerID, script, resolved string) (string, error) {
+	res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
+		Command: "sh",
+		Args:    []string{"-c", script, "croft", resolved},
+		Cwd:     s.cfg.workdir(),
+	})
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	return res.Stdout, nil
 }
 
 // readFilesAt reads the given paths from ws's committed layer, returning a
@@ -497,6 +589,14 @@ func (s *ContainerdSandbox) ReadFilesAt(ctx context.Context, ws WorkspaceState, 
 // and Changes enumerates the state's contents to emit the deletes.
 //
 // Uses `ls -A1 --` — one name per line, no . or .., no metadata.
+//
+// Known limitation: a filename containing a newline would split into two
+// entries. This path is defensive only — the walking differ this sandbox
+// targets emits per-file whiteouts, never opaque markers (Task 0 finding) —
+// and the image contract (sh + cat + ls + readlink) has no NUL-delimited
+// listing primitive. If a differ that emits opaque markers ever becomes the
+// target, switch the protocol (e.g. shell globbing, which preserves such
+// names).
 func (s *ContainerdSandbox) readDirAt(ctx context.Context, ws WorkspaceState, dir string) ([]string, error) {
 	var names []string
 	err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
@@ -584,16 +684,25 @@ func (s *ContainerdSandbox) computeChanges(ctx context.Context, ws WorkspaceStat
 
 	// Resolve opaque dirs (defensive .wh..wh..opq path): enumerate the state's
 	// contents and emit a ChangeDelete for each file the opaque dir hid.
+	// Paths already represented in the change list — modified or explicitly
+	// whiteouted by the upper tree — are skipped: an opaque marker hides the
+	// lower entries, but the upper tar can replace the same names, and a
+	// synthesized delete alongside a modify would be contradictory.
+	existing := make(map[string]bool, len(changes))
+	for _, c := range changes {
+		existing[c.Path] = true
+	}
 	for _, op := range opaques {
 		names, err := s.readDirAt(ctx, ws, op.path)
 		if err != nil {
 			return nil, nil, err
 		}
 		for _, name := range names {
-			changes = append(changes, Change{
-				Path: path.Join(op.path, name),
-				Kind: ChangeDelete,
-			})
+			p := path.Join(op.path, name)
+			if existing[p] {
+				continue
+			}
+			changes = append(changes, Change{Path: p, Kind: ChangeDelete})
 		}
 	}
 
@@ -726,17 +835,13 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 				switch c.Kind {
 				case ChangeModify:
 					// Existence check: absent from the lower tree → add.
-					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-						Command: "sh",
-						// test -e follows symlinks; || test -L catches
-						// dangling links so they are not misclassified as adds.
-						Args: []string{"-c", `test -e "$1" || test -L "$1"`, "croft", resolved},
-						Cwd:  s.cfg.workdir(),
-					})
+					// test -e follows symlinks and returns false for a
+					// dangling link; || test -L catches the link itself.
+					exists, err := s.readerTest(ctx, readerID, `test -e "$1" || test -L "$1"`, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: check %s at state: %w", c.Path, err)
 					}
-					if res.ExitCode != 0 {
+					if !exists {
 						c.Kind = ChangeAdd
 						continue // adds have no pre-image
 					}
@@ -745,53 +850,90 @@ func (s *ContainerdSandbox) diffImpl(ctx context.Context, ws WorkspaceState) (st
 					if c.IsDir {
 						continue
 					}
-					// Fall through to the pre-image read below.
+
+					if c.Mode&fs.ModeSymlink != 0 {
+						// New side is a symlink. The old target comes from
+						// the state's layer — but only if the old side was
+						// also a symlink (file→symlink replacements have no
+						// old target; they render as add-like).
+						isLink, err := s.readerTest(ctx, readerID, `test -L "$1"`, resolved)
+						if err != nil {
+							return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+						}
+						if isLink {
+							target, err := s.readerExecOut(ctx, readerID, `readlink -- "$1"`, resolved)
+							if err != nil {
+								return fmt.Errorf("containerd sandbox: readlink %s at state: %w", c.Path, err)
+							}
+							// Strip only the newline readlink appends.
+							preImages[c.Path] = []byte(strings.TrimSuffix(target, "\n"))
+						}
+						continue
+					}
+
+					// New side is a regular file. Classify the OLD side: a
+					// directory (dir→file replacement) would make cat fail
+					// ("Is a directory"), and a symlink (symlink→file
+					// replacement) would make cat read the referent — which
+					// is not the file's old content, and fails outright for
+					// a dangling link. Both are type replacements: skip the
+					// read and render with no pre-image (add-like).
+					oldIsDir, err := s.readerTest(ctx, readerID, `test -d "$1"`, resolved)
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+					}
+					if oldIsDir {
+						continue
+					}
+					oldIsLink, err := s.readerTest(ctx, readerID, `test -L "$1"`, resolved)
+					if err != nil {
+						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
+					}
+					if oldIsLink {
+						continue
+					}
+					// Old side is a regular file: fall through to the read.
 
 				case ChangeDelete:
-					// Type classification: symlink → target rendering,
-					// directory → marker (no pre-image read).
-					res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-						Command: "sh",
-						Args:    []string{"-c", `test -L "$1"`, "croft", resolved},
-						Cwd:     s.cfg.workdir(),
-					})
+					// Classify the deleted path's old type so rendering
+					// can route it: symlink → target line, directory →
+					// marker, regular file → content diff.
+					isLink, err := s.readerTest(ctx, readerID, `test -L "$1"`, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
 					}
-					if res.ExitCode == 0 {
+					if isLink {
 						c.Mode |= fs.ModeSymlink
-						continue // symlinks render targets, no content read
+						target, err := s.readerExecOut(ctx, readerID, `readlink -- "$1"`, resolved)
+						if err != nil {
+							return fmt.Errorf("containerd sandbox: readlink %s at state: %w", c.Path, err)
+						}
+						// Strip only the newline readlink appends.
+						preImages[c.Path] = []byte(strings.TrimSuffix(target, "\n"))
+						continue
 					}
-					res, err = s.tasks.Exec(ctx, readerID, ExecRequest{
-						Command: "sh",
-						Args:    []string{"-c", `test -d "$1"`, "croft", resolved},
-						Cwd:     s.cfg.workdir(),
-					})
+					isDir, err := s.readerTest(ctx, readerID, `test -d "$1"`, resolved)
 					if err != nil {
 						return fmt.Errorf("containerd sandbox: classify %s at state: %w", c.Path, err)
 					}
-					if res.ExitCode == 0 {
+					if isDir {
 						c.IsDir = true
 						continue // directories render markers, no content read
 					}
-					// Fall through to the pre-image read below.
+					// Regular file: fall through to the pre-image read.
 				}
 
-				// Pre-image read (ChangeModify that exists, or ChangeDelete
-				// of a regular file). One cat per file.
-				res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-					Command: "sh",
-					Args:    []string{"-c", `cat -- "$1"`, "croft", resolved},
-					Cwd:     s.cfg.workdir(),
-				})
+				// Pre-image read (ChangeModify of a regular file that
+				// exists, or ChangeDelete of a regular file). One cat per
+				// file. A read failure fails the whole call — the plan's
+				// documented race contract (Task 4's missing-path rule):
+				// retryable, and one silent empty pre-image would render a
+				// delete-as-nothing or a modify-as-add, which is worse.
+				content, err := s.readerExecOut(ctx, readerID, `cat -- "$1"`, resolved)
 				if err != nil {
 					return fmt.Errorf("containerd sandbox: read %s at state: %w", c.Path, err)
 				}
-				if res.ExitCode != 0 {
-					return fmt.Errorf("containerd sandbox: read %s at state: exit %d: %s",
-						c.Path, res.ExitCode, strings.TrimSpace(res.Stderr))
-				}
-				preImages[c.Path] = []byte(res.Stdout)
+				preImages[c.Path] = []byte(content)
 			}
 			return nil
 		})
@@ -832,8 +974,11 @@ func (s *ContainerdSandbox) renderChange(ctx context.Context, out *strings.Build
 		return nil
 
 	case c.Mode&fs.ModeSymlink != 0:
-		// Symlink: render the target as a one-line diff.
-		return s.renderSymlinkChange(ctx, out, c, ws, postImages)
+		// Symlink: render the target as a one-line diff. Pure — both
+		// targets are already resolved (pre from the reader task, post
+		// from the tar's Linkname).
+		renderSymlinkChange(out, c, preImages, postImages)
+		return nil
 
 	default:
 		// Regular file: unified diff with binary and mode-only handling.
@@ -895,11 +1040,13 @@ func (s *ContainerdSandbox) renderFileChange(ctx context.Context, out *strings.B
 }
 
 // renderSymlinkChange renders a symlink's target as a one-line unified diff.
-// Post-image targets come from the diff blob's tar (postImages, captured from
-// Linkname during parsing), not from re-reading the workspace — saving an
-// exec and eliminating the race where a concurrent Exec retargets the link.
-// Pre-image targets come from the state's layer via readlinkAt.
-func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *strings.Builder, c Change, ws WorkspaceState, postImages map[string][]byte) error {
+// Pure: post-image targets come from the diff blob's tar (postImages,
+// captured from Linkname during parsing); pre-image targets come from
+// preImages, read by the diffImpl reader task (readlink for symlinks on both
+// sides). Neither side re-reads the workspace, so no exec can race the
+// rendering. A missing old target (add, or a file→symlink type replacement)
+// renders add-like; a missing new target (delete) renders delete-like.
+func renderSymlinkChange(out *strings.Builder, c Change, preImages, postImages map[string][]byte) {
 	var oldTarget, newTarget string
 	var isAdd, isDelete bool
 
@@ -909,22 +1056,15 @@ func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *string
 		newTarget = string(postImages[c.Path])
 	case ChangeDelete:
 		isDelete = true
-		target, err := s.readlinkAt(ctx, ws, c.Path)
-		if err != nil {
-			return err
-		}
-		oldTarget = target
+		oldTarget = string(preImages[c.Path])
 	case ChangeModify:
-		var err error
-		oldTarget, err = s.readlinkAt(ctx, ws, c.Path)
-		if err != nil {
-			return err
-		}
+		oldTarget = string(preImages[c.Path])
 		newTarget = string(postImages[c.Path])
 	}
 
 	// Build the content slices: a side with no target (delete has no new
-	// side, add has no old side) is nil, not a single empty line.
+	// side, add has no old side, type replacement has no old side) is nil,
+	// not a single empty line.
 	var oldContent, newContent []byte
 	if oldTarget != "" {
 		oldContent = []byte(oldTarget + "\n")
@@ -933,7 +1073,6 @@ func (s *ContainerdSandbox) renderSymlinkChange(ctx context.Context, out *string
 		newContent = []byte(newTarget + "\n")
 	}
 	out.WriteString(renderUnified(c.Path, oldContent, newContent, isAdd, isDelete))
-	return nil
 }
 
 // readModeAt reads a file's mode from ws's committed layer, via ls -ld and
@@ -965,32 +1104,4 @@ func (s *ContainerdSandbox) readModeAt(ctx context.Context, ws WorkspaceState, p
 		return 0, err
 	}
 	return mode, nil
-}
-
-// readlinkAt reads a symlink's target from ws's committed layer.
-func (s *ContainerdSandbox) readlinkAt(ctx context.Context, ws WorkspaceState, path string) (string, error) {
-	var target string
-	err := s.withReaderTask(ctx, ws, func(ctx context.Context, readerID string) error {
-		resolved := s.resolve(path)
-		res, err := s.tasks.Exec(ctx, readerID, ExecRequest{
-			Command: "sh",
-			Args:    []string{"-c", `readlink -- "$1"`, "croft", resolved},
-			Cwd:     s.cfg.workdir(),
-		})
-		if err != nil {
-			return fmt.Errorf("containerd sandbox: readlink %s at state: %w", path, err)
-		}
-		if res.ExitCode != 0 {
-			return fmt.Errorf("containerd sandbox: readlink %s at state: exit %d: %s",
-				path, res.ExitCode, strings.TrimSpace(res.Stderr))
-		}
-		// Strip only the trailing newline readlink appends; preserve all
-		// other bytes (whitespace is part of a symlink target).
-		target = strings.TrimSuffix(res.Stdout, "\n")
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-	return target, nil
 }

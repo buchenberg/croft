@@ -331,6 +331,12 @@ func (f *fakeTasks) StartTask(_ context.Context, id, snapshotKey string) error {
 	return nil
 }
 
+// StartReaderTask delegates to StartTask: the fake does not model init
+// commands, so inert-vs-configured makes no difference here.
+func (f *fakeTasks) StartReaderTask(ctx context.Context, id, snapshotKey string) error {
+	return f.StartTask(ctx, id, snapshotKey)
+}
+
 func (f *fakeTasks) StopTask(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -665,6 +665,12 @@ func (f *startTaskFailsOnce) StartTask(ctx context.Context, id, key string) erro
 	return f.taskService.StartTask(ctx, id, key)
 }
 
+// StartReaderTask passes through without consuming the fail flag: the
+// wrapper exists to break a roll-forward restart, not reader tasks.
+func (f *startTaskFailsOnce) StartReaderTask(ctx context.Context, id, key string) error {
+	return f.taskService.StartReaderTask(ctx, id, key)
+}
+
 // TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers pins the failure
 // path after Prepare succeeds: the prepared successor must be removed (Destroy
 // would otherwise leak it — it removes only the current activeKey), the task
