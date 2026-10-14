@@ -766,6 +766,16 @@ func TestParseChangeTar_Table(t *testing.T) {
 				{Path: "suid", Kind: ChangeModify, Mode: 0o755 | fs.ModeSetuid, Size: 1},
 			},
 		},
+		{
+			name:    "fifo entry",
+			workdir: "/workspace",
+			entries: []tarEntry{
+				{name: "workspace/pipe", mode: 0o644, typeflag: tar.TypeFifo},
+			},
+			want: []Change{
+				{Path: "pipe", Kind: ChangeModify, Mode: 0o644 | fs.ModeNamedPipe},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2047,8 +2057,9 @@ func TestDiff_FileToSymlinkReplacement(t *testing.T) {
 }
 
 // TestDiff_DirToFileReplacement pins the dir→file type replacement: cat on
-// the old directory would fail, so the reader task's test -d check skips the
-// pre-image read and the section renders add-like.
+// the old directory would fail, so the reader task's type probe skips the
+// pre-image read and the section renders add-like — /dev/null on the old
+// side, making the replacement explicit.
 func TestDiff_DirToFileReplacement(t *testing.T) {
 	sb, _, tasks, _, fds := changesTestSandbox(t)
 	ctx := context.Background()
@@ -2072,7 +2083,7 @@ func TestDiff_DirToFileReplacement(t *testing.T) {
 		t.Fatalf("Diff: %v", err)
 	}
 
-	want := `--- a/wasdir
+	want := `--- /dev/null
 +++ b/wasdir
 @@ -0,0 +1 @@
 +now a file
@@ -2080,6 +2091,386 @@ func TestDiff_DirToFileReplacement(t *testing.T) {
 	if got != want {
 		t.Errorf("Diff dir-to-file:\n got: %q\nwant: %q", got, want)
 	}
+}
+
+// TestChanges_DanglingSymlinkIsModify pins that a dangling symlink — the
+// link exists, its target does not — stays ChangeModify: the type probe
+// checks -L first, so the missing target does not demote it to an add and
+// lose the old side.
+func TestChanges_DanglingSymlinkIsModify(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "nowhere"},
+	)
+	// The link exists in the state's layer; its target does not (dangling).
+	tasks.symlinks["/workspace/link"] = true
+	tasks.missingPaths["/workspace/link"] = true
+
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "link", Kind: ChangeModify, Mode: 0o777 | fs.ModeSymlink},
+	})
+}
+
+// TestDiff_DanglingSymlinkModifyRendersTarget pins the Diff side of the
+// dangling-symlink contract: the old target is read from the link itself
+// (readlink does not follow the missing target) and rendered against the
+// new target from the blob.
+func TestDiff_DanglingSymlinkModifyRendersTarget(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "newtarget"},
+	)
+	tasks.symlinks["/workspace/link"] = true
+	tasks.missingPaths["/workspace/link"] = true // dangling: target missing
+	tasks.preReadlinkTargets["/workspace/link"] = "oldtarget"
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- a/link
++++ b/link
+@@ -1 +1 @@
+-oldtarget
++newtarget
+`
+	if got != want {
+		t.Errorf("Diff dangling symlink:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_TypeReplacementToEmptyFile is the regression for the nil==nil
+// trap: a directory replaced by an EMPTY regular file leaves both the
+// pre-image (deliberately not read) and the post-image (empty) nil. The
+// change must render add-like — not vanish into the content-identical
+// branch of renderFileChange.
+func TestDiff_TypeReplacementToEmptyFile(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// New side: an empty regular file (mode matches the state's default
+	// 0644, so the old code's mode-only branch emitted nothing at all).
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/wasdir", mode: 0o644, typeflag: tar.TypeReg, content: nil},
+	)
+	tasks.dirs["/workspace/wasdir"] = true // old side: a directory
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "--- /dev/null\n+++ b/wasdir\n@@ -0,0 +0,0 @@\n"
+	if got != want {
+		t.Errorf("Diff dir-to-empty-file:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_TypeReplacementToEmptyFileModeDiffers is the second half of the
+// nil==nil trap: with differing modes the old code rendered a bogus
+// old mode/new mode pair with no content. The replacement renders add-like
+// instead — and never reads the state's mode (no ls -ld exec).
+func TestDiff_TypeReplacementToEmptyFileModeDiffers(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/wasdir", mode: 0o600, typeflag: tar.TypeReg, content: nil},
+	)
+	tasks.dirs["/workspace/wasdir"] = true
+	tasks.modes["/workspace/wasdir"] = "-rw-r--r--" // 0644 ≠ 0600
+
+	before := len(tasks.allReqs)
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "--- /dev/null\n+++ b/wasdir\n@@ -0,0 +0,0 @@\n"
+	if got != want {
+		t.Errorf("Diff dir-to-empty-file (mode differs):\n got: %q\nwant: %q", got, want)
+	}
+	if strings.Contains(got, "mode") {
+		t.Errorf("Diff rendered a mode pair for a type replacement: %q", got)
+	}
+	if n := countExecs(tasks.allReqs[before:], `ls -ld -- "$1"`, "/workspace/wasdir"); n != 0 {
+		t.Errorf("type replacement ran %d ls -ld execs, want 0 (mode-only branch must not fire)", n)
+	}
+}
+
+// TestDiff_SpecialFileReplacedByRegularFile pins that an old-side special
+// file (FIFO) is never cat'd — open(2) on a FIFO blocks until a writer
+// appears, which would hang the exec until the context deadline. The probe
+// reports "s", the pre-image read is skipped, and the replacement renders
+// add-like. The fake fails any cat on a special file, so a regression also
+// fails through the render.
+func TestDiff_SpecialFileReplacedByRegularFile(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/pipe", mode: 0o644, typeflag: tar.TypeReg, content: []byte("now a file\n")},
+	)
+	tasks.specials["/workspace/pipe"] = true // old side: a FIFO
+
+	before := len(tasks.allReqs)
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := `--- /dev/null
++++ b/pipe
+@@ -0,0 +1 @@
++now a file
+`
+	if got != want {
+		t.Errorf("Diff fifo-to-file:\n got: %q\nwant: %q", got, want)
+	}
+	if n := countExecs(tasks.allReqs[before:], `cat -- "$1"`, "/workspace/pipe"); n != 0 {
+		t.Errorf("Diff ran %d cat execs on the old FIFO, want 0", n)
+	}
+}
+
+// TestDiff_DeletedSpecialFileRendersDeleteLike pins that a deleted FIFO
+// renders delete-like with no content — the pre-image cat would block on
+// open(2), so the probe routes special files around it.
+func TestDiff_DeletedSpecialFileRendersDeleteLike(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/.wh.pipe", mode: 0, typeflag: tar.TypeReg},
+	)
+	tasks.specials["/workspace/pipe"] = true
+	tasks.preFiles["/workspace/pipe"] = "must not be read\n"
+
+	before := len(tasks.allReqs)
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "--- a/pipe\n+++ /dev/null\n@@ -0,0 +0,0 @@\n"
+	if got != want {
+		t.Errorf("Diff deleted fifo:\n got: %q\nwant: %q", got, want)
+	}
+	if n := countExecs(tasks.allReqs[before:], `cat -- "$1"`, "/workspace/pipe"); n != 0 {
+		t.Errorf("Diff ran %d cat execs on the deleted FIFO, want 0", n)
+	}
+}
+
+// TestDiff_NewSpecialFileRendersMarker pins that a new FIFO renders a type
+// marker, the way directories do: there is no content on either side.
+func TestDiff_NewSpecialFileRendersMarker(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/pipe", mode: 0o644, typeflag: tar.TypeFifo},
+	)
+	tasks.missingPaths["/workspace/pipe"] = true // absent from lower → ChangeAdd
+
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "new special file: pipe\n"
+	if got != want {
+		t.Errorf("Diff new fifo:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestDiff_ModifyToSpecialFileRendersMarker pins that a regular file
+// replaced by a FIFO renders the marker and skips the pre-image read: the
+// new side has no content, so there is nothing to diff against.
+func TestDiff_ModifyToSpecialFileRendersMarker(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/pipe", mode: 0o644, typeflag: tar.TypeFifo},
+	)
+	// Old side: a readable regular file. Even though cat would succeed,
+	// the new side has no content — the section renders as a marker.
+	tasks.preFiles["/workspace/pipe"] = "was a file\n"
+
+	before := len(tasks.allReqs)
+	got, err := sb.Diff(ctx, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	want := "new special file: pipe\n"
+	if got != want {
+		t.Errorf("Diff file-to-fifo:\n got: %q\nwant: %q", got, want)
+	}
+	if n := countExecs(tasks.allReqs[before:], `cat -- "$1"`, "/workspace/pipe"); n != 0 {
+		t.Errorf("Diff ran %d cat execs for a special-file modify, want 0", n)
+	}
+}
+
+// TestDiff_ExecBudgetRegularModify pins the consolidated reader protocol
+// (comment: four execs per modified file is two too many): a modified
+// regular file costs exactly ONE type probe plus ONE cat — the probe
+// answers existence and type together.
+func TestDiff_ExecBudgetRegularModify(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/file.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("new\n")},
+	)
+	tasks.preFiles["/workspace/file.txt"] = "old\n"
+
+	before := len(tasks.allReqs)
+	if _, err := sb.Diff(ctx, state); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	execs := tasks.allReqs[before:]
+	if len(execs) != 2 {
+		t.Fatalf("Diff ran %d execs for one modified file, want 2 (probe + cat): %+v", len(execs), execs)
+	}
+	if n := countExecs(execs, readerTypeScript, "/workspace/file.txt"); n != 1 {
+		t.Errorf("Diff ran %d type probes, want 1", n)
+	}
+	if n := countExecs(execs, `cat -- "$1"`, "/workspace/file.txt"); n != 1 {
+		t.Errorf("Diff ran %d cat execs, want 1", n)
+	}
+}
+
+// TestChanges_DeleteClassificationSingleProbe pins that classifying a
+// deleted path costs ONE probe exec — the old flow ran test -L and test -d
+// as separate round-trips.
+func TestChanges_DeleteClassificationSingleProbe(t *testing.T) {
+	sb, _, tasks, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	fds.blob = buildTar(t,
+		tarEntry{name: "workspace/.wh.olddir", mode: 0, typeflag: tar.TypeReg},
+	)
+	tasks.dirs["/workspace/olddir"] = true
+
+	before := len(tasks.allReqs)
+	changes, err := sb.Changes(ctx, state)
+	if err != nil {
+		t.Fatalf("Changes: %v", err)
+	}
+
+	assertChanges(t, changes, []Change{
+		{Path: "olddir", Kind: ChangeDelete, IsDir: true},
+	})
+	execs := tasks.allReqs[before:]
+	if len(execs) != 1 {
+		t.Fatalf("Changes ran %d execs for one delete, want 1 (probe only): %+v", len(execs), execs)
+	}
+	if n := countExecs(execs, readerTypeScript, "/workspace/olddir"); n != 1 {
+		t.Errorf("Changes ran %d type probes, want 1", n)
+	}
+}
+
+// countExecs returns how many of reqs ran the given `sh -c` script against
+// the given resolved-path argument.
+func countExecs(reqs []ExecRequest, script, arg string) int {
+	n := 0
+	for _, r := range reqs {
+		if r.Command == "sh" && len(r.Args) >= 4 && r.Args[1] == script && r.Args[3] == arg {
+			n++
+		}
+	}
+	return n
 }
 
 // TestParseChangeTar_HardLinkResolvesContent pins that a hard-link entry

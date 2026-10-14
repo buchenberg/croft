@@ -269,8 +269,9 @@ type fakeTasks struct {
 	// execs (pre-images in Diff and ReadFilesAt). Separate from catFiles so
 	// tests can give a file different old and new content.
 	// missingPaths is a set of resolved paths that do not exist in the
-	// fake's filesystem model: cat reports them absent (exit 1), and
-	// test -e reports them missing (exit 1). By default every path exists.
+	// fake's filesystem model: cat reports them absent (exit 1), and the
+	// type probe reports them as "x". By default every path exists as a
+	// regular file.
 	// lsDirs maps resolved dir → entry names for `ls -A1 -- "$1"` execs.
 	// modes maps resolved path → symbolic mode string (e.g. "-rw-r--r--")
 	// for `ls -ld -- "$1"` execs (mode-only change rendering in Diff).
@@ -278,8 +279,13 @@ type fakeTasks struct {
 	// `readlink -- "$1"` execs (post-image symlink targets in Diff).
 	// preReadlinkTargets maps resolved path → symlink target for reader-task
 	// `readlink -- "$1"` execs (pre-image symlink targets in Diff).
-	// symlinks and dirs are sets of resolved paths for `test -L`/`test -d`
-	// execs (delete-type classification in Diff).
+	// symlinks, dirs, and specials are sets of resolved paths that drive the
+	// reader type probe (readerTypeScript): symlink → "l", directory → "d",
+	// special file (FIFO/socket/device) → "s", missing → "x", everything
+	// else → "f". The fake also enforces the invariant that cat must never
+	// run on a directory or special file (real cat fails on a directory and
+	// BLOCKS in open(2) on a FIFO), so a regression that cats one fails the
+	// test instead of silently succeeding.
 	// These let reader-task, Changes, and Diff tests assert behavior without
 	// a filesystem model.
 	catFiles           map[string]string
@@ -291,6 +297,7 @@ type fakeTasks struct {
 	preReadlinkTargets map[string]string
 	symlinks           map[string]bool
 	dirs               map[string]bool
+	specials           map[string]bool
 
 	// mu guards the mutable state above. The production sandbox is documented
 	// safe for concurrent use, and TestCapture_ConcurrentWithApply drives it
@@ -313,6 +320,7 @@ func newFakeTasks(log *opLog, snap *fakeSnapshotter) *fakeTasks {
 		preReadlinkTargets: map[string]string{},
 		symlinks:           map[string]bool{},
 		dirs:               map[string]bool{},
+		specials:           map[string]bool{},
 	}
 }
 
@@ -414,6 +422,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 	}
 	isSymlink := f.symlinks[arg]
 	isDir := f.dirs[arg]
+	isSpecial := f.specials[arg]
 	f.mu.Unlock()
 
 	if hasRunErr {
@@ -422,7 +431,7 @@ func (f *fakeTasks) Exec(_ context.Context, id string, req ExecRequest) (ExecRes
 
 	switch req.Command {
 	case "sh":
-		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing, modeOK, modeStr, linkOK, linkTarget, isSymlink, isDir), nil
+		return f.shExec(req, arg, catOK, catContent, pathGone, lsOK, lsListing, modeOK, modeStr, linkOK, linkTarget, isSymlink, isDir, isSpecial), nil
 	default:
 		return ExecResult{ExitCode: 0}, nil
 	}
@@ -437,9 +446,9 @@ func (f *fakeTasks) shArg(req ExecRequest) string {
 	return ""
 }
 
-// shExec dispatches the programmable cat/ls/test/mode/readlink responses and
-// falls back to the canned "file-contents" for everything else.
-func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string, modeOK bool, modeStr string, linkOK bool, linkTarget string, isSymlink bool, isDir bool) ExecResult {
+// shExec dispatches the programmable cat/ls/probe/mode/readlink responses
+// and falls back to the canned "file-contents" for everything else.
+func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent string, pathGone bool, lsOK bool, lsListing []string, modeOK bool, modeStr string, linkOK bool, linkTarget string, isSymlink bool, isDir bool, isSpecial bool) ExecResult {
 	if len(req.Args) < 2 {
 		return ExecResult{ExitCode: 0, Stdout: "file-contents"}
 	}
@@ -447,6 +456,15 @@ func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent s
 	case `cat -- "$1"`:
 		if pathGone {
 			return ExecResult{ExitCode: 1, Stderr: "cat: " + arg + ": No such file or directory"}
+		}
+		// Enforce the invariant the type probe exists to protect: real cat
+		// fails on a directory and blocks in open(2) on a FIFO. Production
+		// must never cat either — fail loudly if it does.
+		if isDir {
+			return ExecResult{ExitCode: 1, Stderr: "cat: " + arg + ": Is a directory"}
+		}
+		if isSpecial {
+			return ExecResult{ExitCode: 2, Stderr: "cat: " + arg + ": cannot read special file (would block)"}
 		}
 		if catOK {
 			return ExecResult{ExitCode: 0, Stdout: catContent}
@@ -465,29 +483,27 @@ func (f *fakeTasks) shExec(req ExecRequest, arg string, catOK bool, catContent s
 			return ExecResult{ExitCode: 0, Stdout: modeStr + " 1 0 0 0 Jan  1 00:00 " + arg + "\n"}
 		}
 		return ExecResult{ExitCode: 0, Stdout: "-rw-r--r-- 1 0 0 0 Jan  1 00:00 " + arg + "\n"}
-	case `test -e "$1"`:
-		if pathGone {
-			return ExecResult{ExitCode: 1}
+	case readerTypeScript:
+		// The reader type probe. Order matches the production script:
+		// symlink wins over missing (a dangling link is still a link),
+		// then directory, then special, then missing, else regular.
+		switch {
+		case isSymlink:
+			return ExecResult{ExitCode: 0, Stdout: typeSymlink}
+		case isDir:
+			return ExecResult{ExitCode: 0, Stdout: typeDir}
+		case isSpecial:
+			return ExecResult{ExitCode: 0, Stdout: typeSpecial}
+		case pathGone:
+			return ExecResult{ExitCode: 0, Stdout: typeAbsent}
+		default:
+			return ExecResult{ExitCode: 0, Stdout: typeRegular}
 		}
-		return ExecResult{ExitCode: 0}
-	case `test -e "$1" || test -L "$1"`:
-		// Exists or is a symlink (even dangling) → not an add.
-		if pathGone && !isSymlink {
-			return ExecResult{ExitCode: 1}
-		}
-		return ExecResult{ExitCode: 0}
-	case `test -L "$1"`:
-		if isSymlink {
-			return ExecResult{ExitCode: 0}
-		}
-		return ExecResult{ExitCode: 1}
-	case `test -d "$1"`:
-		if isDir {
-			return ExecResult{ExitCode: 0}
-		}
-		return ExecResult{ExitCode: 1}
 	case `readlink -- "$1"`:
-		if pathGone {
+		// readlink reads the link itself: it succeeds for any symlink —
+		// including a dangling one, whose TARGET is missing — and fails
+		// for a path that is not a link.
+		if !isSymlink {
 			return ExecResult{ExitCode: 1, Stderr: "readlink: " + arg + ": No such file or directory"}
 		}
 		if linkOK {
