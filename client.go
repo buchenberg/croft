@@ -311,6 +311,10 @@ func (n namespaceSnapshotter) Mounts(ctx context.Context, key string) ([]mount.M
 	return n.Snapshotter.Mounts(n.ctx(ctx), key)
 }
 
+func (n namespaceSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	return n.Snapshotter.View(n.ctx(ctx), key, parent, opts...)
+}
+
 // containerdImages resolves an image reference to the snapshot key holding its
 // unpacked rootfs.
 //

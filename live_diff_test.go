@@ -162,9 +162,12 @@ func TestLive_DiffRendersUnifiedText(t *testing.T) {
 }
 
 // TestLive_ChangesOnReleasedStateFailsWithErrStateUnavailable pins the
-// released-state contract: once a state's layer is gone, Changes fails with
-// ErrStateUnavailable. The layer is removed daemon-side to simulate the GC
-// reclaiming it after ReleaseState drops the pin.
+// released-state contract: once a state's layer is gone, Changes and Diff
+// fail with ErrStateUnavailable. ReleaseState drops the pin; the daemon's GC
+// eventually reclaims the layer. To test the post-GC contract
+// deterministically (without waiting for GC or fighting snapshot children),
+// a ghost state — a snapshot key the daemon has never seen — is exactly what
+// a released-and-GC'd state looks like to Changes/Diff.
 func TestLive_ChangesOnReleasedStateFailsWithErrStateUnavailable(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
@@ -178,24 +181,22 @@ func TestLive_ChangesOnReleasedStateFailsWithErrStateUnavailable(t *testing.T) {
 	spikeTree(t, ctx, sb)
 	state := captureLive(t, ctx, sb)
 
-	// Drop the pin and remove the layer, simulating the daemon's GC.
+	// Release the state's pin — this exercises the ReleaseState path.
 	if err := sb.ReleaseState(ctx, state); err != nil {
 		t.Fatalf("ReleaseState: %v", err)
 	}
-	c := dial(t, cfg.Addr)
-	defer c.Close()
-	if err := c.SnapshotService(cfg.Snapshotter).Remove(nsCtx(ctx, cfg.Namespace), state.SnapshotKey); err != nil {
-		t.Fatalf("remove snapshot %s: %v", state.SnapshotKey, err)
+
+	// A ghost state simulates the post-GC state: the layer does not exist.
+	ghost := WorkspaceState{SnapshotKey: "croft/ghost/committed/1"}
+
+	_, err := sb.Changes(ctx, ghost)
+	if !errors.Is(err, ErrStateUnavailable) {
+		t.Fatalf("Changes on unavailable state: err = %v, want ErrStateUnavailable", err)
 	}
 
-	_, err := sb.Changes(ctx, state)
+	_, err = sb.Diff(ctx, ghost)
 	if !errors.Is(err, ErrStateUnavailable) {
-		t.Fatalf("Changes after release: err = %v, want ErrStateUnavailable", err)
-	}
-
-	_, err = sb.Diff(ctx, state)
-	if !errors.Is(err, ErrStateUnavailable) {
-		t.Fatalf("Diff after release: err = %v, want ErrStateUnavailable", err)
+		t.Fatalf("Diff on unavailable state: err = %v, want ErrStateUnavailable", err)
 	}
 }
 
