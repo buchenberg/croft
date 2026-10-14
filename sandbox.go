@@ -521,16 +521,35 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 		// The prepared successor leaks otherwise — Destroy removes only the
 		// current activeKey — so it is removed here, cancel-free. The old
 		// active layer still exists at this point (its removal happens only on
-		// success below), so the task restarts on it and the sandbox is left
-		// usable rather than stopped; the restart error is ignored, consistent
-		// with the Prepare-failure branch above. With no prior active (the
-		// first Apply before Create) there is no task to restart and the
-		// sandbox stays cleanly stopped.
-		_ = s.snap.Remove(context.WithoutCancel(ctx), next)
-		if active != "" {
-			_ = s.restart(ctx, id, active)
+		// success below), so the task restarts on it, on the same cancel-free
+		// context (StartTask may have failed *because* the caller's context
+		// expired), and the sandbox is left usable rather than stopped. With
+		// no prior active (the first Apply before Create) there is no task to
+		// restart and the sandbox stays cleanly stopped. A removal failure is
+		// surfaced — the layer would otherwise leak with no key to find it
+		// by — and a restart failure is reported too, since both mean the
+		// sandbox did not recover cleanly.
+		cleanupCtx := context.WithoutCancel(ctx)
+		startErr := fmt.Errorf("containerd sandbox: start task after apply: %w", err)
+		if rerr := s.snap.Remove(cleanupCtx, next); rerr != nil {
+			startErr = errors.Join(startErr, fmt.Errorf("remove prepared successor %s: %w", next, rerr))
 		}
-		return fmt.Errorf("containerd sandbox: start task after apply: %w", err)
+		if active != "" {
+			if rerr := s.restart(cleanupCtx, id, active); rerr != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("restart on %s: %w", active, rerr))
+			}
+		}
+		return startErr
+	}
+
+	// The applied state's committed layer is now an ancestor of this
+	// sandbox's active layer, so it belongs in the chain — including when the
+	// state came from another sandbox's lineage, where splitChain finds
+	// nothing to retain and the chain would otherwise be empty, leaving the
+	// next Capture to mis-record its parent as the image rootfs. When the key
+	// was found in the chain, kept already ends with it; append only once.
+	if n := len(kept); n == 0 || kept[n-1] != committed {
+		kept = append(kept, committed)
 	}
 
 	s.mu.Lock()

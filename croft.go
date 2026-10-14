@@ -44,8 +44,9 @@
 // # The image contract
 //
 // The workspace's file operations shell out inside the container, so the
-// image must provide a shell and the small coreutils they use (see the
-// README for the exact list).
+// image must provide a shell and the small coreutils croft itself uses:
+// mkdir (Create provisions the workdir), and cat, dirname, printf,
+// base64, and chmod (ReadFile and WriteFile).
 //
 // # Status
 //
@@ -91,9 +92,6 @@ import (
 	"io/fs"
 	"time"
 )
-
-// ErrUnsupported is returned by an optional capability that a sandbox does not
-// implement. Callers should check Capabilities (or type-assert the optional
 
 // ExecRequest describes one command execution inside a sandbox.
 type ExecRequest struct {

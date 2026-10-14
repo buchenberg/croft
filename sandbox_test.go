@@ -3,6 +3,7 @@ package croft
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io/fs"
 	"strings"
 	"sync"
@@ -653,12 +654,30 @@ func TestCapture_ConcurrentWithApply(t *testing.T) {
 	wg.Wait()
 }
 
+// startTaskFailsOnce wraps a taskService whose next StartTask fails once, so a
+// test can break exactly one roll-forward and observe the recovery — unlike
+// failingStartTask, which keeps failing and turns the recovery restart into a
+// second failure.
+type startTaskFailsOnce struct {
+	taskService
+	failNext bool
+}
+
+func (f *startTaskFailsOnce) StartTask(ctx context.Context, id, key string) error {
+	if f.failNext {
+		f.failNext = false
+		return errors.New("shim down")
+	}
+	return f.taskService.StartTask(ctx, id, key)
+}
+
 // TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers pins the failure
 // path after Prepare succeeds: the prepared successor must be removed (Destroy
 // would otherwise leak it — it removes only the current activeKey), the task
-// must restart on the old active layer, and the sandbox must stay usable.
+// must restart on the old active layer, and the sandbox must stay usable —
+// the recovery restart itself is asserted, not just a later Capture.
 func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
-	sb, snap, _, _ := newTestSandbox(t)
+	sb, snap, tasks, _ := newTestSandbox(t)
 	ctx := context.Background()
 	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -668,25 +687,60 @@ func TestApply_StartTaskFailureRemovesPreparedLayerAndRecovers(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 	before := len(snap.keys())
+	onActive := tasks.current
 
-	// Wrap the task service so the next StartTask fails, and hand it to the
-	// sandbox through the same seam Capture's roll-forward test uses.
-	fail := &failingStartTask{taskService: sb.tasks, armed: true}
-	sb.tasks = fail
+	// Break exactly the roll-forward's StartTask; the recovery restart must
+	// go through the same fake and succeed.
+	sb.tasks = &startTaskFailsOnce{taskService: sb.tasks, failNext: true}
 
 	if err := sb.Apply(ctx, state); err == nil {
 		t.Fatal("Apply succeeded although the successor task could not start")
+	}
+	if tasks.current != onActive {
+		t.Fatalf("after the failed Apply the task runs on %q, want the old active %q: "+
+			"the sandbox must recover in place, not stay stopped", tasks.current, onActive)
 	}
 	if len(snap.keys()) != before {
 		t.Errorf("snapshot count = %d after the failed Apply, want %d: the prepared successor must not leak",
 			len(snap.keys()), before)
 	}
 
-	// Disarm: the sandbox recovered on the old active layer, so a subsequent
-	// Capture must succeed (StopTask is idempotent, Commit works on the old
-	// active), and a later Apply must work too.
-	fail.armed = false
-	if _, err := sb.Capture(ctx); err != nil {
-		t.Fatalf("Capture after a recovered Apply: %v", err)
+	// The promised later Apply, on the recovered sandbox.
+	if err := sb.Apply(ctx, state); err != nil {
+		t.Fatalf("Apply after the recovered Apply: %v", err)
+	}
+}
+
+// TestApply_PreservesForeignLineageInCapture pins the cross-sandbox fork
+// flow: a fresh sandbox applying a state captured by another sandbox records
+// the applied layer as its lineage, so the next Capture's ParentKey names the
+// applied state's snapshot rather than falling back to the image rootfs.
+func TestApply_PreservesForeignLineageInCapture(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	ctx := context.Background()
+
+	parent := NewWithBackend(Config{Image: "example/dev:latest"}, snap, newFakeTasks(log, snap), images, WithLeases(&fakeLeases{}))
+	if err := parent.Create(ctx); err != nil {
+		t.Fatalf("Create (parent): %v", err)
+	}
+	state, err := parent.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture (parent): %v", err)
+	}
+
+	child := NewWithBackend(Config{Image: "example/dev:latest"}, snap, newFakeTasks(log, snap), images, WithLeases(&fakeLeases{}))
+	if err := child.Apply(ctx, state); err != nil {
+		t.Fatalf("cross-sandbox Apply: %v", err)
+	}
+	after, err := child.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture (child): %v", err)
+	}
+	if after.ParentKey != state.SnapshotKey {
+		t.Errorf("ParentKey after a cross-sandbox Apply = %q, want the applied state's %q",
+			after.ParentKey, state.SnapshotKey)
 	}
 }
