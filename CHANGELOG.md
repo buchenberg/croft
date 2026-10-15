@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.0 (unreleased)
+
+The roadmap's phases 1–3 ship as one release (decision D1): the lean core,
+the snapshot-native diff, and the snapshot-native delta.
+
+- Diff is now computed at the snapshotter layer: `Changes` and `Diff` compare
+  a captured state against the current workspace through the daemon's diff
+  service, and `ReadFilesAt` reads pre-images from a state without applying
+  it. The git dependency is gone.
+- `ApplyDelta` is a tree-level snapshot merge: a three-way merge of two
+  daemon-side diffs against the state's recorded merge base (`BaseKey`),
+  refusing atomically with `ErrDeltaConflict`. Divergent same-file edits
+  conflict; line-level merge is a scoped follow-up.
+- `WorkspaceState` is a typed four-field record (`SnapshotKey`, `ParentKey`,
+  `BaseKey`, `Image`), replacing the `Data`-map envelope and the `StateKey*`
+  constants.
+- The `Sandbox` interface gains `Changes`, `Diff`, and `ApplyDelta` —
+  source-breaking for external implementers, deliberately.
+- The image contract is now `sh`, `cat`, `mkdir`, `dirname`, `printf`,
+  `base64`, `chmod`, `ls`, `readlink`, `rm`, `ln`; git leaves the required
+  set.
+
 ## v0.3.0
 
 First release of croft as an independent project, extracted from the

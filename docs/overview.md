@@ -28,7 +28,7 @@ define it:
 ```mermaid
 flowchart TB
     subgraph host["Host program"]
-        API["Sandbox interface<br/>Create · Exec · ReadFile · WriteFile<br/>Capture · Apply · ReleaseState · Destroy<br/>Changes · Diff"]
+        API["Sandbox interface<br/>Create · Exec · ReadFile · WriteFile<br/>Capture · Apply · ReleaseState · Destroy<br/>Changes · Diff · ApplyDelta"]
         OP["opMu — exclusive: lifecycle<br/>shared: workspace operations"]
         SB["ContainerdSandbox<br/>lifecycle · lineage · lease pinning · state encoding"]
         API --> OP --> SB
@@ -71,6 +71,7 @@ stateDiagram-v2
     Running --> Running: Exec / ReadFile / WriteFile
     Running --> Running: Capture() — commit, pin, continue on a fresh layer
     Running --> Running: Apply(state) — rebind to a captured layer
+    Running --> Running: ApplyDelta(state) — merge a state's changes in, tree-level
     Running --> Destroyed: Destroy()
     Destroyed --> Running: Apply(state) — the resume path
 
@@ -124,10 +125,10 @@ sequenceDiagram
     Note over L: a GC root with a lifetime of its own —<br/>outlives the sandbox and the process
     S->>K: Prepare(croft/ID/active/N, parent = committed)
     S->>T: StartTask on the new layer
-    S-->>H: WorkspaceState{SnapshotKey, ParentKey, Image}
+    S-->>H: WorkspaceState{SnapshotKey, ParentKey, BaseKey, Image}
 ```
 
-The returned `WorkspaceState` is a plain three-field record. Capture is
+The returned `WorkspaceState` is a plain four-field record. Capture is
 non-mutating: the caller's workspace metadata is left as it was found. The
 price of a coherent snapshot is in-container process state: stopping the task
 kills it. Files persist; running processes do not.
@@ -160,6 +161,48 @@ Three consequences worth internalizing:
   committed snapshot another layer's parent is what preserves them.
 - **Apply works from nothing.** A fresh `ContainerdSandbox` — same config, new
   process — can `Apply` a state it was handed. That is the crash-resume path.
+
+### Merging: ApplyDelta, the three-way merge
+
+`Apply` rebinds; it does not combine. When two sandboxes diverged from the
+same base and one lineage's work must land in the other's tree, `ApplyDelta`
+merges it — tree-level, without git, without a patch payload, and without
+stopping the task. The merge base rides the state: every capture records the
+layer its sandbox last `Apply`ed as `BaseKey`, so a state knows what its own
+changes are relative to.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Host
+    participant A as Sandbox A — ours
+    participant D as Daemon diff service
+    participant K as Snapshotter
+
+    Note over A: A's tree diverged from base B;<br/>state T's lineage diverged from B too
+    H->>A: ApplyDelta(T)
+    A->>K: View(B), View(T) — committed layers mount through views
+    A->>D: Compare(B → T) — "theirs" blob
+    A->>K: View(B)
+    A->>D: Compare(B → A's active) — "ours" blob
+    Note over A: parse both blobs, merge per path:<br/>theirs-only applies · ours-only keeps<br/>identical edits keep · anything else conflicts
+    alt any conflict
+        A-->>H: ErrDeltaConflict(paths) — zero mutations ran
+    else clean
+        A->>A: apply through the task: rm · mkdir · WriteFile · ln -s
+        A-->>H: nil — merged
+    end
+```
+
+Everything is computed before anything is written: both diffs, both parses,
+the merge, and the applicability plan. A conflict therefore refuses exactly —
+`ErrDeltaConflict` names the paths and the workspace is bit-identical to
+before the call. The application phase after a clean merge is *not*
+transactional (parity with the git-era version's `git apply` path).
+Granularity is per-file: divergent same-file edits conflict even on disjoint
+lines — refuse rather than pretend, with line-level merge a scoped follow-up.
+The base must still be pinned: a released base surfaces `ErrStateUnavailable`,
+the same contract `Changes`/`Diff` carry.
 
 ### Giving disk back
 
@@ -207,6 +250,19 @@ _ = child.Apply(ctx, base)         // Create is not needed on the resume path
 // whichever branch wins, the loser's states are reclaimed with ReleaseState
 ```
 
+### Merge: recombining diverged work
+
+The losing branch's work does not have to be discarded — if the child
+captured it, the parent can merge it in instead of rebasing onto it:
+
+```go
+theirs, _ := child.Capture(ctx)        // BaseKey = the shared base
+err := parent.ApplyDelta(ctx, theirs)  // tree-level merge onto the parent's tree
+if errors.Is(err, croft.ErrDeltaConflict) {
+    // both sides touched the same paths incompatibly; nothing was written
+}
+```
+
 ### Crash-resilient work
 
 States outlive the sandbox that captured them. A host records the
@@ -237,9 +293,15 @@ _ = sb.ReleaseState(ctx, superseded)
 - **A state's identity is its snapshot key** — sequence-derived, so two
   captures of identical content produce distinct states. Identity, not
   content equality; a content-derived state identity is a recorded follow-up.
+- **A state's base is its merge base.** `BaseKey` records the layer the
+  capturing sandbox last Applied; `ApplyDelta` diffs against it. A state
+  captured without any Apply has no base and cannot be merged. ApplyDelta
+  never moves the base — a merge is not a rebase.
 - **The image contract.** The workspace's file operations shell out inside
   the container, so the image must provide a shell and the small coreutils
-  croft itself uses: `mkdir`, `cat`, `dirname`, `printf`, `base64`, `chmod`.
+  croft itself uses: `mkdir`, `cat`, `dirname`, `printf`, `base64`, `chmod`;
+  the diff machinery adds `ls` and `readlink`, the delta machinery `rm` and
+  `ln`.
 - **Exec stdin is unsupported** (`ErrStdinUnsupported`): the runc-v2 shim
   holds the exec's stdin FIFO open for the process's lifetime, so a reader
   would never see EOF. Pass data as arguments, as `WriteFile` does — whose

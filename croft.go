@@ -12,7 +12,11 @@
 // Two states can be compared without applying either: Changes reports the
 // sorted difference between a captured state and the current workspace as a
 // []Change, and Diff renders that difference as a unified text diff. Both are
-// read-only against the workspace and never stop or restart the task.
+// read-only against the workspace and never stop or restart the task. A
+// state's changes can also be merged into a diverged workspace: ApplyDelta
+// runs a tree-level three-way merge against the merge base the state carries
+// (BaseKey), refusing atomically on conflict — no git, no repository, no
+// patch payload.
 //
 // # Design constraints
 //
@@ -53,26 +57,29 @@
 // mkdir (Create provisions the workdir), and cat, dirname, printf,
 // base64, and chmod (ReadFile and WriteFile). The diff machinery adds
 // ls and readlink: reader tasks use them to read pre-images, enumerate
-// directories, and resolve symlink targets from a captured state.
+// directories, and resolve symlink targets from a captured state. The
+// delta machinery adds rm and ln: ApplyDelta clears replaced and deleted
+// paths and recreates symlinks.
 //
 // # Status
 //
-// The snapshot lifecycle, teardown ordering, layer pruning, file I/O, and the
-// snapshot-native diff machinery (Changes, Diff, ReadFilesAt) are implemented
-// and unit-tested against containerd's real snapshots.Snapshotter interface,
-// using an in-memory fake that enforces the same invariants as the overlayfs
-// snapshotter: a key cannot be prepared twice, a parent must be committed,
-// only an active layer can be committed (exactly once — an already committed
-// layer is rejected), a committed layer is read-only, and a layer with
-// children cannot be removed.
+// The snapshot lifecycle, teardown ordering, layer pruning, file I/O, the
+// snapshot-native diff machinery (Changes, Diff, ReadFilesAt), and the
+// snapshot-native delta (ApplyDelta) are implemented and unit-tested against
+// containerd's real snapshots.Snapshotter interface, using an in-memory fake
+// that enforces the same invariants as the overlayfs snapshotter: a key
+// cannot be prepared twice, a parent must be committed, only an active layer
+// can be committed (exactly once — an already committed layer is rejected), a
+// committed layer is read-only, and a layer with children cannot be removed.
 //
 // The daemon adapter (client.go) compiles but has not been exercised on every
 // supported daemon configuration; the live test suite runs it against a real
-// containerd when one is reachable. The live suite covers the full lifecycle
-// and the diff path end to end (Changes, Diff, ReadFilesAt against a real
-// daemon-side diff service). Treat container and OCI spec construction, the
-// exec round-trip, and the daemon-side diff service as verified only where
-// the live suite has run.
+// containerd when one is reachable. The live suite covers the full lifecycle,
+// the diff path end to end (Changes, Diff, ReadFilesAt against a real
+// daemon-side diff service), and the delta path (two sandboxes merging over a
+// shared base, conflict refusal, symlink and directory application). Treat
+// container and OCI spec construction, the exec round-trip, and the
+// daemon-side diff service as verified only where the live suite has run.
 //
 // # Lifecycle
 //
@@ -109,6 +116,20 @@
 // lock: they never interleave with Capture/Apply/Destroy, so they always see
 // a quiescent workspace. A state whose layer has been released surfaces
 // ErrStateUnavailable.
+//
+// # Merging states
+//
+// ApplyDelta merges a state's changes into the current workspace: a
+// tree-level three-way merge of two daemon-side diffs — base→theirs (the
+// incoming state) and base→ours (the active layer) — against the merge base
+// the state carries (BaseKey, the layer its capturing sandbox last Applied).
+// Theirs-only changes apply, ours-only changes are kept, identical edits are
+// kept once; divergent edits to the same file, mode disagreement,
+// modify-vs-delete, or a deleted subtree the other side wrote into are
+// conflicts. The refusal is atomic — ErrDeltaConflict names the paths and
+// the workspace is untouched; the application phase after a clean merge is
+// not transactional, matching the git-era version it replaces. Granularity
+// is per-file, not per-line; line-level merge is a scoped follow-up.
 package croft
 
 import (
