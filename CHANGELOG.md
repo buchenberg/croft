@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.0 (unreleased)
+
+- Added: `ExecRequest.Stdin` is honored — stdin as data, staged to a temp
+  file inside the container and redirected into the process, which sees EOF.
+  The shim's stdin FIFO, which never signals EOF, is bypassed entirely.
+- Added: `Config.MaxOutputBytes` — a per-stream cap on exec stdout/stderr.
+  Over-cap streams keep their first and last half around a
+  `[... N bytes truncated ...]` marker; zero (the default) is unbounded.
+- Documented and live-pinned: the background-process recipe — `nohup … &`
+  work survives its launching exec and is polled through its log file; it
+  dies at `Capture`, the stated process-state cost of a coherent snapshot.
+- Breaking: `ErrStdinUnsupported` removed — a non-empty `Stdin` no longer
+  fails.
+- Scope boundaries recorded: interactive exec sessions are deferred (stdin
+  is data delivered once; output is bounded-but-buffered, not streamed), and
+  process-preserving capture is a permanent boundary (CRIU-class
+  checkpointing of arbitrary trees is experimental and fragile).
+
 ## v0.4.0
 
 The roadmap's phases 1–3 ship as one release (decision D1): the lean core,

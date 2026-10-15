@@ -112,6 +112,23 @@ _ = sb.Apply(ctx, state)      // resume from it — rollback, crash-resume, fork
 _ = sb.ReleaseState(ctx, state) // disk comes back when the caller says so
 ```
 
+## Exec I/O
+
+`ExecRequest.Stdin` is honored as data: the bytes are staged to a temp file
+in the container (chunked like `WriteFile`, mode 0600, removed on every
+outcome path) and redirected into the process, which sees EOF when they run
+out — the shim's stdin FIFO, which never signals EOF, is bypassed entirely.
+The staged payload inherits `WriteFile`'s exposure: base64 in argv, visible
+in `/proc/*/cmdline` while staging runs — stdin-shaped data, never secrets.
+Output is bounded-but-buffered: `Config.MaxOutputBytes` caps stdout and
+stderr independently, keeping the first and last half of the budget around a
+`[... N bytes truncated ...]` marker (zero, the default, is unbounded). Two
+deliberate boundaries: interactive exec sessions — writing to a running
+process's stdin, live-tailing its output — are deferred until a consumer
+needs a TTY, and process-preserving `Capture` is permanently out of scope
+(CRIU-class checkpointing of arbitrary process trees is experimental and
+fragile).
+
 ## Long-running processes
 
 Exec waits for its command to exit — and a command that backgrounds its work
@@ -157,7 +174,10 @@ files; `WriteFile` costs roughly one container exec per 512 KiB (configurable
 via `WriteChunkBytes`) and carries its payload base64-encoded in exec
 arguments, visible in `/proc/*/cmdline` while the exec runs — so large
 artifacts are out of the design scope and secrets never travel through
-`WriteFile`.
+`WriteFile` (or through `ExecRequest.Stdin`, which stages through the same
+path). Exec output is bounded-but-buffered: `Config.MaxOutputBytes` caps each
+stream in memory, keeping head and tail around a truncation marker; live
+streaming is a scoped follow-up.
 
 ## Configuration
 

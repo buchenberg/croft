@@ -161,7 +161,9 @@ type ExecRequest struct {
 	Stdin []byte
 }
 
-// ExecResult is the outcome of one command execution.
+// ExecResult is the outcome of one command execution. Stdout and Stderr are
+// the capped strings described on Config.MaxOutputBytes when that knob is
+// set.
 type ExecResult struct {
 	ExitCode int
 	Stdout   string
@@ -215,6 +217,15 @@ type Sandbox interface {
 	ReleaseState(ctx context.Context, ws WorkspaceState) error
 
 	// Exec runs a command in the sandbox and returns its result.
+	//
+	// A non-empty ExecRequest.Stdin is delivered to the command as data:
+	// staged to a temp file in the container and redirected into the
+	// process, which sees EOF (see ExecRequest.Stdin for the contract and
+	// the exposure caveat). Stdout and Stderr are capped per stream by
+	// Config.MaxOutputBytes when set; over-cap streams keep their head and
+	// tail around a truncation marker. A command that backgrounds its work
+	// (`nohup … &`) returns immediately and survives subsequent Execs —
+	// and dies at Capture, like every process.
 	Exec(ctx context.Context, req ExecRequest) (ExecResult, error)
 
 	// ReadFile reads a file inside the sandbox workspace.
