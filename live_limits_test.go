@@ -34,9 +34,11 @@ import (
 // either way. The probe checks the v2 core interface file, which every v2
 // cgroup has: its absence means there is no v2 view in the container at
 // all (a v1 host, or no cgroup mount). It cannot tell the task's own
-// cgroup from the hierarchy root, but the root carries none of the limit
-// files, so a root view fails the reads loudly below (cat exits non-zero),
-// never passing silently.
+// cgroup from a root-level view, but no such view can pass silently,
+// whichever shape the root takes: where the limit files are absent (the
+// hierarchy root — they are CFTYPE_NOT_ON_ROOT), cat exits non-zero; where
+// a view does expose them reading "max", the value assertions below fail
+// on the mismatch.
 func TestLive_LimitsReachTheCgroup(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
