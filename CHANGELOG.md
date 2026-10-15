@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.7.0 (unreleased)
+## v0.7.0
 
 - Added: `Config.Secrets` (`[]SecretMount`) — host files bind-mounted
   read-only into the container. A token arrives as a file at its
