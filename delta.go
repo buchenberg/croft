@@ -288,19 +288,21 @@ var ErrDeltaConflict = errors.New("croft: delta conflicts with the workspace's o
 //     would no-op through it, and the chmod would rewrite the target's mode —
 //     possibly outside the workspace. `[ -L ]` closes that; real directories
 //     survive because ours may hold kept children inside them.
-//   - `chmod -s,-t` precedes the numeric mode because some chmod
+//   - `chmod a-s,a-t` precedes the numeric mode because some chmod
 //     implementations (GNU-derived semantics, observed on uutils) PRESERVE a
 //     directory's setuid/setgid when the numeric mode does not spell the
 //     special bits, so a theirs-side 02755→0755 change would silently stay
-//     2755. The symbolic clear is portable (GNU, BusyBox, uutils all carry
-//     -s/-t); padding the numeric to five digits is not — POSIX numeric
-//     modes are at most four octal digits.
+//     2755. The explicit-who symbolic clear is portable: no leading dash for
+//     an option parser to trip over (GNU special-cases mode letters in its
+//     optstring; plainer parsers may not), and no dependence on the
+//     omitted-who umask rule. Padding the numeric to five digits is NOT
+//     portable — POSIX numeric modes are at most four octal digits.
 //
 // The image contract: sh, rm, mkdir, chmod, ln — plus whatever WriteFile
 // already needs.
 const (
 	deltaRemoveScript  = `rm -rf -- "$1"`
-	deltaMkdirScript   = "set -e\nif [ ! -d \"$1\" ] || [ -L \"$1\" ]; then rm -rf -- \"$1\"; fi\nmkdir -p -- \"$1\"\nchmod -s,-t \"$1\"\nchmod \"$2\" \"$1\""
+	deltaMkdirScript   = "set -e\nif [ ! -d \"$1\" ] || [ -L \"$1\" ]; then rm -rf -- \"$1\"; fi\nmkdir -p -- \"$1\"\nchmod a-s,a-t \"$1\"\nchmod \"$2\" \"$1\""
 	deltaSymlinkScript = `rm -rf -- "$2" && ln -s -- "$1" "$2"`
 )
 

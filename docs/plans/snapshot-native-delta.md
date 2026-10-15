@@ -239,7 +239,7 @@ rules:
   survive — ours may hold kept children inside it — while anything else at
   the path, a symlink-to-directory included, is replaced (a plain `-d`
   guard follows the link and the chmod would rewrite the target). The
-  script also clears special bits symbolically (`chmod -s,-t`) before the
+  script also clears special bits symbolically (`chmod a-s,a-t`) before the
   numeric mode: short numeric modes preserve a directory's setgid under
   preservation-quirk implementations (verified on uutils and BusyBox), and
   five-digit padding is not portable (POSIX numeric modes cap at four
