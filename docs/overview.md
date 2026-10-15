@@ -366,7 +366,12 @@ other containerd users), `Image` (required — the base rootfs), `Runtime`,
 `FIFODir` (client-side stdio FIFOs — set it to drive the daemon without
 root), `Limits` (CPU shares/quota, memory, pids caps on every container
 generation the sandbox starts; nil is unbounded — the multitenancy fairness
-floor), and `Network` (the posture: `""`/`"none"` keeps the container's own
+floor), `Network` (the posture: `""`/`"none"` keeps the container's own
 loopback-only namespace — the default croft has always had; `"host"` shares
-the daemon host's network, an explicit opt-in). See `Config` in `sandbox.go`
-for the full contract of each field.
+the daemon host's network, an explicit opt-in), `Secrets` (host files
+bind-mounted read-only into the container — a token arrives as a file,
+never in argv, env, or any exec payload), and `StagingDir` (when set,
+`WriteFile` writes host-side and moves files into place atomically,
+closing the `/proc/*/cmdline` exposure; when unset the base64-in-argv
+posture is unchanged). See `Config` in `sandbox.go` for the full contract
+of each field.

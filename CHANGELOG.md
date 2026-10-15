@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.7.0
+
+- Added: `Config.Secrets` (`[]SecretMount`) — host files bind-mounted
+  read-only into the container. A token arrives as a file at its
+  destination, never in argv, process environment, or any exec payload.
+  Source must be an absolute path on the daemon host; Destination must be
+  an absolute in-container path outside the workdir root. Duplicate
+  destinations are rejected. The same host-coupling caveat as `FIFODir`
+  applies: remote clients stage their secrets through whatever shared path
+  they already have.
+- Added: `Config.StagingDir` — when set, `WriteFile` writes the payload
+  host-side into the staging directory (bind-mounted read-write at
+  `/run/croft-staging`) and moves it into place atomically inside the
+  container via cat-to-temp-then-rename. The content appears in no argv at
+  any point, closing the `/proc/*/cmdline` exposure for every write.
+  When unset, `WriteFile` keeps the documented base64-in-argv posture.
+- Validation: `Config.Secrets` and `Config.StagingDir` are checked at every
+  generation-starting entry — `Create`, `Apply`, and the `ReadFilesAt`
+  reader path — per the config-typo convention.
+
 ## v0.6.0
 
 - Added: `Config.Network` — the workspace's network posture, with the

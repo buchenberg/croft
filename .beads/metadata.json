@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "croft",
+  "project_id": "c074fade-d915-4349-928f-5542ac62c15e"
+}
