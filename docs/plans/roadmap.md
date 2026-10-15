@@ -100,14 +100,22 @@ The single most important authorization rule survives the remap verbatim: no
 tool accepts raw `WorkspaceState` JSON from a client; handles are broker IDs
 the broker recorded (D3).
 
-### D6 — The network default stays `host`
+### D6 — The network default stays what it is: isolated (corrected)
 
-Phases 4–6 deliberately change no default behavior: workspaces without
-`Config.Network` set keep the host's network exactly as today (agents need
-package installs and git remotes), and `none` is the opt-in off-switch. The
-default being a footgun for generated-code workloads is a documentation
-problem — the README says what `host` means — not a breaking change.
-Controlled egress is follow-on work, not a phase.
+**Corrected by ruling, 2026-10-15.** The original decision ("the network
+default stays `host`") rested on a false premise: containerd's default spec
+already unshares the network namespace, so croft's containers have never
+shared the host's network — they have always been loopback-only. "No default
+change" applied to reality means the default stays *isolated*:
+`Config.Network` `""`/`"none"` keep today's private netns, and `"host"` is
+the explicit opt-in that removes the NEWNET entry so the container joins the
+daemon host's namespace (package installs, git remotes, and everything else
+the host can reach — for trusted workloads, and what the broker surfaces as
+per-tenant policy). Flipping the default to `host` as originally written
+would silently grant every existing sandbox network access it never had: a
+security regression shipped as a no-change phase, rejected. Controlled
+egress remains follow-on work, not a phase. The correction is recorded in
+full in the network plan.
 
 ### D7 — Secrets are files, not a vault
 
@@ -192,8 +200,8 @@ yaah, not here. Long term, an open question below.
 - **v0.5.0 tag**: the exec I/O plan's live set — stdin-as-data, the
   truncation marker, and both background-process tests (survives-exec and
   dies-at-Capture) — green against a real daemon.
-- **v0.6.0 tag**: both network tests green (`lo`-only under `none`; the
-  honest host-interface listing under the default).
+- **v0.6.0 tag**: both network tests green (`lo`-only under `none` and the
+  identical default; the host's own interface listing under `host`).
 - **v0.7.0 tag**: the secrets live set green, and the fake's recorded exec
   log for a staging write contains no base64 payload — the exposure-closure
   assertion.

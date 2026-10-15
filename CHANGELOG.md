@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.0 (unreleased)
+
+- Added: `Config.Network` — the workspace's network posture, with the
+  default now documented as what it has always been: containerd's default
+  spec unshares the network namespace, so croft containers run
+  loopback-only — no egress, no ingress, DNS fails fast. `""`/`"none"` keep
+  that posture; `"host"` is the explicit opt-in that removes the unshare so
+  the container shares the daemon host's network. Unknown values are
+  rejected loudly at `Create` and `Apply` alike.
+- Corrected: the phase plan and roadmap decision D6 assumed today's default
+  was host networking; the premise was inverted. The ruling (2026-10-15)
+  keeps the default unchanged in fact — isolated — rather than silently
+  granting every existing sandbox host network access.
+- Live-pinned: the `lo`-only listing under `none` and the identical default;
+  the host's own interface listing under `host`.
+
 ## v0.5.0
 
 - Added: `Config.Limits` — CPU shares/quota, memory, and pids caps, threaded

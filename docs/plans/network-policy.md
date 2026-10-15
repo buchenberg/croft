@@ -1,5 +1,12 @@
 # Network Policy Plan — croft
 
+> **Correction (2026-10-15):** this plan's premise was inverted — croft's
+> containers have never shared the host's network namespace; containerd's
+> default spec already unshares it. The ruled semantics are in
+> "Correction: the premise was inverted" at the end. Parts 0–2 below keep
+> their intent and task shapes, but the mechanism is flipped: `host` is the
+> mode that changes the spec, and the isolated default needs nothing.
+
 Give a workspace a network posture: **`Config.Network`** with two modes —
 `host` (today's behavior, the default) and `none` (a fresh network namespace
 with only loopback: a true off-switch). This is the biggest honesty gap in an
@@ -119,3 +126,37 @@ wants the reverse. The broker's `create_sandbox` tool grows an optional
 - Controlled egress / allowlist proxy (follow-on; roadmap records it).
 - Custom bridges, CNI integration, per-sandbox IP allocation.
 - Inbound port publishing (a workspace is not a service).
+
+## Correction: the premise was inverted (ruled 2026-10-15)
+
+Part 0 called host networking "the biggest honesty gap" on the claim that
+croft's containers share the host's network namespace. They do not, and
+never did: containerd's default spec (`pkg/oci`'s `defaultUnixNamespaces`)
+carries a `NetworkNamespace` entry, and an empty-path NEWNET entry makes
+runc unshare into a fresh netns — loopback-only, since croft wires no CNI
+(the same reason bare `ctr run` containers have no networking). No live
+test exposed this because nothing in the suite needed container-side
+networking.
+
+The ruling keeps the default behavior unchanged in fact, which means
+unchanged as *isolated*:
+
+- `""` / `"none"`: today's posture — the default spec's private netns,
+  untouched. The right default for untrusted code, and the one croft has
+  always shipped.
+- `"host"`: the mode that must act — `oci.WithHostNamespace` removes the
+  NEWNET entry, runc skips the unshare, and the container joins the daemon
+  host's namespace. An explicit opt-in for trusted workloads; this is what
+  makes package installs and git remotes work, which Part 0 wrongly assumed
+  they already did.
+- Flipping the default to `host` (D6 as originally written) would silently
+  grant every existing sandbox network access it never had — a security
+  regression shipped as a "no default change" phase. Rejected.
+
+Mechanism and task deltas from Parts 1–2 as landed: validation runs at
+`Create` *and* `Apply` (a resumed sandbox never calls Create); the spec opt
+is `WithHostNamespace` for `host`, nothing at all for `none`; and the live
+proofs are `TestLive_NetworkNoneIsLoopbackOnly` (`lo`-only under `none` and
+the identical `""`) plus `TestLive_NetworkHostSeesInterfaces` (the
+container's listing equals the host's own `/sys/class/net`, skipping
+honestly on a loopback-only host). Roadmap D6 carries the same correction.

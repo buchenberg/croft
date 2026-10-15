@@ -338,6 +338,16 @@ _ = sb.ReleaseState(ctx, superseded)
   not coexist in this design — including for the background-process recipe
   above, and permanently: a process-preserving capture would need CRIU-class
   checkpointing of an arbitrary tree, which is a recorded scope boundary.
+- **The network default is isolation.** Containers run in their own network
+  namespace with only loopback — no egress, no ingress, DNS fails fast.
+  This is not new behavior: containerd's default spec unshares the network
+  namespace and croft wires no CNI, so workspaces have always been
+  loopback-only. `Config.Network: "host"` removes the unshare and shares
+  the daemon host's network — package installs, git remotes, and everything
+  else the host can reach; an explicit opt-in for trusted workloads. The
+  posture's proof is `ls /sys/class/net` inside the container: the image
+  contract carries no curl or wget, and the interface listing is the
+  contract-honest evidence.
 - **Containment is honest, not absolute.** Namespaces plus a separate rootfs:
   strong, but a kernel exploit escapes it.
 - **Linux only.** OverlayFS and the containerd daemon require Linux with root
@@ -352,6 +362,9 @@ other containerd users), `Image` (required — the base rootfs), `Runtime`,
 `InitArgs` (the keep-alive command, default `sleep infinity`), `Workdir`
 (default `/workspace`), `WriteChunkBytes` (per-exec write payload),
 `FIFODir` (client-side stdio FIFOs — set it to drive the daemon without
-root), and `Limits` (CPU shares/quota, memory, pids caps on every container
+root), `Limits` (CPU shares/quota, memory, pids caps on every container
 generation the sandbox starts; nil is unbounded — the multitenancy fairness
-floor). See `Config` in `sandbox.go` for the full contract of each field.
+floor), and `Network` (the posture: `""`/`"none"` keeps the container's own
+loopback-only namespace — the default croft has always had; `"host"` shares
+the daemon host's network, an explicit opt-in). See `Config` in `sandbox.go`
+for the full contract of each field.

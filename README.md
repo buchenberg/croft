@@ -44,6 +44,12 @@ The properties, honestly:
   captures of identical content are distinct states. Identity, not content
   equality; croft has no digest, and a host that wants a record identity
   hashes the four-field struct itself.
+- **Network-isolated by default** — the container gets its own network
+  namespace with only loopback: no egress, no ingress, DNS fails fast.
+  `Config.Network: "host"` is the explicit opt-in that shares the daemon
+  host's network instead — package installs, git remotes, and everything
+  else the host can reach. Untrusted code keeps the default; trusted
+  workloads opt in.
 
 ## Diffing states
 
@@ -183,11 +189,13 @@ streaming is a scoped follow-up.
 
 `croft.Config` carries the containerd address, namespace, image, runtime,
 snapshotter, init command, in-container workdir, write chunking, the
-client-side FIFO directory (set the last to a user-writable path to drive
-containerd without root), and resource limits (`Config.Limits`: CPU
+client-side FIFO directory (set it to a user-writable path to drive
+containerd without root), resource limits (`Config.Limits`: CPU
 shares/quota, memory, and pids caps applied to every container generation
-the sandbox starts; nil means unbounded). See `Config` in `sandbox.go` for the
-full contract of each field.
+the sandbox starts; nil means unbounded), and the network posture
+(`Config.Network`: the default keeps the container's own loopback-only
+namespace; `"host"` opts into the daemon host's network). See `Config` in
+`sandbox.go` for the full contract of each field.
 
 ## State format
 
