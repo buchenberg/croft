@@ -182,10 +182,12 @@ streaming is a scoped follow-up.
 ## Configuration
 
 `croft.Config` carries the containerd address, namespace, image, runtime,
-snapshotter, init command, in-container workdir, write chunking, and the
+snapshotter, init command, in-container workdir, write chunking, the
 client-side FIFO directory (set the last to a user-writable path to drive
-containerd without root). See `Config` in `croft.go` for the full contract of
-each field.
+containerd without root), and resource limits (`Config.Limits`: CPU
+shares/quota, memory, and pids caps applied to every container generation
+the sandbox starts; nil means unbounded). See `Config` in `sandbox.go` for the
+full contract of each field.
 
 ## State format
 
