@@ -145,8 +145,9 @@ type Config struct {
 	// resolver: /etc/resolv.conf is the image's, so hostname-based
 	// operations also need an image with a usable resolver config.
 	//
-	// Any other value is rejected loudly at Create and Apply (the
-	// config-typo convention).
+	// Any other value is rejected loudly at every entry that starts a
+	// container generation — Create, Apply, and the ReadFilesAt reader
+	// path (the config-typo convention).
 	Network string
 }
 
@@ -192,9 +193,9 @@ func (c Config) workdir() string {
 }
 
 // validateNetwork checks Config.Network against the two supported postures.
-// Called at Create and Apply — every entry that starts a container
-// generation — so a typo fails loudly before any daemon call instead of
-// silently running the workspace under the wrong network posture.
+// Called at Create, Apply, and withReaderTask — every entry that starts a
+// container generation — so a typo fails loudly before any daemon call
+// instead of silently running the workspace under the wrong network posture.
 func (c Config) validateNetwork() error {
 	switch c.Network {
 	case "", "host", "none":
