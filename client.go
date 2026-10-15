@@ -40,17 +40,6 @@ const sandboxLabel = "croft.sandbox"
 // rather than assumed.
 const defaultSnapshotter = "overlayfs"
 
-// ErrStdinUnsupported is returned by Exec when ExecRequest.Stdin is non-empty.
-// Callers can test for it with errors.Is to fall back to another transport.
-//
-// This is a containerd constraint, not a missing feature. The runc-v2 shim's
-// execProcess.openStdin opens the exec's stdin FIFO O_WRONLY and keeps it in
-// e.closers for the process's whole lifetime, so the FIFO always has a writer
-// and an in-container reader never observes EOF. Failing immediately beats the
-// alternative: a process blocked on stdin does not error, it hangs until the
-// context expires, which for a caller-supplied timeout can be minutes.
-var ErrStdinUnsupported = errors.New("containerd sandbox: exec stdin is unsupported")
-
 // namespaceOrDefault resolves the namespace this backend operates in.
 func namespaceOrDefault(cfg Config) string {
 	if cfg.Namespace == "" {
@@ -667,13 +656,20 @@ func (t *containerdTasks) StopTask(ctx context.Context, id string) error {
 
 // Exec runs a command in the sandbox's current container generation.
 func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) (ExecResult, error) {
-	// Rejected before any RPC: the process would start, block on a stdin that can
-	// never reach EOF, and cost the caller its whole context budget to find out.
+	// The adapter never delivers ExecRequest.Stdin to the shim — a
+	// containerd constraint, not a missing feature: the runc-v2 shim's
+	// execProcess.openStdin opens the exec's stdin FIFO O_WRONLY and keeps
+	// it in e.closers for the process's whole lifetime
+	// (cmd/containerd-shim-runc-v2/process/exec.go), so the FIFO always has
+	// a writer and an in-container reader never observes EOF. Fed through
+	// it, a process does not error — it hangs until the context expires.
+	// The sandbox layer therefore stages stdin as a temp file and redirects
+	// it (see ExecRequest.Stdin); a non-empty Stdin reaching this adapter
+	// is a croft invariant violation and fails loudly before any RPC.
 	if len(req.Stdin) > 0 {
-		return ExecResult{}, fmt.Errorf("%w: %s would block until the context "+
-			"expires because the runc-v2 shim keeps a write end on the exec's stdin FIFO; "+
-			"pass data through arguments instead, as WriteFile does",
-			ErrStdinUnsupported, req.Command)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: ExecRequest.Stdin reached the daemon adapter for %q: "+
+			"the shim's stdin FIFO never signals EOF; the sandbox layer must stage it as a file",
+			req.Command)
 	}
 
 	ctx = t.ctx(ctx)
@@ -696,10 +692,11 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 
 	execID := fmt.Sprintf("exec-%d", t.execSeq.Add(1))
 
-	// req.Stdin is rejected at the top of this method (see ErrStdinUnsupported),
-	// so stdin is always empty here. A reader is still supplied because copyIO
-	// passes it to io.CopyBuffer without a nil check and a nil interface reader
-	// panics; an empty bytes.Reader reaches EOF at once.
+	// req.Stdin never reaches here (guarded above — the sandbox layer
+	// stages it as a file), so stdin is always empty. A reader is still
+	// supplied because copyIO passes it to io.CopyBuffer without a nil
+	// check and a nil interface reader panics; an empty bytes.Reader
+	// reaches EOF at once.
 	//
 	// FIFODir comes from Config: containerd's default is root-owned, and the
 	// client creates these FIFOs itself, so an unprivileged caller needs a

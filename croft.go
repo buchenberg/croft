@@ -145,7 +145,20 @@ type ExecRequest struct {
 	Cwd     string
 	Env     map[string]string
 	Timeout time.Duration
-	Stdin   []byte
+	// Stdin is delivered to the command as data: the bytes are staged to a
+	// mode-0600 temp file inside the container (through the WriteFile
+	// path, so arbitrary sizes chunk) and redirected into the process's
+	// stdin, which sees EOF when the bytes run out — the shim's stdin
+	// FIFO, which never signals EOF, is bypassed entirely. The staged file
+	// is removed on every outcome path.
+	//
+	// This is data delivery, not an interactive session: nothing can be
+	// written after the process starts (interactive sessions are a
+	// deferred scope boundary). The exposure caveat inherits from
+	// WriteFile — content travels base64 in exec arguments, visible in
+	// /proc/*/cmdline while staging runs: stdin-shaped data, never
+	// secrets.
+	Stdin []byte
 }
 
 // ExecResult is the outcome of one command execution.

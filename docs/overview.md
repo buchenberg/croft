@@ -302,11 +302,14 @@ _ = sb.ReleaseState(ctx, superseded)
   croft itself uses: `mkdir`, `cat`, `dirname`, `printf`, `base64`, `chmod`;
   the diff machinery adds `ls` and `readlink`, the delta machinery `rm` and
   `ln`.
-- **Exec stdin is unsupported** (`ErrStdinUnsupported`): the runc-v2 shim
-  holds the exec's stdin FIFO open for the process's lifetime, so a reader
-  would never see EOF. Pass data as arguments, as `WriteFile` does — whose
-  content travels base64-encoded in argv, visible in `/proc/*/cmdline`; do
-  not write secrets with this backend.
+- **Exec stdin is data, not a session.** `ExecRequest.Stdin` is staged to a
+  temp file in the container and redirected into the process, which sees EOF
+  — the shim's stdin FIFO, held open for the process's lifetime so a reader
+  would never see EOF, is bypassed entirely. Nothing can be written after
+  the process starts: interactive sessions are a deferred scope boundary.
+  The staged payload inherits `WriteFile`'s exposure — base64 in argv,
+  visible in `/proc/*/cmdline` while staging runs; stdin-shaped data, never
+  secrets.
 - **Capture costs process state.** Stopping the task kills running
   processes; files persist. A coherent snapshot and a live process tree do
   not coexist in this design.

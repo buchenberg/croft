@@ -731,6 +731,12 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 }
 
 // Exec runs a command inside the sandbox.
+//
+// A non-empty ExecRequest.Stdin is delivered as data: staged to a temp file
+// in the container and redirected into the process, which sees EOF when the
+// bytes run out. The shim's stdin FIFO — which never signals EOF — is
+// bypassed entirely; see ExecRequest.Stdin for the contract and the
+// exposure caveat.
 func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResult, error) {
 	s.opMu.RLock()
 	defer s.opMu.RUnlock()
@@ -751,7 +757,62 @@ func (s *ContainerdSandbox) execImpl(ctx context.Context, req ExecRequest) (Exec
 	if req.Cwd == "" {
 		req.Cwd = s.cfg.workdir()
 	}
+	if len(req.Stdin) > 0 {
+		return s.execWithStdin(ctx, id, req)
+	}
 	return s.tasks.Exec(ctx, id, req)
+}
+
+// execWithStdin delivers req.Stdin as data without touching the shim's
+// stdin FIFO — which never signals EOF, so feeding it directly would hang
+// the process until the context expires. The mechanism is a staged temp
+// file and a shell redirect:
+//
+//  1. The bytes go to /tmp/croft-stdin-<rand> through the WriteFile path
+//     (chunked, so arbitrary sizes work), mode 0600.
+//  2. The command runs wrapped as
+//     /bin/sh -c 'exec "$@" < <staged>' croft <command> <args...> —
+//     the exec "$@" form passes the command and its arguments through
+//     verbatim, with no quoting or escaping of user data, and the shell
+//     performs the redirect. The process sees EOF when the bytes run out.
+//  3. The staged file is removed on EVERY outcome path, cancel-free — the
+//     house cleanup rule the blob pins follow.
+//
+// The exposure caveat inherits from WriteFile: the payload travels
+// base64-encoded in exec arguments while staging, visible in
+// /proc/*/cmdline. Stdin-shaped data, never secrets.
+func (s *ContainerdSandbox) execWithStdin(ctx context.Context, id string, req ExecRequest) (ExecResult, error) {
+	data := req.Stdin
+	stdinPath := "/tmp/croft-stdin-" + newSandboxID()
+
+	if err := s.writeFileImpl(ctx, stdinPath, data, 0o600); err != nil {
+		// Staging failed partway: a partial temp file may exist. No exec
+		// ran; clean up best-effort and surface the staging error.
+		s.removeStagedStdin(ctx, id, stdinPath)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: stage stdin for %s: %w", req.Command, err)
+	}
+	defer s.removeStagedStdin(ctx, id, stdinPath)
+
+	req.Stdin = nil
+	wrapped := ExecRequest{
+		Command: "/bin/sh",
+		Args:    append([]string{"-c", `exec "$@" < ` + stdinPath, "croft", req.Command}, req.Args...),
+		Cwd:     req.Cwd,
+		Env:     req.Env,
+		Timeout: req.Timeout,
+	}
+	return s.tasks.Exec(ctx, id, wrapped)
+}
+
+// removeStagedStdin deletes a staged stdin temp file, cancel-free and
+// best-effort: the cleanup must run even after a failed or cancelled exec,
+// and a cleanup failure must not mask the exec's own outcome.
+func (s *ContainerdSandbox) removeStagedStdin(ctx context.Context, id, stdinPath string) {
+	_, _ = s.tasks.Exec(context.WithoutCancel(ctx), id, ExecRequest{
+		Command: "rm",
+		Args:    []string{"-f", "--", stdinPath},
+		Cwd:     "/",
+	})
 }
 
 // ReadFile reads a file inside the sandbox.
@@ -847,7 +908,7 @@ chmod "$perm" "$p"`
 			args[2] = "1"
 		}
 		args = append(args, base64Args(data[off:end])...)
-		if _, err := s.execShell(ctx, nil, script, args...); err != nil {
+		if _, err := s.shell(ctx, script, args...); err != nil {
 			return fmt.Errorf("containerd sandbox: write %s: %w", path, err)
 		}
 		if end == len(data) {
@@ -888,13 +949,11 @@ func (s *ContainerdSandbox) restart(ctx context.Context, id, activeKey string) e
 	return s.tasks.StartTask(ctx, id, activeKey)
 }
 
-// shell runs a POSIX shell script with positional arguments.
+// shell runs a POSIX shell script with positional arguments. A non-zero exit
+// is an error. There is no stdin parameter: the shim's stdin FIFO can never
+// deliver data (see ExecRequest.Stdin for the staged-file mechanism Exec
+// uses), so nothing here may pretend otherwise.
 func (s *ContainerdSandbox) shell(ctx context.Context, script string, args ...string) (ExecResult, error) {
-	return s.execShell(ctx, nil, script, args...)
-}
-
-// execShell runs a shell script with optional stdin and positional arguments.
-func (s *ContainerdSandbox) execShell(ctx context.Context, stdin []byte, script string, args ...string) (ExecResult, error) {
 	s.mu.Lock()
 	id := s.id
 	s.mu.Unlock()
@@ -908,7 +967,6 @@ func (s *ContainerdSandbox) execShell(ctx context.Context, stdin []byte, script 
 		Command: "sh",
 		Args:    shArgs,
 		Cwd:     s.cfg.workdir(),
-		Stdin:   stdin,
 	})
 	if err != nil {
 		return res, err

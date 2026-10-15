@@ -29,7 +29,9 @@ the fakes cannot reach everything a real daemon does:
   collector across the whole lifecycle; namespace isolation is asserted
   against the daemon itself (the fakes have no namespaces).
 - **Exec semantics.** Streams are separated, exit codes surface without
-  errors, duration is populated, and stdin is refused rather than blocked.
+  errors, duration is populated, and `ExecRequest.Stdin` is delivered as
+  data — staged to a temp file and redirected, so the process sees EOF and
+  no residue survives (`TestLive_ExecStdinIsData`).
 - **Snapshot-native diff.** `Changes` reports the full change matrix (add,
   modify, delete, mode-only, new directory, opaque directory, symlink)
   through the production API against a real daemon-side diff service;
