@@ -112,6 +112,32 @@ _ = sb.Apply(ctx, state)      // resume from it — rollback, crash-resume, fork
 _ = sb.ReleaseState(ctx, state) // disk comes back when the caller says so
 ```
 
+## Long-running processes
+
+Exec waits for its command to exit — and a command that backgrounds its work
+returns immediately. That is the whole recipe for dev servers, test watchers,
+and daemons:
+
+```go
+_, _ = sb.Exec(ctx, croft.ExecRequest{
+    Command: "/bin/sh",
+    Args:    []string{"-c", `nohup ./dev-server > /tmp/server.log 2>&1 &`},
+})
+// The exec returns at once; the child is reparented to the container's init
+// and keeps running across subsequent Execs. Poll its log like any file:
+log, _ := sb.ReadFile(ctx, "/tmp/server.log")
+```
+
+The boundary, plainly: **background processes die at Capture**. A coherent
+snapshot stops the task, commits the layer, and continues on a fresh one —
+files persist, processes do not. A process-preserving capture would need
+CRIU-class checkpointing of an arbitrary process tree and is a permanent
+scope boundary, not a gap awaiting a fix; restart the server after Capture if
+you want it running (the workspace, including its log, is intact).
+Interactive sessions are out of scope by decision as well: stdin is data
+delivered once (`ExecRequest.Stdin`), and output is bounded-but-buffered
+(`Config.MaxOutputBytes`), not streamed.
+
 ## The image contract
 
 The workspace's file operations shell out inside the container, so the image

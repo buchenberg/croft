@@ -228,6 +228,29 @@ good, _ := sb.Capture(ctx)   // tests green: pin it, keep working
 Each `Capture` costs a task restart but leaves the sandbox running on a fresh
 layer; capture as often as the work is worth keeping.
 
+### A background dev server
+
+Exec waits for its command to exit — so a command that backgrounds its work
+returns immediately, and the child (reparented to the container's init) keeps
+running across subsequent Execs:
+
+```go
+_, _ = sb.Exec(ctx, croft.ExecRequest{
+    Command: "/bin/sh",
+    Args:    []string{"-c", `nohup ./dev-server > /tmp/server.log 2>&1 &`},
+})
+// poll the log like any file:
+log, _ := sb.ReadFile(ctx, "/tmp/server.log")
+```
+
+This is the Exec-and-poll pattern agent workloads want — dev servers, test
+watchers, fleet daemons — and it is pinned by the live suite
+(`TestLive_BackgroundProcessSurvivesExec`). Its boundary is equally part of
+the product: **background processes die at `Capture`**
+(`TestLive_BackgroundProcessDiesAtCapture` pins that too, honestly). Files
+persist, processes do not; restart the server after capturing if you want it
+running.
+
 ### Rollback
 
 ```go
@@ -312,7 +335,9 @@ _ = sb.ReleaseState(ctx, superseded)
   secrets.
 - **Capture costs process state.** Stopping the task kills running
   processes; files persist. A coherent snapshot and a live process tree do
-  not coexist in this design.
+  not coexist in this design — including for the background-process recipe
+  above, and permanently: a process-preserving capture would need CRIU-class
+  checkpointing of an arbitrary tree, which is a recorded scope boundary.
 - **Containment is honest, not absolute.** Namespaces plus a separate rootfs:
   strong, but a kernel exploit escapes it.
 - **Linux only.** OverlayFS and the containerd daemon require Linux with root

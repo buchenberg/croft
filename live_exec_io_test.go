@@ -126,3 +126,121 @@ func TestLive_ExecOutputCapTruncatesMiddle(t *testing.T) {
 		t.Errorf("under-cap stdout = %q, want %q", res.Stdout, "hi\n")
 	}
 }
+
+// startBackgroundTicker launches a writer that appends a tick line to
+// /tmp/bg.log every 200ms, via the documented recipe: nohup, redirected,
+// backgrounded. The launching Exec must return immediately — the point of the
+// recipe is that Exec waits for its command, and this command's job is to
+// not be the workload.
+func startBackgroundTicker(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd string) {
+	t.Helper()
+	start := time.Now()
+	res, err := sb.Exec(ctx, ExecRequest{
+		Command: "/bin/sh",
+		Args: []string{"-c",
+			`nohup /bin/sh -c 'i=0; while [ $i -lt 1000 ]; do echo "tick $i" >> /tmp/bg.log; i=$((i+1)); sleep 0.2; done' >/dev/null 2>&1 &`},
+		Cwd: cwd,
+	})
+	if err != nil {
+		t.Fatalf("launch background ticker: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("launch exit = %d (stderr %q)", res.ExitCode, res.Stderr)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("launch took %s, want an immediate return (the workload is backgrounded)", elapsed)
+	}
+}
+
+// tickCount reads /tmp/bg.log and returns its line count, failing the test
+// only when the read itself fails (an empty log before the first tick is a
+// legitimate zero).
+func tickCount(t *testing.T, ctx context.Context, sb *ContainerdSandbox) int {
+	t.Helper()
+	data, err := sb.ReadFile(ctx, "/tmp/bg.log")
+	if err != nil {
+		t.Fatalf("read bg log: %v", err)
+	}
+	return strings.Count(string(data), "\n")
+}
+
+// waitTicks polls until the log holds at least want lines, or fails the test
+// after the deadline.
+func waitTicks(t *testing.T, ctx context.Context, sb *ContainerdSandbox, want int) int {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		n := tickCount(t, ctx, sb)
+		if n >= want {
+			return n
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bg log held %d lines after 15s, want >= %d (the background process never ran)", n, want)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestLive_BackgroundProcessSurvivesExec pins the recipe's product behavior
+// on a real runtime: a backgrounded writer survives the exec that launched
+// it (reparented to the container's init) and keeps producing across later
+// execs and file reads — the log grows while the client merely polls.
+func TestLive_BackgroundProcessSurvivesExec(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	sb := newLiveSandbox(t, ctx, cfg)
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	startBackgroundTicker(t, ctx, sb, cfg.Workdir)
+
+	// The process is alive across unrelated client traffic: first ticks
+	// appear, and the count keeps growing afterwards.
+	first := waitTicks(t, ctx, sb, 2)
+	time.Sleep(700 * time.Millisecond)
+	second := tickCount(t, ctx, sb)
+	if second <= first {
+		t.Errorf("bg log stuck at %d lines (was %d): the process did not survive its launching exec", second, first)
+	}
+}
+
+// TestLive_BackgroundProcessDiesAtCapture pins the recipe's boundary with
+// the same honesty: Capture stops the task to commit a coherent layer, so
+// the background process is gone afterwards — while its FILE output persists
+// in the snapshot. A growing-then-frozen log is the observation; a
+// process-preserving capture is a permanent scope boundary, not a gap.
+func TestLive_BackgroundProcessDiesAtCapture(t *testing.T) {
+	cfg := loadLiveConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	defer cancel()
+
+	sb := newLiveSandbox(t, ctx, cfg)
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	startBackgroundTicker(t, ctx, sb, cfg.Workdir)
+	before := waitTicks(t, ctx, sb, 2)
+
+	state := captureLive(t, ctx, sb)
+	if state.SnapshotKey == "" {
+		t.Fatal("Capture returned an empty state")
+	}
+
+	// After the restart the writer must be dead: the log it kept growing
+	// freezes at whatever was committed (possibly a few ticks more than
+	// `before` — the process ran until the stop), and stays frozen while a
+	// live writer would add several lines per second.
+	time.Sleep(1500 * time.Millisecond)
+	frozen := tickCount(t, ctx, sb)
+	if frozen < before {
+		t.Errorf("bg log shrank across Capture: %d → %d (the committed layer must carry the file)", before, frozen)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if grown := tickCount(t, ctx, sb); grown != frozen {
+		t.Errorf("bg log grew %d → %d after Capture: the background process survived a snapshot it must not survive", frozen, grown)
+	}
+}
