@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 (unreleased)
+## v0.5.0
 
 - Added: `Config.Limits` — CPU shares/quota, memory, and pids caps, threaded
   into the OCI spec of every container generation a sandbox starts (init and

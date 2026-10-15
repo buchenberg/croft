@@ -173,3 +173,31 @@ everything else unchanged.
 - CRIU / process-preserving capture — permanent boundary.
 - Secrets-safe input paths (a real secrets story is its own cross-cutting
   design; this plan documents the exposure instead of pretending).
+
+## Landing notes (implementation deviations)
+
+Recorded as landed in branch `phase4/exec-io` (PRs #10 and, for D2's
+`Config.Limits`, #9):
+
+- **The wrapper's placeholder**: the §1.1 sketch put `req.Command` in the
+  first position after the script — that is `$0`, so `exec "$@"` would have
+  run the first *argument*. The landed form uses the house placeholder:
+  `/bin/sh -c 'exec "$@" < staged' croft <command> <args…>`.
+- **Staging lives in the sandbox layer** (`execWithStdin` reusing
+  `writeFileImpl`), not inside `containerdTasks.Exec`: the adapter stays a
+  pure argv runner, and a non-empty `Stdin` reaching it is now a loud
+  invariant violation instead of `ErrStdinUnsupported` (deleted as planned).
+- **The output cap applies to public Exec traffic only** (review finding):
+  `ReadFile`'s cat stdout *is* the file's bytes and the diff reader tasks
+  speak protocol over stdout — capping them would silently corrupt data
+  transport. An unexported `ExecRequest.capOutput` flag, set only by the
+  sandbox's Exec path, scopes the cap; diagnostics are capped, data is not.
+- **Non-positive `MaxOutputBytes` means unbounded**, guarded in the buffer
+  itself: a negative cap computed a negative tail capacity and panicked
+  inside cio's copy goroutine — a host-process crash over a config typo.
+- **The tail window pre-trims oversized writes** before appending, so
+  retained memory is bounded by the budget rather than by a single write's
+  size.
+- `Config.Limits` (D2) landed alongside, early in phase 4 as the roadmap
+  sequences it: CPU shares/quota, memory, pids, merged into the spec's
+  Linux resources without clobbering the default device allowlist.
