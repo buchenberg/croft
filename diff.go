@@ -808,6 +808,15 @@ func (s *ContainerdSandbox) computeChangesBetween(ctx context.Context, lowerKey,
 			changes = append(changes, Change{Path: p, Kind: ChangeDelete})
 		}
 	}
+	if len(opaques) > 0 {
+		// Re-sort: the synthesized deletes are appended after the parser's
+		// sorted entries, and this function's contract (like the parser's)
+		// is a path-sorted list — mergeChanges' two-pointer walk depends
+		// on it, and an out-of-order delete could slip past conflict
+		// detection. changesImpl/diffImpl re-sort again after their own
+		// reclassification; that stays harmless.
+		sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	}
 
 	return changes, postImages, nil
 }

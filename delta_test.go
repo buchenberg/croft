@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -877,5 +880,154 @@ func TestApplyDelta_SpecialFileRefusesBeforeMutation(t *testing.T) {
 	}
 	if len(tasks.allReqs) != before {
 		t.Errorf("refusal ran %d execs, want 0", len(tasks.allReqs)-before)
+	}
+}
+
+// TestDeltaMkdirScript runs the real mkdir script under the host's /bin/sh
+// against a real filesystem — the semantics the fake cannot model: a
+// symlink-to-directory must be replaced rather than written through (a plain
+// `[ ! -d ]` guard follows the link and would chmod the TARGET, possibly
+// outside the workspace), a real directory with kept children must survive,
+// and the symbolic pre-clear must make the numeric mode absolute (short
+// numeric modes preserve a directory's setgid under preservation-quirk chmod
+// implementations — verified against uutils and BusyBox).
+func TestDeltaMkdirScript(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh on PATH")
+	}
+	run := func(dir, mode string) {
+		t.Helper()
+		cmd := exec.Command(sh, "-c", deltaMkdirScript, "croft", dir, mode)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("mkdir script on %s: %v\n%s", dir, err, out)
+		}
+	}
+
+	t.Run("replaces a symlink-to-directory without touching the target", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		link := filepath.Join(root, "d")
+		if err := os.Mkdir(target, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(target, 0o755|fs.ModeSetgid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+
+		run(link, "0750")
+
+		info, err := os.Lstat(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("d is %v, want a real directory (the symlink must be replaced)", info.Mode())
+		}
+		if info.Mode().Perm() != 0o750 {
+			t.Errorf("d perm = %04o, want 0750", info.Mode().Perm())
+		}
+		ti, err := os.Stat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ti.Mode()&fs.ModeSetgid == 0 || ti.Mode().Perm() != 0o755 {
+			t.Errorf("target mode = %v, want untouched setgid 0755 (chmod must not write through the link)", ti.Mode())
+		}
+	})
+
+	t.Run("preserves a real directory and its children, clears special bits", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "e")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755|fs.ModeSetgid); err != nil {
+			t.Fatal(err)
+		}
+		child := filepath.Join(dir, "keep.txt")
+		if err := os.WriteFile(child, []byte("kept\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		run(dir, "0755")
+
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("e is %v, want a surviving directory", info.Mode())
+		}
+		if info.Mode().Perm() != 0o755 {
+			t.Errorf("e perm = %04o, want 0755", info.Mode().Perm())
+		}
+		if info.Mode()&fs.ModeSetgid != 0 {
+			t.Errorf("e mode = %v, want setgid cleared (the numeric mode is absolute)", info.Mode())
+		}
+		if got, err := os.ReadFile(child); err != nil || string(got) != "kept\n" {
+			t.Errorf("kept child = %q, %v; want %q, nil", got, err, "kept\n")
+		}
+	})
+
+	t.Run("creates an absent directory with the exact mode", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "n", "deep")
+		run(dir, "0700")
+
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Errorf("n/deep = %v, want a directory with perm 0700", info.Mode())
+		}
+	})
+}
+
+// TestApplyDelta_OpaqueDirExpansionStaysSorted is the regression for
+// unsorted merge inputs: the synthesized opaque-dir deletes are appended
+// after the parser's sorted entries, and an out-of-order delete would slip
+// past the two-pointer merge — applied over ours' change instead of
+// conflicting with it. Theirs' opaque dir hides the base's d/a.txt (which
+// ours modified); the correct merge is a modify/delete conflict on d/a.txt,
+// while the unsorted walk would silently apply the delete.
+func TestApplyDelta_OpaqueDirExpansionStaysSorted(t *testing.T) {
+	sb, _, tasks, _, fds, base := deltaTestSandbox(t)
+	ctx := context.Background()
+
+	// Theirs: an opaque marker on d plus one new file in it. The base's d
+	// held a.txt and z.txt, so resolving the marker synthesizes a delete
+	// for d/a.txt — appended AFTER the parser's d/z.txt entry unless the
+	// list is re-sorted.
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/d/.wh..wh..opq", mode: 0, typeflag: tar.TypeReg},
+		tarEntry{name: "workspace/d/z.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("Z\n")},
+	))
+	tasks.lsDirs["/workspace/d"] = []string{"a.txt", "z.txt"}
+	// Ours: a modification to one of the hidden files.
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/d/a.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("ours\n")},
+	))
+
+	before := len(tasks.allReqs)
+	err := sb.ApplyDelta(ctx, deltaState(base))
+	if !errors.Is(err, ErrDeltaConflict) {
+		t.Fatalf("err = %v, want ErrDeltaConflict (delete of d/a.txt vs ours' modify)", err)
+	}
+	if !strings.Contains(err.Error(), "d/a.txt") {
+		t.Errorf("conflict error %q does not name d/a.txt", err)
+	}
+	// No mutation ran (the opaque resolution's ls is reader-task work, not
+	// a mutation): nothing removed, nothing written.
+	execs := tasks.allReqs[before:]
+	if paths := scriptPaths(execs, deltaRemoveScript); len(paths) != 0 {
+		t.Errorf("refusal ran rm on %v, want none", paths)
+	}
+	if writes := decodeDeltaWrites(t, execs); len(writes) != 0 {
+		t.Errorf("refusal wrote %v, want none", writes)
 	}
 }

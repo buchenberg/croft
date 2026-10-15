@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -214,10 +213,12 @@ type deltaOp struct {
 // must replace whatever is there: truncate-through on a symlink would
 // corrupt its target, on a directory it fails, and on a FIFO open(2) blocks.
 // rm -rf is uniformly correct and a cheap no-op when the path is absent (the
-// add case). Directories use a conditional script instead: a dir landing on
-// a NON-directory (the base's file replaced by a dir) must clear it first,
-// but an existing directory must survive — ours may hold kept children in
-// it, which the rigid-entry rule permits.
+// add case). Directories use a guarded script instead: a dir landing on a
+// NON-directory (the base's file or symlink-to-directory replaced by a dir)
+// must clear it first, but an existing real directory must survive — ours
+// may hold kept children in it, which the rigid-entry rule permits. The
+// script also clears special bits symbolically before the numeric chmod;
+// see deltaMkdirScript.
 //
 // No size guard: the delta carries full file contents transiently, the same
 // documented blob-cost risk the diff machinery carries (the roadmap rules
@@ -279,14 +280,27 @@ func planDelta(apply []Change, theirsContent map[string][]byte) ([]deltaOp, erro
 var ErrDeltaConflict = errors.New("croft: delta conflicts with the workspace's own changes")
 
 // The delta application scripts. rm -rf covers files, symlinks, and
-// directories alike; mkdirScript's conditional rm replaces a non-directory
-// the base left at the path without ever removing an existing directory
-// (ours may hold kept children in it); the symlink script rm-then-ln's
-// because ln -s refuses to replace an existing path. The image contract:
-// sh, rm, mkdir, chmod, ln — plus whatever WriteFile already needs.
+// directories alike; the symlink script rm-then-ln's because ln -s refuses
+// to replace an existing path. The mkdir script is the subtle one:
+//
+//   - The guard removes the path unless it is a REAL directory. `[ ! -d ]`
+//     alone follows symlinks: a symlink-to-directory would survive, mkdir -p
+//     would no-op through it, and the chmod would rewrite the target's mode —
+//     possibly outside the workspace. `[ -L ]` closes that; real directories
+//     survive because ours may hold kept children inside them.
+//   - `chmod -s,-t` precedes the numeric mode because some chmod
+//     implementations (GNU-derived semantics, observed on uutils) PRESERVE a
+//     directory's setuid/setgid when the numeric mode does not spell the
+//     special bits, so a theirs-side 02755→0755 change would silently stay
+//     2755. The symbolic clear is portable (GNU, BusyBox, uutils all carry
+//     -s/-t); padding the numeric to five digits is not — POSIX numeric
+//     modes are at most four octal digits.
+//
+// The image contract: sh, rm, mkdir, chmod, ln — plus whatever WriteFile
+// already needs.
 const (
 	deltaRemoveScript  = `rm -rf -- "$1"`
-	deltaMkdirScript   = "set -e\nif [ ! -d \"$1\" ]; then rm -rf -- \"$1\"; fi\nmkdir -p -- \"$1\"\nchmod \"$2\" \"$1\""
+	deltaMkdirScript   = "set -e\nif [ ! -d \"$1\" ] || [ -L \"$1\" ]; then rm -rf -- \"$1\"; fi\nmkdir -p -- \"$1\"\nchmod -s,-t \"$1\"\nchmod \"$2\" \"$1\""
 	deltaSymlinkScript = `rm -rf -- "$2" && ln -s -- "$1" "$2"`
 )
 
@@ -383,11 +397,12 @@ func (s *ContainerdSandbox) applyDeltaImpl(ctx context.Context, ws WorkspaceStat
 				return fmt.Errorf("containerd sandbox: delta remove %s: %w", op.path, err)
 			}
 		case opMkdir:
-			mode := strconv.FormatUint(uint64(effectivePerm(op.mode)), 8)
-			// The conditional rm handles the base-type replacement (the
-			// base's regular file became a directory in theirs) without
-			// ever removing an existing directory ours may hold kept
-			// children in. See planDelta.
+			mode := fmt.Sprintf("%04o", effectivePerm(op.mode))
+			// The script's guard replaces a non-directory (or a symlink to
+			// one) the base left at the path, without ever removing a real
+			// directory ours may hold kept children in; its symbolic
+			// pre-clear makes the numeric mode absolute across chmod
+			// implementations. See deltaMkdirScript.
 			if _, err := s.shell(ctx, deltaMkdirScript, resolved, mode); err != nil {
 				return fmt.Errorf("containerd sandbox: delta mkdir %s: %w", op.path, err)
 			}

@@ -107,11 +107,10 @@ func TestLive_ApplyDeltaMergesOntoMovedParent(t *testing.T) {
 	}
 
 	// ApplyDelta left the lineage base untouched: the next capture still
-	// records the last APPLIED state as its base.
-	after, err := sbA.Capture(ctx)
-	if err != nil {
-		t.Fatalf("Capture after merge: %v", err)
-	}
+	// records the last APPLIED state as its base. captureLive (not a bare
+	// Capture) so this state's pin is released with the test, like every
+	// other live capture.
+	after := captureLive(t, ctx, sbA)
 	if after.BaseKey != base.SnapshotKey {
 		t.Errorf("post-merge BaseKey = %q, want %q (ApplyDelta must not move the base)",
 			after.BaseKey, base.SnapshotKey)

@@ -234,9 +234,16 @@ rules:
   modify (the parser reports `ChangeModify` for all non-whiteout entries)
   and the delta runs no classification reader task, so the base's type
   under any written path is unknowable. `rm -rf` is uniformly correct and
-  a no-op on absence. Directories instead use a conditional script
-  (`[ -d ] || rm -rf`): an existing directory must survive — ours may hold
-  kept children inside it.
+  a no-op on absence. Directories instead use a guarded script
+  (`[ ! -d ] || [ -L ]` → `rm -rf`): an existing real directory must
+  survive — ours may hold kept children inside it — while anything else at
+  the path, a symlink-to-directory included, is replaced (a plain `-d`
+  guard follows the link and the chmod would rewrite the target). The
+  script also clears special bits symbolically (`chmod -s,-t`) before the
+  numeric mode: short numeric modes preserve a directory's setgid under
+  preservation-quirk implementations (verified on uutils and BusyBox), and
+  five-digit padding is not portable (POSIX numeric modes cap at four
+  digits).
 - **The image contract gains `ln` alongside `rm`** (§1.4 named only `rm`):
   theirs' symlink entries apply as `rm -rf` + `ln -s`, with the target
   carried by the blob's `Linkname`. BusyBox and coreutils both carry it —
