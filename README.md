@@ -48,8 +48,9 @@ The properties, honestly:
   namespace with only loopback: no egress, no ingress, DNS fails fast.
   `Config.Network: "host"` is the explicit opt-in that shares the daemon
   host's network instead — package installs, git remotes, and everything
-  else the host can reach. Untrusted code keeps the default; trusted
-  workloads opt in.
+  else the host can reach (the namespace is shared, not the resolver:
+  `/etc/resolv.conf` stays the image's). Untrusted code keeps the default;
+  trusted workloads opt in.
 
 ## Diffing states
 

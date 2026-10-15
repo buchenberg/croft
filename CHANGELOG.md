@@ -7,8 +7,10 @@
   spec unshares the network namespace, so croft containers run
   loopback-only — no egress, no ingress, DNS fails fast. `""`/`"none"` keep
   that posture; `"host"` is the explicit opt-in that removes the unshare so
-  the container shares the daemon host's network. Unknown values are
-  rejected loudly at `Create` and `Apply` alike.
+  the container shares the daemon host's network (the namespace is shared,
+  not the resolver: `/etc/resolv.conf` stays the image's). Unknown values
+  are rejected loudly at every generation entry — `Create`, `Apply`, and
+  the `ReadFilesAt` reader path.
 - Corrected: the phase plan and roadmap decision D6 assumed today's default
   was host networking; the premise was inverted. The ruling (2026-10-15)
   keeps the default unchanged in fact — isolated — rather than silently

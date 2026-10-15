@@ -492,6 +492,14 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 	if ws.SnapshotKey == "" {
 		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
+	// The reader task is a container generation like any other — and
+	// ReadFilesAt works before Create, so this path can be the first
+	// thing a misconfigured sandbox ever does. Validate here too: an
+	// unknown posture must fail loudly, not silently run a reader under
+	// the isolated default.
+	if err := s.cfg.validateNetwork(); err != nil {
+		return err
+	}
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}

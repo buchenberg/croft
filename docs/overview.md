@@ -344,10 +344,12 @@ _ = sb.ReleaseState(ctx, superseded)
   namespace and croft wires no CNI, so workspaces have always been
   loopback-only. `Config.Network: "host"` removes the unshare and shares
   the daemon host's network — package installs, git remotes, and everything
-  else the host can reach; an explicit opt-in for trusted workloads. The
-  posture's proof is `ls /sys/class/net` inside the container: the image
-  contract carries no curl or wget, and the interface listing is the
-  contract-honest evidence.
+  else the host can reach; an explicit opt-in for trusted workloads, with
+  one caveat: host mode shares the namespace, not the resolver —
+  `/etc/resolv.conf` comes from the image, so hostname-based operations
+  need an image with a usable resolver config. The posture's proof is
+  `ls /sys/class/net` inside the container: the image contract carries no
+  curl or wget, and the interface listing is the contract-honest evidence.
 - **Containment is honest, not absolute.** Namespaces plus a separate rootfs:
   strong, but a kernel exploit escapes it.
 - **Linux only.** OverlayFS and the containerd daemon require Linux with root

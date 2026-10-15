@@ -154,9 +154,16 @@ unchanged as *isolated*:
   regression shipped as a "no default change" phase. Rejected.
 
 Mechanism and task deltas from Parts 1–2 as landed: validation runs at
-`Create` *and* `Apply` (a resumed sandbox never calls Create); the spec opt
-is `WithHostNamespace` for `host`, nothing at all for `none`; and the live
-proofs are `TestLive_NetworkNoneIsLoopbackOnly` (`lo`-only under `none` and
-the identical `""`) plus `TestLive_NetworkHostSeesInterfaces` (the
-container's listing equals the host's own `/sys/class/net`, skipping
-honestly on a loopback-only host). Roadmap D6 carries the same correction.
+`Create`, `Apply`, *and* the `ReadFilesAt` reader path (a resumed sandbox
+never calls Create, and a reader task is a container generation too); the
+spec opt is `WithHostNamespace` for `host`, and an explicit re-assertion of
+the NEWNET entry for `none`/default — review hardening, so the off-switch is
+croft's own guarantee rather than a containerd default that could drift;
+host mode shares the namespace but not the resolver (`/etc/resolv.conf`
+stays the image's — a documented prerequisite for hostname-based
+operations); and the live proofs are `TestLive_NetworkNoneIsLoopbackOnly`
+(`lo`-only under `none` and the identical `""`) plus
+`TestLive_NetworkHostSeesInterfaces` (the container's listing brackets
+against the host's own `/sys/class/net` read immediately before and after,
+set-shaped to tolerate interface churn, skipping honestly on a
+loopback-only host). Roadmap D6 carries the same correction.

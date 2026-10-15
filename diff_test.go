@@ -1001,6 +1001,31 @@ func TestReadFilesAt_BeforeCreate(t *testing.T) {
 	}
 }
 
+// TestReadFilesAt_ValidatesNetwork pins the reader path against the posture
+// typo: ReadFilesAt works before Create, and its reader task is a container
+// generation like any other — an unknown Network value must be rejected
+// before any backend operation, not silently run an isolated reader.
+func TestReadFilesAt_ValidatesNetwork(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("croft/test/committed/1")
+	sb := NewWithBackend(
+		Config{Image: "example/dev:latest", Network: "bridge"},
+		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "croft/test/committed/1"})
+
+	_, err := sb.ReadFilesAt(context.Background(),
+		WorkspaceState{SnapshotKey: "croft/test/committed/1"}, []string{"file.txt"})
+	if err == nil {
+		t.Fatal("ReadFilesAt with an unknown Network posture must fail")
+	}
+	if !strings.Contains(err.Error(), "Network") {
+		t.Errorf("error should name the field: %v", err)
+	}
+	if ops := log.snapshot(); len(ops) != 0 {
+		t.Errorf("validation must run before any backend operation; ops = %v", opVerbs(ops))
+	}
+}
+
 // TestReadFilesAt_ReleasedStateIsUnavailable pins that a state whose layer
 // has been released surfaces ErrStateUnavailable.
 func TestReadFilesAt_ReleasedStateIsUnavailable(t *testing.T) {

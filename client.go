@@ -510,13 +510,20 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 	if res := linuxResources(t.cfg.Limits); res != nil {
 		opts = append(opts, withLinuxResources(res))
 	}
-	// Config.Network: containerd's default spec already unshares the
-	// network namespace, so "" and "none" — the isolated posture croft
-	// has always had — need no spec change at all. "host" is the mode
-	// that must act: removing the NEWNET entry makes runc skip the
-	// unshare, and the container joins the daemon host's namespace.
+	// Config.Network: "host" removes the default spec's NEWNET entry —
+	// runc then skips the unshare and the container joins the daemon
+	// host's namespace. "" and "none" re-assert the entry explicitly:
+	// today that replaces the default spec's identical entry with itself
+	// (no change), but the off-switch is thereby croft's own guarantee
+	// rather than a dependency default that could drift — a silently
+	// host-networked "none" is exactly the regression this feature
+	// exists to prevent.
 	if t.cfg.Network == "host" {
 		opts = append(opts, oci.WithHostNamespace(specs.NetworkNamespace))
+	} else {
+		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+			Type: specs.NetworkNamespace,
+		}))
 	}
 	return opts, nil
 }

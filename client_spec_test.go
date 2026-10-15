@@ -176,17 +176,20 @@ func TestLinuxResources(t *testing.T) {
 
 // TestInitSpecOpts_Network pins the posture mapping — and with it the
 // corrected premise of the network phase: containerd's default spec already
-// unshares the network namespace, so the isolated default ("", "none") needs
-// no opt at all, and "host" is the mode that must change the spec, by
-// removing the NEWNET entry so runc skips the unshare.
+// unshares the network namespace. The isolated default ("", "none") keeps
+// that entry, re-asserted explicitly so the off-switch is croft's own
+// guarantee rather than a dependency default that could drift; "host" is
+// the mode that changes the spec, removing the NEWNET entry so runc skips
+// the unshare.
 func TestInitSpecOpts_Network(t *testing.T) {
-	hasNetNS := func(spec *oci.Spec) bool {
+	countNetNS := func(spec *oci.Spec) int {
+		n := 0
 		for _, ns := range spec.Linux.Namespaces {
 			if ns.Type == specs.NetworkNamespace {
-				return true
+				n++
 			}
 		}
-		return false
+		return n
 	}
 
 	for name, scfg := range map[string]Config{
@@ -197,8 +200,10 @@ func TestInitSpecOpts_Network(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: generateInitSpecWithConfig: %v", name, err)
 		}
-		if !hasNetNS(spec) {
-			t.Errorf("%s: spec carries no network-namespace entry, want the default spec's private netns kept", name)
+		if n := countNetNS(spec); n != 1 {
+			t.Errorf("%s: %d network-namespace entries in the spec, want exactly "+
+				"one — the private netns kept, and the re-assertion must replace "+
+				"the default's entry, not duplicate it", name, n)
 		}
 	}
 
@@ -206,9 +211,9 @@ func TestInitSpecOpts_Network(t *testing.T) {
 	if err != nil {
 		t.Fatalf("host: generateInitSpecWithConfig: %v", err)
 	}
-	if hasNetNS(spec) {
-		t.Errorf("host: spec still carries a network-namespace entry (%v), want it removed so runc shares the host's netns",
-			spec.Linux.Namespaces)
+	if n := countNetNS(spec); n != 0 {
+		t.Errorf("host: spec carries %d network-namespace entries (%v), want it "+
+			"removed so runc shares the host's netns", n, spec.Linux.Namespaces)
 	}
 }
 

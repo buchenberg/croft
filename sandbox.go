@@ -141,7 +141,9 @@ type Config struct {
 	// installs, git remotes, and egress work, and so does everything
 	// else the host can reach. An explicit opt-in; every container
 	// generation this sandbox starts inherits it, reader tasks
-	// included.
+	// included. What host mode shares is the namespace, not the
+	// resolver: /etc/resolv.conf is the image's, so hostname-based
+	// operations also need an image with a usable resolver config.
 	//
 	// Any other value is rejected loudly at Create and Apply (the
 	// config-typo convention).
@@ -198,7 +200,7 @@ func (c Config) validateNetwork() error {
 	case "", "host", "none":
 		return nil
 	default:
-		return fmt.Errorf("containerd sandbox: Config.Network %q is not a supported posture: use \"host\" or \"none\"", c.Network)
+		return fmt.Errorf("containerd sandbox: Config.Network %q is not a supported posture: leave it unset (the isolated default), or use \"none\" or \"host\"", c.Network)
 	}
 }
 

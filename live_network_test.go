@@ -20,6 +20,7 @@ package croft
 import (
 	"context"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -88,27 +89,49 @@ func TestLive_NetworkNoneIsLoopbackOnly(t *testing.T) {
 
 // TestLive_NetworkHostSeesInterfaces pins the opt-in: under "host" the
 // container's network view is the daemon host's own — the honest statement
-// of what "host" means. The listing is compared against the host's
-// /sys/class/net read from the test process, which runs on the daemon's
-// machine (that is what "the host" refers to: the daemon host, not some
-// further-up hypervisor).
+// of what "host" means. The host's listing is read from the test process
+// (same machine as the daemon) immediately before and after the container
+// read, and the assertion is set-shaped rather than strict equality:
+// interfaces come and go on a live host (veth pairs from other containers,
+// transient tunnels), so every interface stable across the container read
+// must appear in it, and the container must show nothing the host did not
+// have around the read.
 func TestLive_NetworkHostSeesInterfaces(t *testing.T) {
+	sb, ctx := startNetSandbox(t, "host")
+
+	before := hostInterfaces(t)
+	got := netInterfaces(t, ctx, sb)
+	after := hostInterfaces(t)
+
+	if len(before) == 1 && before[0] == "lo" && len(after) == 1 && after[0] == "lo" {
+		t.Skip("the host shows only loopback: host mode would be " +
+			"indistinguishable from none on this machine")
+	}
+	for _, name := range before {
+		if slices.Contains(after, name) && !slices.Contains(got, name) {
+			t.Errorf("Network \"host\": interface %q was on the host across the "+
+				"container read but is missing from the container's view %v", name, got)
+		}
+	}
+	for _, name := range got {
+		if !slices.Contains(before, name) && !slices.Contains(after, name) {
+			t.Errorf("Network \"host\": container shows interface %q, absent from "+
+				"both surrounding host readings %v / %v", name, before, after)
+		}
+	}
+}
+
+// hostInterfaces lists the host's own /sys/class/net, sorted.
+func hostInterfaces(t *testing.T) []string {
+	t.Helper()
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
 		t.Skipf("cannot read the host's interfaces: %v", err)
 	}
-	var host []string
+	host := make([]string, 0, len(entries))
 	for _, e := range entries {
 		host = append(host, e.Name())
 	}
 	sort.Strings(host)
-	if len(host) == 1 && host[0] == "lo" {
-		t.Skip("the host shows only loopback: host mode would be " +
-			"indistinguishable from none on this machine")
-	}
-
-	sb, ctx := startNetSandbox(t, "host")
-	if got := netInterfaces(t, ctx, sb); strings.Join(got, " ") != strings.Join(host, " ") {
-		t.Errorf("Network \"host\": interfaces = %v, want the host's own %v", got, host)
-	}
+	return host
 }
