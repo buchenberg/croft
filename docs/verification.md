@@ -29,7 +29,18 @@ the fakes cannot reach everything a real daemon does:
   collector across the whole lifecycle; namespace isolation is asserted
   against the daemon itself (the fakes have no namespaces).
 - **Exec semantics.** Streams are separated, exit codes surface without
-  errors, duration is populated, and stdin is refused rather than blocked.
+  errors, duration is populated, and `ExecRequest.Stdin` is delivered as
+  data — staged to a temp file and redirected, so the process sees EOF and
+  no residue survives (`TestLive_ExecStdinIsData`). Over-cap streams keep
+  their head and tail around a truncation marker, reconstructed
+  byte-for-byte against the expected rendering
+  (`TestLive_ExecOutputCapTruncatesMiddle`).
+- **The background-process recipe.** A `nohup … &` workload survives its
+  launching exec and keeps producing across later client traffic
+  (`TestLive_BackgroundProcessSurvivesExec`), and dies at `Capture` while
+  its file output persists in the snapshot — the boundary pinned as
+  honestly as the recipe
+  (`TestLive_BackgroundProcessDiesAtCapture`).
 - **Snapshot-native diff.** `Changes` reports the full change matrix (add,
   modify, delete, mode-only, new directory, opaque directory, symlink)
   through the production API against a real daemon-side diff service;

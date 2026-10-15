@@ -92,6 +92,19 @@ type Config struct {
 	// travels per exec.
 	WriteChunkBytes int
 
+	// MaxOutputBytes caps each of an exec's stdout and stderr in memory,
+	// applied per stream independently to public Exec traffic only —
+	// ReadFile and the diff reader tasks carry data, not diagnostics, and
+	// stay lossless regardless of this knob. Over the cap, the first and
+	// last MaxOutputBytes/2 bytes survive with a "[... N bytes truncated
+	// ...]" marker between them — heads carry the command's banner, tails
+	// the actual error. The cut is byte-based: a UTF-8 sequence or line may
+	// split at a boundary (output is diagnostic text). Zero or negative
+	// means unbounded — the behavior before this knob existed; a negative
+	// value is treated as unbounded rather than rejected, matching
+	// WriteChunkBytes' tolerance for non-positive knobs.
+	MaxOutputBytes int
+
 	// FIFODir is where the containerd *client* creates the FIFOs that carry an
 	// exec's stdio. Empty uses containerd's default (/run/containerd/fifo),
 	// which is root-owned — and because the client creates these itself, an
@@ -779,6 +792,12 @@ func splitChain(chain []string, key string) (kept, orphaned []string) {
 }
 
 // Exec runs a command inside the sandbox.
+//
+// A non-empty ExecRequest.Stdin is delivered as data: staged to a temp file
+// in the container and redirected into the process, which sees EOF when the
+// bytes run out. The shim's stdin FIFO — which never signals EOF — is
+// bypassed entirely; see ExecRequest.Stdin for the contract and the
+// exposure caveat.
 func (s *ContainerdSandbox) Exec(ctx context.Context, req ExecRequest) (ExecResult, error) {
 	s.opMu.RLock()
 	defer s.opMu.RUnlock()
@@ -799,7 +818,74 @@ func (s *ContainerdSandbox) execImpl(ctx context.Context, req ExecRequest) (Exec
 	if req.Cwd == "" {
 		req.Cwd = s.cfg.workdir()
 	}
+	// Public Exec traffic: the only path where Config.MaxOutputBytes
+	// applies. Internal protocol reads (ReadFile's cat, reader tasks)
+	// carry data and stay lossless.
+	req.capOutput = true
+	if len(req.Stdin) > 0 {
+		return s.execWithStdin(ctx, id, req)
+	}
 	return s.tasks.Exec(ctx, id, req)
+}
+
+// execWithStdin delivers req.Stdin as data without touching the shim's
+// stdin FIFO — which never signals EOF, so feeding it directly would hang
+// the process until the context expires. The mechanism is a staged temp
+// file and a shell redirect:
+//
+//  1. The bytes go to /tmp/croft-stdin-<rand> through the WriteFile path
+//     (chunked, so arbitrary sizes work), mode 0600.
+//  2. The command runs wrapped as
+//     /bin/sh -c 'exec "$@" < <staged>' croft <command> <args...> —
+//     the exec "$@" form passes the command and its arguments through
+//     verbatim, with no quoting or escaping of user data, and the shell
+//     performs the redirect. The process sees EOF when the bytes run out.
+//  3. The staged file is removed on EVERY outcome path, cancel-free — the
+//     house cleanup rule the blob pins follow.
+//
+// The exposure caveat inherits from WriteFile: the payload travels
+// base64-encoded in exec arguments while staging, visible in
+// /proc/*/cmdline. Stdin-shaped data, never secrets.
+func (s *ContainerdSandbox) execWithStdin(ctx context.Context, id string, req ExecRequest) (ExecResult, error) {
+	data := req.Stdin
+	stdinPath := "/tmp/croft-stdin-" + newSandboxID()
+
+	if err := s.writeFileImpl(ctx, stdinPath, data, 0o600); err != nil {
+		// Staging failed partway: a partial temp file may exist. No exec
+		// ran; clean up best-effort and surface the staging error.
+		s.removeStagedStdin(ctx, id, stdinPath)
+		return ExecResult{}, fmt.Errorf("containerd sandbox: stage stdin for %s: %w", req.Command, err)
+	}
+	defer s.removeStagedStdin(ctx, id, stdinPath)
+
+	wrapped := ExecRequest{
+		Command: "/bin/sh",
+		Args:    append([]string{"-c", `exec "$@" < ` + stdinPath, "croft", req.Command}, req.Args...),
+		Cwd:     req.Cwd,
+		Env:     req.Env,
+		Timeout: req.Timeout,
+
+		capOutput: req.capOutput,
+	}
+	res, err := s.tasks.Exec(ctx, id, wrapped)
+	if err != nil {
+		// The adapter only ever sees the wrapper: name the caller's
+		// command too, so a timed-out `cat` does not report as a failed
+		// /bin/sh.
+		return res, fmt.Errorf("exec %s with staged stdin: %w", req.Command, err)
+	}
+	return res, nil
+}
+
+// removeStagedStdin deletes a staged stdin temp file, cancel-free and
+// best-effort: the cleanup must run even after a failed or cancelled exec,
+// and a cleanup failure must not mask the exec's own outcome.
+func (s *ContainerdSandbox) removeStagedStdin(ctx context.Context, id, stdinPath string) {
+	_, _ = s.tasks.Exec(context.WithoutCancel(ctx), id, ExecRequest{
+		Command: "rm",
+		Args:    []string{"-f", "--", stdinPath},
+		Cwd:     "/",
+	})
 }
 
 // ReadFile reads a file inside the sandbox.
@@ -895,7 +981,7 @@ chmod "$perm" "$p"`
 			args[2] = "1"
 		}
 		args = append(args, base64Args(data[off:end])...)
-		if _, err := s.execShell(ctx, nil, script, args...); err != nil {
+		if _, err := s.shell(ctx, script, args...); err != nil {
 			return fmt.Errorf("containerd sandbox: write %s: %w", path, err)
 		}
 		if end == len(data) {
@@ -936,13 +1022,11 @@ func (s *ContainerdSandbox) restart(ctx context.Context, id, activeKey string) e
 	return s.tasks.StartTask(ctx, id, activeKey)
 }
 
-// shell runs a POSIX shell script with positional arguments.
+// shell runs a POSIX shell script with positional arguments. A non-zero exit
+// is an error. There is no stdin parameter: the shim's stdin FIFO can never
+// deliver data (see ExecRequest.Stdin for the staged-file mechanism Exec
+// uses), so nothing here may pretend otherwise.
 func (s *ContainerdSandbox) shell(ctx context.Context, script string, args ...string) (ExecResult, error) {
-	return s.execShell(ctx, nil, script, args...)
-}
-
-// execShell runs a shell script with optional stdin and positional arguments.
-func (s *ContainerdSandbox) execShell(ctx context.Context, stdin []byte, script string, args ...string) (ExecResult, error) {
 	s.mu.Lock()
 	id := s.id
 	s.mu.Unlock()
@@ -956,7 +1040,6 @@ func (s *ContainerdSandbox) execShell(ctx context.Context, stdin []byte, script 
 		Command: "sh",
 		Args:    shArgs,
 		Cwd:     s.cfg.workdir(),
-		Stdin:   stdin,
 	})
 	if err != nil {
 		return res, err

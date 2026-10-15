@@ -145,10 +145,36 @@ type ExecRequest struct {
 	Cwd     string
 	Env     map[string]string
 	Timeout time.Duration
-	Stdin   []byte
+	// Stdin is delivered to the command as data: the bytes are staged to a
+	// mode-0600 temp file inside the container (through the WriteFile
+	// path, so arbitrary sizes chunk) and redirected into the process's
+	// stdin, which sees EOF when the bytes run out — the shim's stdin
+	// FIFO, which never signals EOF, is bypassed entirely. The staged file
+	// is removed on every outcome path.
+	//
+	// This is data delivery, not an interactive session: nothing can be
+	// written after the process starts (interactive sessions are a
+	// deferred scope boundary). The exposure caveat inherits from
+	// WriteFile — content travels base64 in exec arguments, visible in
+	// /proc/*/cmdline while staging runs: stdin-shaped data, never
+	// secrets.
+	Stdin []byte
+
+	// capOutput marks the request as public Exec traffic, where
+	// Config.MaxOutputBytes applies. It is unexported and set only by the
+	// sandbox's Exec path: internal protocol reads — ReadFile's cat, the
+	// diff reader tasks, WriteFile's own acks — carry file bytes and
+	// command output that the library parses, so capping them would
+	// silently corrupt data transport (a large ReadFile would come back
+	// with a truncation marker inside the file's bytes). Diagnostics are
+	// capped; data is not. A backend implementation reading this field
+	// sees it set exactly for caller-facing Execs.
+	capOutput bool
 }
 
-// ExecResult is the outcome of one command execution.
+// ExecResult is the outcome of one command execution. Stdout and Stderr are
+// the capped strings described on Config.MaxOutputBytes when that knob is
+// set.
 type ExecResult struct {
 	ExitCode int
 	Stdout   string
@@ -202,6 +228,15 @@ type Sandbox interface {
 	ReleaseState(ctx context.Context, ws WorkspaceState) error
 
 	// Exec runs a command in the sandbox and returns its result.
+	//
+	// A non-empty ExecRequest.Stdin is delivered to the command as data:
+	// staged to a temp file in the container and redirected into the
+	// process, which sees EOF (see ExecRequest.Stdin for the contract and
+	// the exposure caveat). Stdout and Stderr are capped per stream by
+	// Config.MaxOutputBytes when set; over-cap streams keep their head and
+	// tail around a truncation marker. A command that backgrounds its work
+	// (`nohup … &`) returns immediately and survives subsequent Execs —
+	// and dies at Capture, like every process.
 	Exec(ctx context.Context, req ExecRequest) (ExecResult, error)
 
 	// ReadFile reads a file inside the sandbox workspace.

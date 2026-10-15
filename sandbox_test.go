@@ -407,7 +407,7 @@ func TestWriteFile_EncodesContentInArgs(t *testing.T) {
 		t.Errorf("stdin = %q, want empty: WriteFile must not depend on stdin EOF", tasks.lastStdin)
 	}
 
-	// execShell builds ["-c", script, placeholder, path, mode, first, chunks...].
+	// shell builds ["-c", script, placeholder, path, mode, first, chunks...].
 	args := tasks.lastReq.Args
 	if len(args) < 7 {
 		t.Fatalf("args = %v, want script, placeholder, path, mode, first flag, and a payload", args)
@@ -534,6 +534,112 @@ func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 	}
 	if len(args) != 6 {
 		t.Errorf("args = %v, want no payload arguments for empty content", args)
+	}
+}
+
+// TestExec_StdinIsStagedAndRedirected pins the stdin-as-data mechanism at the
+// exec-protocol level: the bytes travel as a staged WriteFile to
+// /tmp/croft-stdin-*, the command runs wrapped in a shell redirect that passes
+// the command and its arguments through verbatim ("exec \"$@\"", no quoting of
+// user data), no Stdin ever reaches the task adapter, and the staged file is
+// removed afterwards — in that order.
+func TestExec_StdinIsStagedAndRedirected(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	payload := []byte("payload with 'quotes' and $vars\n")
+	before := len(tasks.allReqs)
+	if _, err := sb.Exec(ctx, ExecRequest{
+		Command: "grep",
+		Args:    []string{"-c", "quotes"},
+		Stdin:   payload,
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	execs := tasks.allReqs[before:]
+	if len(execs) != 3 {
+		t.Fatalf("Exec issued %d execs, want 3 (stage, wrapped run, cleanup): %+v", len(execs), execs)
+	}
+
+	// 1. Staging: a WriteFile-protocol exec to a /tmp/croft-stdin-* path,
+	// mode 0600, carrying the payload base64-encoded.
+	stage := execs[0]
+	if stage.Command != "sh" || !strings.Contains(stage.Args[1], "base64 -d") {
+		t.Fatalf("staging exec = %+v, want the WriteFile script", stage)
+	}
+	stdinPath := stage.Args[3]
+	if !strings.HasPrefix(stdinPath, "/tmp/croft-stdin-") {
+		t.Errorf("staged path = %q, want /tmp/croft-stdin-*", stdinPath)
+	}
+	if stage.Args[4] != "600" {
+		t.Errorf("staged mode = %q, want 600", stage.Args[4])
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.Join(stage.Args[6:], ""))
+	if err != nil {
+		t.Fatalf("staged payload is not base64: %v", err)
+	}
+	if string(decoded) != string(payload) {
+		t.Errorf("staged payload = %q, want %q", decoded, payload)
+	}
+
+	// 2. The wrapped run: /bin/sh -c 'exec "$@" < staged' croft <cmd> <args...>.
+	wrapped := execs[1]
+	if wrapped.Command != "/bin/sh" {
+		t.Fatalf("wrapped command = %q, want /bin/sh", wrapped.Command)
+	}
+	wantScript := `exec "$@" < ` + stdinPath
+	if wrapped.Args[1] != wantScript {
+		t.Errorf("wrapper script = %q, want %q", wrapped.Args[1], wantScript)
+	}
+	wantArgs := []string{"-c", wantScript, "croft", "grep", "-c", "quotes"}
+	if strings.Join(wrapped.Args, "\x00") != strings.Join(wantArgs, "\x00") {
+		t.Errorf("wrapped args = %q, want %q", wrapped.Args, wantArgs)
+	}
+	if len(wrapped.Stdin) != 0 {
+		t.Errorf("wrapped Stdin = %q, want empty: the shim FIFO must never carry data", wrapped.Stdin)
+	}
+
+	// 3. Cleanup: rm -f of the staged path, after the run.
+	cleanup := execs[2]
+	if cleanup.Command != "rm" || strings.Join(cleanup.Args, " ") != "-f -- "+stdinPath {
+		t.Errorf("cleanup exec = %+v, want rm -f -- %s", cleanup, stdinPath)
+	}
+}
+
+// TestExec_StdinStagingFailureCleansUp pins the failure path: when staging
+// fails, the wrapped command never runs, the error names the staging step,
+// and the partial temp file is still removed (best-effort, cancel-free).
+func TestExec_StdinStagingFailureCleansUp(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tasks.runErr["sh"] = errors.New("staging transport down")
+	before := len(tasks.allReqs)
+	_, err := sb.Exec(ctx, ExecRequest{Command: "cat", Stdin: []byte("data")})
+	if err == nil || !strings.Contains(err.Error(), "stage stdin") {
+		t.Fatalf("err = %v, want a stage-stdin error", err)
+	}
+
+	execs := tasks.allReqs[before:]
+	for _, r := range execs {
+		if r.Command == "/bin/sh" {
+			t.Errorf("the wrapped command ran despite the staging failure: %+v", r)
+		}
+	}
+	var cleaned bool
+	for _, r := range execs {
+		if r.Command == "rm" && len(r.Args) == 3 && r.Args[0] == "-f" && strings.HasPrefix(r.Args[2], "/tmp/croft-stdin-") {
+			cleaned = true
+		}
+	}
+	if !cleaned {
+		t.Errorf("no cleanup rm after the staging failure: %+v", execs)
 	}
 }
 
@@ -889,5 +995,60 @@ func TestWithDiffServiceWiresTheCollaborator(t *testing.T) {
 	wired := NewWithBackend(Config{Image: "example/dev:latest"}, nil, nil, nil, WithDiffService(stubDiff{}))
 	if wired.diff == nil {
 		t.Error("WithDiffService must wire the diff collaborator")
+	}
+}
+
+// TestExec_CapOutputMarksPublicTrafficOnly pins the cap's scope: the
+// unexported capOutput flag rides exactly the public Exec requests — the
+// caller's and the stdin wrapper's — and never the internal protocol reads
+// (ReadFile's cat, WriteFile's chunks), whose stdout is data the library
+// returns or parses and must stay lossless under any Config.MaxOutputBytes.
+func TestExec_CapOutputMarksPublicTrafficOnly(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := sb.Exec(ctx, ExecRequest{Command: "true"}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !tasks.lastReq.capOutput {
+		t.Error("public Exec request is not marked capOutput")
+	}
+
+	if _, err := sb.Exec(ctx, ExecRequest{Command: "cat", Stdin: []byte("data")}); err != nil {
+		t.Fatalf("Exec with stdin: %v", err)
+	}
+	// lastReq is the cleanup rm (internal, uncapped); the wrapper is the
+	// second-to-last... find it explicitly.
+	var wrapper *ExecRequest
+	for i := range tasks.allReqs {
+		if tasks.allReqs[i].Command == "/bin/sh" {
+			wrapper = &tasks.allReqs[i]
+		}
+	}
+	if wrapper == nil {
+		t.Fatal("no stdin wrapper exec recorded")
+	}
+	if !wrapper.capOutput {
+		t.Error("stdin wrapper request is not marked capOutput")
+	}
+	if tasks.lastReq.capOutput {
+		t.Errorf("internal cleanup exec is marked capOutput: %+v", tasks.lastReq)
+	}
+
+	if _, err := sb.ReadFile(ctx, "f.txt"); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if tasks.lastReq.capOutput {
+		t.Error("ReadFile's cat exec is marked capOutput: data reads must stay lossless")
+	}
+
+	if err := sb.WriteFile(ctx, "g.txt", []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if tasks.lastReq.capOutput {
+		t.Error("WriteFile's chunk exec is marked capOutput")
 	}
 }

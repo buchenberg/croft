@@ -6,6 +6,22 @@
   into the OCI spec of every container generation a sandbox starts (init and
   reader tasks alike). Nil keeps the unbounded default with an identical
   spec (roadmap decision D2, the broker's fairness floor).
+- Added: `ExecRequest.Stdin` is honored — stdin as data, staged to a temp
+  file inside the container and redirected into the process, which sees EOF.
+  The shim's stdin FIFO, which never signals EOF, is bypassed entirely.
+- Added: `Config.MaxOutputBytes` — a per-stream cap on public Exec
+  stdout/stderr (data reads — `ReadFile`, the diff reader tasks — stay
+  lossless). Over-cap streams keep their first and last half around a
+  `[... N bytes truncated ...]` marker; zero (the default) is unbounded.
+- Documented and live-pinned: the background-process recipe — `nohup … &`
+  work survives its launching exec and is polled through its log file; it
+  dies at `Capture`, the stated process-state cost of a coherent snapshot.
+- Breaking: `ErrStdinUnsupported` removed — a non-empty `Stdin` no longer
+  fails.
+- Scope boundaries recorded: interactive exec sessions are deferred (stdin
+  is data delivered once; output is bounded-but-buffered, not streamed), and
+  process-preserving capture is a permanent boundary (CRIU-class
+  checkpointing of arbitrary trees is experimental and fragile).
 
 ## v0.4.0
 

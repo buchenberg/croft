@@ -53,8 +53,8 @@ package croft
 // socket permissions rather than anything the client creates.
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -621,21 +621,14 @@ func leaseHoldsSnapshot(t *testing.T, svc leases.Manager, ctx context.Context, k
 	return false
 }
 
-// TestLive_ExecRejectsStdin pins that Exec refuses a non-empty
-// ExecRequest.Stdin immediately instead of starting a process that can never see
-// EOF. This is why WriteFile sends content through argv.
-//
-// The runc-v2 shim's execProcess.openStdin opens the exec's stdin FIFO
-// O_WRONLY and keeps it in e.closers for the process's whole lifetime
-// (cmd/containerd-shim-runc-v2/process/exec.go), so the FIFO always has a
-// writer and an in-container reader blocks until the context expires.
-// Established by goroutine dump: the client had written the payload and closed
-// its own write end, and the process was still blocked reading.
-//
-// If a future containerd releases the shim's hold, this fails — at which point
-// the argv transport, with its /proc/<pid>/cmdline exposure, is worth
-// reconsidering.
-func TestLive_ExecRejectsStdin(t *testing.T) {
+// TestLive_ExecStdinIsData pins the stdin-as-data mechanism end to end: the
+// bytes are staged to a temp file and redirected into the process, which sees
+// EOF — cat TERMINATING is the load-bearing assertion, because the shim's
+// stdin FIFO (the transport this bypasses) never signals EOF and a process
+// reading it hangs until the context expires. Also covered: a multi-chunk
+// payload, an exact binary round-trip, a command that ignores stdin, and
+// zero /tmp/croft-stdin-* residue afterwards (the cancel-free cleanup).
+func TestLive_ExecStdinIsData(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
@@ -645,27 +638,77 @@ func TestLive_ExecRejectsStdin(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	start := time.Now()
-	_, err := sb.Exec(ctx, ExecRequest{
+	// Text round-trip: cat must terminate (EOF) and echo the bytes back.
+	res, err := sb.Exec(ctx, ExecRequest{
 		Command: "cat",
 		Cwd:     cfg.Workdir,
-		Stdin:   []byte("never sees EOF\n"),
+		Stdin:   []byte("hello stdin\nsecond line\n"),
 	})
-	elapsed := time.Since(start)
-	t.Logf("exec cat with stdin refused in %s: %v", elapsed.Round(time.Millisecond), err)
+	if err != nil {
+		t.Fatalf("exec cat with stdin: %v", err)
+	}
+	if res.ExitCode != 0 || res.Stdout != "hello stdin\nsecond line\n" {
+		t.Errorf("cat round-trip = (exit %d, %q), want (0, the staged bytes)", res.ExitCode, res.Stdout)
+	}
 
-	if err == nil {
-		t.Fatal("Exec with stdin succeeded: the constraint appears lifted, so the argv " +
-			"transport in WriteFile can be reconsidered and this test inverted")
+	// Multi-chunk payload: 1 MiB spans at least two WriteFile chunks at the
+	// default WriteChunkBytes, so this exercises staged reassembly. wc -c
+	// proves the exact byte count arrived.
+	big := bytes.Repeat([]byte("0123456789abcdef\n"), 65536) // 1 MiB
+	res, err = sb.Exec(ctx, ExecRequest{
+		Command: "wc",
+		Args:    []string{"-c"},
+		Cwd:     cfg.Workdir,
+		Stdin:   big,
+	})
+	if err != nil {
+		t.Fatalf("exec wc with 1 MiB stdin: %v", err)
 	}
-	if !errors.Is(err, ErrStdinUnsupported) {
-		t.Errorf("err = %v, want it to wrap ErrStdinUnsupported", err)
+	if got := strings.TrimSpace(res.Stdout); got != fmt.Sprint(len(big)) {
+		t.Errorf("wc -c = %q, want %d", got, len(big))
 	}
-	// Refusing up front is the whole point: a caller must not spend its context
-	// budget discovering this. The ceiling is generous enough to survive a slow
-	// daemon yet still catch a regression to the old hang.
-	if elapsed > 5*time.Second {
-		t.Errorf("Exec with stdin took %s, want an immediate refusal", elapsed)
+
+	// Binary payload with NULs, high bytes, and no trailing newline: the
+	// base64 staging and the redirect must be byte-exact.
+	binary := []byte{0x00, 0x01, 0xfe, 0xff, '\n', 0x00, 0x80, 'x'}
+	res, err = sb.Exec(ctx, ExecRequest{
+		Command: "cat",
+		Cwd:     cfg.Workdir,
+		Stdin:   binary,
+	})
+	if err != nil {
+		t.Fatalf("exec cat with binary stdin: %v", err)
+	}
+	if !bytes.Equal([]byte(res.Stdout), binary) {
+		t.Errorf("binary round-trip = %q, want %q", res.Stdout, binary)
+	}
+
+	// A command that ignores stdin still runs normally.
+	res, err = sb.Exec(ctx, ExecRequest{
+		Command: "echo",
+		Args:    []string{"hi"},
+		Cwd:     cfg.Workdir,
+		Stdin:   []byte("ignored\n"),
+	})
+	if err != nil {
+		t.Fatalf("exec echo with stdin: %v", err)
+	}
+	if res.ExitCode != 0 || strings.TrimSpace(res.Stdout) != "hi" {
+		t.Errorf("echo = (exit %d, %q), want (0, \"hi\")", res.ExitCode, res.Stdout)
+	}
+
+	// Cleanup: no staged temp file survives any of the runs. ls on the glob
+	// fails (exit non-zero) exactly when nothing matches.
+	res, err = sb.Exec(ctx, ExecRequest{
+		Command: "/bin/sh",
+		Args:    []string{"-c", "ls /tmp/croft-stdin-* 2>/dev/null"},
+		Cwd:     cfg.Workdir,
+	})
+	if err != nil {
+		t.Fatalf("residue check exec: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("staged stdin residue in /tmp: %q", res.Stdout)
 	}
 }
 
