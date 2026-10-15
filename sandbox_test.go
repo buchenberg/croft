@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io/fs"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -140,6 +141,77 @@ func TestApply_ValidatesNetwork(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "Network") {
 			t.Errorf("error should name the field: %v", err)
 		}
+	}
+}
+
+// TestCreate_ValidatesSecrets pins the config-typo convention for secret
+// mounts: empty source, non-absolute paths, workdir collision, and duplicate
+// destinations all fail loudly at Create, naming the field.
+func TestCreate_ValidatesSecrets(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("r")
+
+	cases := []struct {
+		name    string
+		secrets []SecretMount
+		wantErr string
+	}{
+		{"empty source", []SecretMount{{Source: "", Destination: "/run/s"}}, "Source"},
+		{"relative source", []SecretMount{{Source: "token", Destination: "/run/s"}}, "Source"},
+		{"empty dest", []SecretMount{{Source: "/host/token", Destination: ""}}, "Destination"},
+		{"relative dest", []SecretMount{{Source: "/host/token", Destination: "run/s"}}, "Destination"},
+		{"workdir collision", []SecretMount{{Source: "/host/token", Destination: "/workspace/secret"}}, "workdir"},
+		{"duplicate dest", []SecretMount{{Source: "/host/a", Destination: "/run/s"}, {Source: "/host/b", Destination: "/run/s"}}, "duplicated"},
+	}
+	for _, tc := range cases {
+		sb := NewWithBackend(
+			Config{Image: "example/dev:latest", Secrets: tc.secrets},
+			snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
+		err := sb.Create(context.Background())
+		if err == nil {
+			t.Errorf("%s: Create with bad Secrets must fail", tc.name)
+		} else if !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s: error should mention %q: %v", tc.name, tc.wantErr, err)
+		}
+	}
+	// A valid secret passes.
+	sb := NewWithBackend(
+		Config{Image: "example/dev:latest", Secrets: []SecretMount{{Source: "/host/token", Destination: "/run/secrets/token"}}},
+		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
+	if err := sb.Create(context.Background()); err != nil {
+		t.Errorf("valid Secrets: Create: %v", err)
+	}
+}
+
+// TestCreate_ValidatesStaging pins the config-typo convention for
+// Config.StagingDir: a non-absolute host path fails at Create; a valid
+// absolute path passes; empty means the argv path (no error).
+func TestCreate_ValidatesStaging(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("r")
+
+	bad := NewWithBackend(
+		Config{Image: "example/dev:latest", StagingDir: "relative/path"},
+		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
+	err := bad.Create(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "StagingDir") {
+		t.Errorf("relative StagingDir must fail: %v", err)
+	}
+
+	ok := NewWithBackend(
+		Config{Image: "example/dev:latest", StagingDir: "/tmp/croft-staging"},
+		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
+	if err := ok.Create(context.Background()); err != nil {
+		t.Errorf("valid StagingDir: Create: %v", err)
+	}
+
+	empty := NewWithBackend(
+		Config{Image: "example/dev:latest"},
+		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
+	if err := empty.Create(context.Background()); err != nil {
+		t.Errorf("unset StagingDir: Create: %v", err)
 	}
 }
 
@@ -585,6 +657,63 @@ func TestWriteFile_EmptyContentStillTruncates(t *testing.T) {
 	}
 	if len(args) != 6 {
 		t.Errorf("args = %v, want no payload arguments for empty content", args)
+	}
+}
+
+// TestWriteFile_StagingRecordsNoBase64InArgv pins the argv-free write path:
+// when Config.StagingDir is set, WriteFile writes the payload host-side and
+// moves it into place inside the container without ever putting content in
+// any exec's argv — the assertion that closes the /proc/*/cmdline exposure.
+func TestWriteFile_StagingRecordsNoBase64InArgv(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	tasks := newFakeTasks(log, snap)
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	staging := t.TempDir()
+	sb := NewWithBackend(
+		Config{Image: "example/dev:latest", StagingDir: staging},
+		snap, tasks, images, WithLeases(&fakeLeases{}))
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Use content that would be visible as base64 if it leaked into argv.
+	content := []byte("SECRET-TOKEN-8f3a1b\n")
+	before := len(tasks.allReqs)
+	if err := sb.WriteFile(ctx, "run/config.txt", content, fs.FileMode(0o600)); err != nil {
+		t.Fatalf("WriteFile via staging: %v", err)
+	}
+	writes := tasks.allReqs[before:]
+	if len(writes) == 0 {
+		t.Fatal("staging write recorded no execs")
+	}
+
+	// The encoded form that would appear in the argv path.
+	encoded := base64.StdEncoding.EncodeToString(content)
+	for i, req := range writes {
+		for j, arg := range req.Args {
+			if strings.Contains(arg, encoded) {
+				t.Errorf("exec %d arg %d contains base64 payload in argv", i, j)
+			}
+			if strings.Contains(arg, "SECRET-TOKEN") {
+				t.Errorf("exec %d arg %d contains raw content in argv", i, j)
+			}
+		}
+		// The staging script must reference the staging mount, not base64.
+		if len(req.Args) > 1 && strings.Contains(req.Args[1], "base64") {
+			t.Errorf("exec %d script uses base64 decode in the staging path", i)
+		}
+	}
+
+	// The staging file is removed after the write.
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatalf("read staging dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("staging dir has %d leftover entries after write, want 0", len(entries))
 	}
 }
 

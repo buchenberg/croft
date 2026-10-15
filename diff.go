@@ -500,6 +500,12 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 	if err := s.cfg.validateNetwork(); err != nil {
 		return err
 	}
+	if err := s.cfg.validateSecrets(); err != nil {
+		return err
+	}
+	if err := s.cfg.validateStaging(); err != nil {
+		return err
+	}
 	if err := s.requireBackend(ctx); err != nil {
 		return err
 	}

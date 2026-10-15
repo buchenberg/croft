@@ -3,6 +3,7 @@ package croft
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -214,6 +215,87 @@ func TestInitSpecOpts_Network(t *testing.T) {
 	if n := countNetNS(spec); n != 0 {
 		t.Errorf("host: spec carries %d network-namespace entries (%v), want it "+
 			"removed so runc shares the host's netns", n, spec.Linux.Namespaces)
+	}
+}
+
+// TestInitSpecOpts_Secrets pins the secret-mount wiring: each SecretMount
+// becomes a read-only bind mount in the spec, and no mount appears when
+// Secrets is empty.
+func TestInitSpecOpts_Secrets(t *testing.T) {
+	// No secrets: no bind mounts in the spec.
+	spec, err := generateInitSpecWithConfig(t, Config{}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("no secrets: %v", err)
+	}
+	for _, m := range spec.Mounts {
+		if m.Type == "bind" && m.Destination == "/run/secrets/token" {
+			t.Fatal("no-secret config must not carry a secret bind mount")
+		}
+	}
+
+	// One secret: a read-only bind mount at the destination.
+	spec, err = generateInitSpecWithConfig(t, Config{
+		Secrets: []SecretMount{{Source: "/host/git-token", Destination: "/run/secrets/token"}},
+	}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("with secret: %v", err)
+	}
+	found := false
+	for _, m := range spec.Mounts {
+		if m.Destination == "/run/secrets/token" {
+			found = true
+			if m.Type != "bind" {
+				t.Errorf("secret mount type = %q, want bind", m.Type)
+			}
+			if m.Source != "/host/git-token" {
+				t.Errorf("secret mount source = %q, want /host/git-token", m.Source)
+			}
+			if !slices.Contains(m.Options, "ro") {
+				t.Errorf("secret mount options = %v, want ro", m.Options)
+			}
+		}
+	}
+	if !found {
+		t.Error("secret bind mount not found in the generated spec")
+	}
+}
+
+// TestInitSpecOpts_StagingDir pins the staging bind: when set, a read-write
+// bind mount appears at /run/croft-staging; when unset, no such mount exists.
+func TestInitSpecOpts_StagingDir(t *testing.T) {
+	findStaging := func(spec *oci.Spec) *specs.Mount {
+		for i := range spec.Mounts {
+			if spec.Mounts[i].Destination == "/run/croft-staging" {
+				return &spec.Mounts[i]
+			}
+		}
+		return nil
+	}
+
+	spec, err := generateInitSpecWithConfig(t, Config{}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("no staging: %v", err)
+	}
+	if findStaging(spec) != nil {
+		t.Error("unset StagingDir must not produce a staging bind mount")
+	}
+
+	spec, err = generateInitSpecWithConfig(t, Config{StagingDir: "/tmp/croft-staging"}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("with staging: %v", err)
+	}
+	m := findStaging(spec)
+	if m == nil {
+		t.Fatal("StagingDir set but no /run/croft-staging bind mount found")
+	}
+	if m.Type != "bind" {
+		t.Errorf("staging mount type = %q, want bind", m.Type)
+	}
+	if m.Source != "/tmp/croft-staging" {
+		t.Errorf("staging mount source = %q, want /tmp/croft-staging", m.Source)
+	}
+	if slices.Contains(m.Options, "ro") {
+		t.Error("staging mount must be read-write (no ro option)")
 	}
 }
 

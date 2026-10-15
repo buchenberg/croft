@@ -525,6 +525,30 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 			Type: specs.NetworkNamespace,
 		}))
 	}
+	// Config.Secrets: bind-mount each host file read-only at its destination.
+	// The container reads a normal file; the content never appears in argv,
+	// process environment, or any exec payload. Mount options are the same
+	// shape Kubernetes uses for secret files.
+	for _, sec := range t.cfg.Secrets {
+		opts = append(opts, oci.WithMounts([]specs.Mount{{
+			Type:        "bind",
+			Source:      sec.Source,
+			Destination: sec.Destination,
+			Options:     []string{"ro", "rbind"},
+		}}))
+	}
+	// Config.StagingDir: bind-mount the host staging directory read-write at
+	// /run/croft-staging so WriteFile can move files into place atomically
+	// without putting content in argv. When unset the bind is absent and
+	// WriteFile falls back to the documented base64-in-argv path.
+	if t.cfg.StagingDir != "" {
+		opts = append(opts, oci.WithMounts([]specs.Mount{{
+			Type:        "bind",
+			Source:      t.cfg.StagingDir,
+			Destination: "/run/croft-staging",
+			Options:     []string{"rbind"},
+		}}))
+	}
 	return opts, nil
 }
 
