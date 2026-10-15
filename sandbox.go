@@ -92,6 +92,15 @@ type Config struct {
 	// travels per exec.
 	WriteChunkBytes int
 
+	// MaxOutputBytes caps each of an exec's stdout and stderr in memory,
+	// applied per stream independently. Over the cap, the first and last
+	// MaxOutputBytes/2 bytes survive with a "[... N bytes truncated ...]"
+	// marker between them — heads carry the command's banner, tails the
+	// actual error. The cut is byte-based: a UTF-8 sequence or line may
+	// split at a boundary (output is diagnostic text). Zero, the default,
+	// means unbounded — the behavior before this knob existed.
+	MaxOutputBytes int
+
 	// FIFODir is where the containerd *client* creates the FIFOs that carry an
 	// exec's stdio. Empty uses containerd's default (/run/containerd/fifo),
 	// which is root-owned — and because the client creates these itself, an

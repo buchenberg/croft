@@ -680,7 +680,11 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 		return ExecResult{}, err
 	}
 
-	var stdout, stderr bytes.Buffer
+	// Per-stream output ceilings (Config.MaxOutputBytes; 0 = unbounded).
+	// Bounded-but-buffered, not streamed: a live tail is a scoped follow-up
+	// (the cio plumbing already streams, so the cost there is API design).
+	stdout := &cappedBuffer{limit: t.cfg.MaxOutputBytes}
+	stderr := &cappedBuffer{limit: t.cfg.MaxOutputBytes}
 	spec := &specs.Process{
 		Args: append([]string{req.Command}, req.Args...),
 		Cwd:  req.Cwd,
@@ -703,7 +707,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	// writable directory of its own.
 	ioCreator := cio.NewCreator(
 		cio.WithFIFODir(t.cfg.FIFODir),
-		cio.WithStreams(bytes.NewReader(nil), &stdout, &stderr),
+		cio.WithStreams(bytes.NewReader(nil), stdout, stderr),
 	)
 	proc, err := task.Exec(ctx, execID, spec, ioCreator)
 	if err != nil {
