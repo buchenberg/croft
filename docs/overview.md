@@ -326,4 +326,4 @@ other containerd users), `Image` (required — the base rootfs), `Runtime`,
 `FIFODir` (client-side stdio FIFOs — set it to drive the daemon without
 root), and `Limits` (CPU shares/quota, memory, pids caps on every container
 generation the sandbox starts; nil is unbounded — the multitenancy fairness
-floor). See `Config` in `croft.go` for the full contract of each field.
+floor). See `Config` in `sandbox.go` for the full contract of each field.

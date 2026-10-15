@@ -108,8 +108,11 @@ type Config struct {
 	// with the image and runtime defaults.
 	//
 	// Limits apply at container creation (Create, Apply, Capture's restart,
-	// reader tasks): changing Config.Limits takes effect on the next
-	// container generation, never on a running one.
+	// reader tasks) and are fixed at construction: New copies Config by
+	// value, so reassigning cfg.Limits on the caller's struct after New has
+	// no effect on any generation. Mutating the shared *Limits in place
+	// while the sandbox starts containers is a data race — decide limits
+	// before New, not after.
 	Limits *Limits
 }
 
@@ -122,7 +125,10 @@ type Config struct {
 type Limits struct {
 	// CPUShares is the relative CPU weight against other containers
 	// (cgroup v1 cpu.shares semantics; the runtime converts it to the
-	// cgroup v2 cpu.weight scale). Zero uses the runtime default.
+	// cgroup v2 cpu.weight scale). The v1 range is roughly [2, 262144]
+	// with a default of 1024; a v1 runtime may reject an out-of-range
+	// value with an opaque container-creation failure, while v2 clamps.
+	// Zero uses the runtime default.
 	CPUShares uint64
 
 	// CPUQuota caps CPU bandwidth: at most CPUQuota microseconds of CPU
@@ -131,8 +137,11 @@ type Limits struct {
 	// or negative leaves it unset.
 	CPUQuota int64
 
-	// MemoryBytes is the hard memory limit in bytes. Zero or negative
-	// leaves it unset.
+	// MemoryBytes is the memory limit in bytes (cgroup v2 memory.max).
+	// It governs memory alone: swap is accounted separately
+	// (memory.swap.max) and left at the runtime default, so on a
+	// swap-enabled host a container can hold MemoryBytes of memory plus
+	// swap. Zero or negative leaves it unset.
 	MemoryBytes int64
 
 	// Pids caps the number of processes in the container's cgroup — the

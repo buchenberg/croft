@@ -24,6 +24,17 @@ import (
 // is runc's conversion of the v1-style shares (512 → its own scale), so it
 // is logged and sanity-checked rather than pinned to a formula croft does
 // not own.
+//
+// The in-container view depends on the host: containerd gives a cgroup-v2
+// daemon's containers a private cgroup namespace and the default spec mounts
+// the cgroup filesystem, so these paths show the TASK's own cgroup — but a
+// cgroup-v1 host has no v2 interface files to read. The probe below skips
+// (honestly, naming both possible causes) rather than false-fails on such a
+// host; the spec-level mapping stays pinned by TestInitSpecOpts_Limits
+// either way. The probe checks for the v2 controllers file, not merely the
+// mount: a v2 view without it would mean the reads target the hierarchy
+// root, where memory.max does not exist — and there the assertions fail
+// loudly (cat exits non-zero), never passing silently.
 func TestLive_LimitsReachTheCgroup(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
@@ -59,6 +70,22 @@ func TestLive_LimitsReachTheCgroup(t *testing.T) {
 
 	if err := sb.Create(ctx); err != nil {
 		t.Fatalf("Create: %v", err)
+	}
+
+	// Probe the in-container cgroup view before asserting against it.
+	probe, err := sb.Exec(ctx, ExecRequest{
+		Command: "/bin/sh",
+		Args:    []string{"-c", "test -r /sys/fs/cgroup/cgroup.controllers"},
+		Cwd:     "/",
+	})
+	if err != nil {
+		t.Fatalf("cgroup probe exec: %v", err)
+	}
+	if probe.ExitCode != 0 {
+		t.Skip("no cgroup-v2 view inside the container: the host runs a v1 " +
+			"hierarchy, or the daemon provides no cgroup mount/private cgroup " +
+			"namespace. The spec-level mapping is pinned by TestInitSpecOpts_Limits; " +
+			"this acceptance step needs a v2 daemon host.")
 	}
 
 	if got := strings.TrimSpace(mustExec(t, ctx, sb, "/", "cat", "/sys/fs/cgroup/memory.max")); got != "201326592" {

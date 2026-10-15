@@ -99,8 +99,11 @@ func TestInitSpecOpts_Limits(t *testing.T) {
 	if res == nil {
 		t.Fatal("spec.Linux.Resources = nil, want the configured limits")
 	}
+	// Fatalf, not Errorf: the checks below dereference res.CPU, so a
+	// regressed CPU mapping must stop here rather than panic on the very
+	// assertion targeting it.
 	if res.CPU == nil || res.CPU.Shares == nil || *res.CPU.Shares != 512 {
-		t.Errorf("CPU.Shares = %+v, want 512", res.CPU)
+		t.Fatalf("CPU.Shares = %+v, want 512", res.CPU)
 	}
 	if res.CPU.Quota == nil || *res.CPU.Quota != 50000 {
 		t.Errorf("CPU.Quota = %+v, want 50000", res.CPU.Quota)
