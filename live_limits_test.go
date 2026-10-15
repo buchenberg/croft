@@ -31,10 +31,12 @@ import (
 // cgroup-v1 host has no v2 interface files to read. The probe below skips
 // (honestly, naming both possible causes) rather than false-fails on such a
 // host; the spec-level mapping stays pinned by TestInitSpecOpts_Limits
-// either way. The probe checks for the v2 controllers file, not merely the
-// mount: a v2 view without it would mean the reads target the hierarchy
-// root, where memory.max does not exist — and there the assertions fail
-// loudly (cat exits non-zero), never passing silently.
+// either way. The probe checks the v2 core interface file, which every v2
+// cgroup has: its absence means there is no v2 view in the container at
+// all (a v1 host, or no cgroup mount). It cannot tell the task's own
+// cgroup from the hierarchy root, but the root carries none of the limit
+// files, so a root view fails the reads loudly below (cat exits non-zero),
+// never passing silently.
 func TestLive_LimitsReachTheCgroup(t *testing.T) {
 	cfg := loadLiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
