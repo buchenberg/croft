@@ -201,7 +201,7 @@ func TestCreate_ValidatesStaging(t *testing.T) {
 	}
 
 	ok := NewWithBackend(
-		Config{Image: "example/dev:latest", StagingDir: "/tmp/croft-staging"},
+		Config{Image: "example/dev:latest", StagingDir: t.TempDir()},
 		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
 	if err := ok.Create(context.Background()); err != nil {
 		t.Errorf("valid StagingDir: Create: %v", err)

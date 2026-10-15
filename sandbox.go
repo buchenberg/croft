@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -42,6 +43,11 @@ const (
 	// i.e. about eight maxArgPayload arguments — comfortably inside the ~2 MiB
 	// ARG_MAX while keeping the exec count low for typical source files.
 	defaultWriteChunkBytes = 512 * 1024
+
+	// stagingMountPath is the fixed in-container path where Config.StagingDir
+	// is bind-mounted. WriteFile's staging path references this constant so
+	// the mount and the move script cannot drift apart.
+	stagingMountPath = "/run/croft-staging"
 )
 
 // ErrNotImplemented is returned when the containerd surface could not be
@@ -233,11 +239,13 @@ func (c Config) validateNetwork() error {
 
 // validateSecrets checks the configured secret mounts for the loud-failure
 // config-typo convention: Source must be an absolute path on the daemon host,
-// Destination must be an absolute in-container path, and the two must not
-// collide with the workdir root (agents write there). Called at Create, Apply,
-// and withReaderTask — every entry that starts a container generation.
+// Destination must be an absolute in-container path that does not collide
+// with the workdir root (agents write there), the reserved staging mount, or
+// highly privileged system paths. Called at Create, Apply, and withReaderTask
+// — every entry that starts a container generation.
 func (c Config) validateSecrets() error {
 	seen := make(map[string]bool, len(c.Secrets))
+	workdir := path.Clean(c.workdir())
 	for i, s := range c.Secrets {
 		if s.Source == "" {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source is required: name the host file to bind", i)
@@ -245,34 +253,57 @@ func (c Config) validateSecrets() error {
 		if !path.IsAbs(s.Source) {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source %q is not absolute: it must name a path on the daemon host", i, s.Source)
 		}
+		// Best-effort existence check: a remote client may not share the
+		// daemon's filesystem, so a stat failure is not a hard error. When
+		// the path is visible and missing, fail loudly now rather than
+		// letting runc fail later with an opaque message.
+		if _, statErr := os.Stat(s.Source); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source %q: %w", i, s.Source, statErr)
+		} else if statErr == nil {
+			// exists — good
+		}
 		if s.Destination == "" {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination is required: name the in-container path", i)
 		}
 		if !path.IsAbs(s.Destination) {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is not absolute: it must name an in-container path", i, s.Destination)
 		}
-		if strings.HasPrefix(s.Destination, c.workdir()+"/") || s.Destination == c.workdir() {
-			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q collides with the workdir root %q: secrets mount read-only at their destination and the workdir is where agents write", i, s.Destination, c.workdir())
+		dst := path.Clean(s.Destination)
+		if dst == workdir || strings.HasPrefix(dst, workdir+"/") {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q collides with the workdir root %q: secrets mount read-only at their destination and the workdir is where agents write", i, dst, workdir)
 		}
-		if seen[s.Destination] {
-			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is duplicated: each in-container path may be bound once", i, s.Destination)
+		if dst == stagingMountPath || strings.HasPrefix(dst, stagingMountPath+"/") {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q collides with the reserved staging mount %q: nesting a read-only secret inside the read-write staging mount is not supported", i, dst, stagingMountPath)
 		}
-		seen[s.Destination] = true
+		if dst == "/" || dst == "/proc" || dst == "/dev" || dst == "/sys" || dst == "/etc" {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is a privileged system path: secrets must not shadow core system directories", i, dst)
+		}
+		if seen[dst] {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is duplicated: each in-container path may be bound once", i, dst)
+		}
+		seen[dst] = true
 	}
 	return nil
 }
 
 // validateStaging checks Config.StagingDir for the same config-typo
-// convention. When set it must be an absolute host path; when unset the
-// argv-free write path is simply unavailable and WriteFile falls back to the
-// documented base64-in-argv posture. Called at Create, Apply, and
-// withReaderTask.
+// convention: when set it must be an absolute host path that exists and is a
+// directory. When unset the argv-free write path is simply unavailable and
+// WriteFile falls back to the documented base64-in-argv posture. Called at
+// Create, Apply, and withReaderTask.
 func (c Config) validateStaging() error {
 	if c.StagingDir == "" {
 		return nil
 	}
 	if !path.IsAbs(c.StagingDir) {
 		return fmt.Errorf("containerd sandbox: Config.StagingDir %q is not absolute: it must name a directory on the daemon host", c.StagingDir)
+	}
+	info, err := os.Stat(c.StagingDir)
+	if err != nil {
+		return fmt.Errorf("containerd sandbox: Config.StagingDir %q: %w", c.StagingDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("containerd sandbox: Config.StagingDir %q is not a directory", c.StagingDir)
 	}
 	return nil
 }
@@ -1134,27 +1165,45 @@ chmod "$perm" "$p"`
 func (s *ContainerdSandbox) writeFileViaStaging(ctx context.Context, path string, data []byte, mode string) error {
 	name := "w-" + newSandboxID()
 	staged := filepath.Join(s.cfg.StagingDir, name)
-	if err := os.WriteFile(staged, data, 0o600); err != nil {
-		return fmt.Errorf("containerd sandbox: write %s: stage host file: %w", path, err)
+	// O_CREATE|O_EXCL|O_NOFOLLOW: the staging directory is bind-mounted
+	// read-write into the container, so a workspace process could pre-create
+	// a symlink at the expected name. O_EXCL refuses to follow one, and
+	// O_NOFOLLOW is defense in depth. The random name makes collisions
+	// negligible; the flags make them safe.
+	fd, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("containerd sandbox: write %s: create staging file: %w", path, err)
+	}
+	if _, err := fd.Write(data); err != nil {
+		fd.Close()
+		_ = os.Remove(staged)
+		return fmt.Errorf("containerd sandbox: write %s: write staging file: %w", path, err)
+	}
+	if err := fd.Close(); err != nil {
+		_ = os.Remove(staged)
+		return fmt.Errorf("containerd sandbox: write %s: close staging file: %w", path, err)
 	}
 	// Always remove the staging file, even on failure paths.
 	defer func() {
 		_ = os.Remove(staged)
 	}()
 
-	// The in-container staging path. The bind mount is at /run/croft-staging.
-	containerStaged := "/run/croft-staging/" + name
+	// The in-container staging path. The bind mount is at stagingMountPath.
+	containerStaged := stagingMountPath + "/" + name
 
 	// Copy to a temp name in the destination's directory, then rename.
 	// mv across the staging mount boundary would be copy+unlink (EXDEV),
 	// so cat+mv within the destination directory gives the atomic rename.
+	// The trap ensures the temp file is removed even if cat or chmod fails.
 	const script = `set -e
 p=$1; perm=$2; src=$3
 mkdir -p -- "$(dirname -- "$p")"
 tmp="$p.croft-tmp.$$"
+trap 'rm -f -- "$tmp"' EXIT
 cat -- "$src" > "$tmp"
 chmod "$perm" "$tmp"
-mv -f -- "$tmp" "$p"`
+mv -f -- "$tmp" "$p"
+trap - EXIT`
 
 	if _, err := s.shell(ctx, script, path, mode, containerStaged); err != nil {
 		return fmt.Errorf("containerd sandbox: write %s: %w", path, err)

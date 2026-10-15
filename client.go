@@ -525,29 +525,45 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 			Type: specs.NetworkNamespace,
 		}))
 	}
+	// Config.Secrets and Config.StagingDir: accumulate all bind mounts into a
+	// single oci.SpecOpts that appends to the spec's existing mounts.
+	// oci.WithMounts *assigns* spec.Mounts rather than appending, so calling
+	// it once per secret would drop every prior mount including the default
+	// spec's /proc, /dev, and /sys. A single inline SpecOpts that does
+	// s.Mounts = append(s.Mounts, ...) preserves them all.
+	var bindMounts []specs.Mount
 	// Config.Secrets: bind-mount each host file read-only at its destination.
 	// The container reads a normal file; the content never appears in argv,
 	// process environment, or any exec payload. Mount options are the same
 	// shape Kubernetes uses for secret files.
 	for _, sec := range t.cfg.Secrets {
-		opts = append(opts, oci.WithMounts([]specs.Mount{{
+		bindMounts = append(bindMounts, specs.Mount{
 			Type:        "bind",
 			Source:      sec.Source,
 			Destination: sec.Destination,
 			Options:     []string{"ro", "rbind"},
-		}}))
+		})
 	}
 	// Config.StagingDir: bind-mount the host staging directory read-write at
 	// /run/croft-staging so WriteFile can move files into place atomically
 	// without putting content in argv. When unset the bind is absent and
 	// WriteFile falls back to the documented base64-in-argv path.
+	// nosuid,nodev,noexec: the workspace can write here, so it must not be
+	// able to plant setuid binaries, device files, or executable payloads
+	// in a host-visible directory.
 	if t.cfg.StagingDir != "" {
-		opts = append(opts, oci.WithMounts([]specs.Mount{{
+		bindMounts = append(bindMounts, specs.Mount{
 			Type:        "bind",
 			Source:      t.cfg.StagingDir,
-			Destination: "/run/croft-staging",
-			Options:     []string{"rbind"},
-		}}))
+			Destination: stagingMountPath,
+			Options:     []string{"rbind", "nosuid", "nodev", "noexec"},
+		})
+	}
+	if len(bindMounts) > 0 {
+		opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+			s.Mounts = append(s.Mounts, bindMounts...)
+			return nil
+		})
 	}
 	return opts, nil
 }

@@ -297,6 +297,11 @@ func TestInitSpecOpts_StagingDir(t *testing.T) {
 	if slices.Contains(m.Options, "ro") {
 		t.Error("staging mount must be read-write (no ro option)")
 	}
+	for _, want := range []string{"nosuid", "nodev", "noexec"} {
+		if !slices.Contains(m.Options, want) {
+			t.Errorf("staging mount options = %v, want %s", m.Options, want)
+		}
+	}
 }
 
 // TestInitSpecOpts pins the WithImageConfig parity this translation keeps:
