@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.6.0 (unreleased)
+## v0.6.0
 
 - Added: `Config.Network` — the workspace's network posture, with the
   default now documented as what it has always been: containerd's default
