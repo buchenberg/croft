@@ -182,9 +182,52 @@ via `WriteChunkBytes`) and carries its payload base64-encoded in exec
 arguments, visible in `/proc/*/cmdline` while the exec runs — so large
 artifacts are out of the design scope and secrets never travel through
 `WriteFile` (or through `ExecRequest.Stdin`, which stages through the same
-path). Exec output is bounded-but-buffered: `Config.MaxOutputBytes` caps each
-stream in memory, keeping head and tail around a truncation marker; live
-streaming is a scoped follow-up.
+path). With `Config.StagingDir` set, `WriteFile` writes host-side and moves
+the file into place atomically inside the container, eliminating the argv
+exposure entirely. Exec output is bounded-but-buffered: `Config.MaxOutputBytes`
+caps each stream in memory, keeping head and tail around a truncation marker;
+live streaming is a scoped follow-up.
+
+## Secrets delivery
+
+Secrets are files, not a vault. Croft delivers credential material the caller
+already controls into the workspace boundary without transiting any leaking
+surface — it does not encrypt, rotate, issue, or audit credentials.
+
+**Secret mounts** (`Config.Secrets`): host files bind-mounted read-only into
+the container. The container reads a normal file; the content never appears in
+argv, process environment, or any exec payload.
+
+```go
+sb := croft.New(croft.Config{
+    Image: "docker.io/library/golang:1.26",
+    Secrets: []croft.SecretMount{{
+        Source:      "/run/keys/git-token",
+        Destination: "/run/secrets/git-token",
+    }},
+})
+```
+
+The source path must exist on the daemon host (the same coupling `FIFODir`
+already has); a remote client stages its secrets through whatever shared path
+it already has. A bind mount preserves the host file's uid/gid/mode — protect
+the source with 0600.
+
+**Argv-free writes** (`Config.StagingDir`): when set, `WriteFile` writes the
+payload to a staging directory on the host, bind-mounts it read-write at
+`/run/croft-staging`, and moves the file into place atomically inside the
+container. The content appears in no argv at any point. When unset, the
+base64-in-argv path is unchanged (documented exposure).
+
+The exposure inventory, plainly:
+
+| Surface | Exposure | After this plan |
+|---|---|---|
+| `WriteFile` | base64 in argv → `/proc/*/cmdline` | closed when `StagingDir` is set |
+| `ExecRequest.Stdin` | same argv staging path | closed for writes; stdin content itself still stages via argv — documented |
+| `ExecRequest.Env` | `/proc/*/environ` | not addressed — env is not a secrets channel |
+| `Exec` args | argv by definition | not addressed — a caller passing a secret as an argument is a caller bug |
+| Secret *delivery* | previously: none | solved: bind-mounted files |
 
 ## Configuration
 
@@ -193,10 +236,13 @@ snapshotter, init command, in-container workdir, write chunking, the
 client-side FIFO directory (set it to a user-writable path to drive
 containerd without root), resource limits (`Config.Limits`: CPU
 shares/quota, memory, and pids caps applied to every container generation
-the sandbox starts; nil means unbounded), and the network posture
+the sandbox starts; nil means unbounded), the network posture
 (`Config.Network`: the default keeps the container's own loopback-only
-namespace; `"host"` opts into the daemon host's network). See `Config` in
-`sandbox.go` for the full contract of each field.
+namespace; `"host"` opts into the daemon host's network), secret mounts
+(`Config.Secrets`: host files bind-mounted read-only into the container),
+and the staging directory (`Config.StagingDir`: when set, `WriteFile`
+writes host-side and moves files into place atomically, closing the argv
+exposure). See `Config` in `sandbox.go` for the full contract of each field.
 
 ## State format
 
