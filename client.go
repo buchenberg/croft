@@ -556,8 +556,8 @@ func withLinuxResources(res *specs.LinuxResources) oci.SpecOpts {
 
 // linuxResources maps the public Limits onto the OCI spec's Linux
 // resources, returning nil when nothing is set so no resource option is
-// applied at all and the runtime's defaults stand. Only non-zero fields
-// are carried: a partial Limits composes with the image and runtime
+// applied at all and the runtime's defaults stand. Only positive (set)
+// fields are carried: a partial Limits composes with the image and runtime
 // defaults instead of clobbering them with zeros.
 func linuxResources(l *Limits) *specs.LinuxResources {
 	if l == nil {
