@@ -92,6 +92,57 @@ func TestCreate_ValidatesImage(t *testing.T) {
 	}
 }
 
+// netValidationSandbox is a fake-backed sandbox with Config.Network set —
+// shared by the two validation tests because the knob is checked at both
+// entries that start a container generation.
+func netValidationSandbox(log *opLog, snap *fakeSnapshotter, network string) *ContainerdSandbox {
+	return NewWithBackend(
+		Config{Image: "example/dev:latest", Network: network},
+		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"},
+	)
+}
+
+// TestCreate_ValidatesNetwork pins the config-typo convention for the
+// posture knob: unknown values fail loudly at Create, naming the field,
+// while all three supported values pass.
+func TestCreate_ValidatesNetwork(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("r")
+
+	for _, bad := range []string{"bridge", "Host", "NONE", "lo"} {
+		err := netValidationSandbox(log, snap, bad).Create(context.Background())
+		if err == nil {
+			t.Errorf("Create with Network %q must fail", bad)
+		} else if !strings.Contains(err.Error(), "Network") {
+			t.Errorf("error should name the field: %v", err)
+		}
+	}
+	for _, ok := range []string{"", "host", "none"} {
+		if err := netValidationSandbox(log, snap, ok).Create(context.Background()); err != nil {
+			t.Errorf("Create with Network %q: %v", ok, err)
+		}
+	}
+}
+
+// TestApply_ValidatesNetwork: a resumed sandbox never calls Create, so Apply
+// — its generation-starting entry — must reject unknown postures too,
+// before any daemon call.
+func TestApply_ValidatesNetwork(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+
+	for _, bad := range []string{"bridge", "Host", "NONE", "lo"} {
+		err := netValidationSandbox(log, snap, bad).Apply(
+			context.Background(), WorkspaceState{SnapshotKey: "committed-1"})
+		if err == nil {
+			t.Errorf("Apply with Network %q must fail", bad)
+		} else if !strings.Contains(err.Error(), "Network") {
+			t.Errorf("error should name the field: %v", err)
+		}
+	}
+}
+
 // TestCapture_StopsTaskBeforeCommitAndRestartsAfter is the design-critical test.
 //
 // containerd's Commit is a metadata rename, so a running task's mount survives

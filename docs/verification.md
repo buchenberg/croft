@@ -41,6 +41,17 @@ the fakes cannot reach everything a real daemon does:
   its file output persists in the snapshot — the boundary pinned as
   honestly as the recipe
   (`TestLive_BackgroundProcessDiesAtCapture`).
+- **Resource limits.** `Config.Limits` reaches the real cgroup: under a
+  cgroup-v2 daemon, `memory.max`, `pids.max`, and `cpu.max` inside the
+  container show exactly the configured values, and `cpu.weight` carries
+  runc's shares conversion (`TestLive_LimitsReachTheCgroup`, which skips
+  honestly on a host with no v2 view).
+- **Network posture.** The default (`""`) and `"none"` show exactly `lo` in
+  the container's `/sys/class/net` — the private netns croft has always
+  shipped — and `"host"` shows the daemon host's own interface listing,
+  compared against the host's
+  (`TestLive_NetworkNoneIsLoopbackOnly`,
+  `TestLive_NetworkHostSeesInterfaces`).
 - **Snapshot-native diff.** `Changes` reports the full change matrix (add,
   modify, delete, mode-only, new directory, opaque directory, symlink)
   through the production API against a real daemon-side diff service;

@@ -13,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // configImage is a containerd.Image whose config descriptor carries the
@@ -170,6 +171,49 @@ func TestLinuxResources(t *testing.T) {
 	res = linuxResources(&Limits{CPUQuota: 25000})
 	if res == nil || res.CPU == nil || res.CPU.Shares != nil || res.CPU.Quota == nil || *res.CPU.Quota != 25000 {
 		t.Errorf("quota-only resources = %+v, want CPU{Quota: 25000} without shares", res)
+	}
+}
+
+// TestInitSpecOpts_Network pins the posture mapping — and with it the
+// corrected premise of the network phase: containerd's default spec already
+// unshares the network namespace. The isolated default ("", "none") keeps
+// that entry, re-asserted explicitly so the off-switch is croft's own
+// guarantee rather than a dependency default that could drift; "host" is
+// the mode that changes the spec, removing the NEWNET entry so runc skips
+// the unshare.
+func TestInitSpecOpts_Network(t *testing.T) {
+	countNetNS := func(spec *oci.Spec) int {
+		n := 0
+		for _, ns := range spec.Linux.Namespaces {
+			if ns.Type == specs.NetworkNamespace {
+				n++
+			}
+		}
+		return n
+	}
+
+	for name, scfg := range map[string]Config{
+		"default": {},
+		"none":    {Network: "none"},
+	} {
+		spec, err := generateInitSpecWithConfig(t, scfg, v1.ImageConfig{})
+		if err != nil {
+			t.Fatalf("%s: generateInitSpecWithConfig: %v", name, err)
+		}
+		if n := countNetNS(spec); n != 1 {
+			t.Errorf("%s: %d network-namespace entries in the spec, want exactly "+
+				"one — the private netns kept, and the re-assertion must replace "+
+				"the default's entry, not duplicate it", name, n)
+		}
+	}
+
+	spec, err := generateInitSpecWithConfig(t, Config{Network: "host"}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("host: generateInitSpecWithConfig: %v", err)
+	}
+	if n := countNetNS(spec); n != 0 {
+		t.Errorf("host: spec carries %d network-namespace entries (%v), want it "+
+			"removed so runc shares the host's netns", n, spec.Linux.Namespaces)
 	}
 }
 
