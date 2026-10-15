@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 (unreleased)
+## v0.4.0
 
 The roadmap's phases 1–3 ship as one release (decision D1): the lean core,
 the snapshot-native diff, and the snapshot-native delta.
