@@ -20,15 +20,6 @@ import (
 	"testing"
 )
 
-// changeMap indexes a change list by path for lookup assertions.
-func changeMap(changes []Change) map[string]Change {
-	m := make(map[string]Change, len(changes))
-	for _, c := range changes {
-		m[c.Path] = c
-	}
-	return m
-}
-
 // TestLive_ChangesReportsAddModifyDelete is the load-bearing live diff test:
 // the spike's full change matrix (add, modify, delete, mode-only, new
 // directory, opaque directory, symlink) flows through the production Changes

@@ -1,7 +1,9 @@
 package croft
 
 import (
+	"archive/tar"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -204,6 +206,37 @@ func TestMergeChanges(t *testing.T) {
 			theirsContent: contents("d/new.txt", "N"),
 			wantApply:     nil,
 			wantConflicts: []string{"d/new.txt"},
+		},
+		{
+			name:          "theirs replaces a path with a file, ours added a child under it: conflict",
+			theirs:        []Change{regChange("p", ChangeModify, 0o644)},
+			ours:          []Change{regChange("p/child", ChangeAdd, 0o644)},
+			theirsContent: contents("p", "file now"),
+			oursContent:   contents("p/child", "C"),
+			wantApply:     nil,
+			wantConflicts: []string{"p"},
+		},
+		{
+			name:          "ours replaced a path with a file, theirs added a child under it: conflict",
+			theirs:        []Change{regChange("p/child", ChangeAdd, 0o644)},
+			ours:          []Change{regChange("p", ChangeModify, 0o644)},
+			theirsContent: contents("p/child", "C"),
+			oursContent:   contents("p", "file now"),
+			wantApply:     nil,
+			wantConflicts: []string{"p/child"},
+		},
+		{
+			name:          "theirs added under a directory ours modified: compatible",
+			theirs:        []Change{regChange("d/new.txt", ChangeAdd, 0o644)},
+			ours:          []Change{dirChange("d", ChangeModify, 0o700)},
+			theirsContent: contents("d/new.txt", "N"),
+			wantApply:     []Change{regChange("d/new.txt", ChangeAdd, 0o644)},
+		},
+		{
+			name:      "deletes underneath a rigid entry are compatible",
+			theirs:    []Change{del("d/x")},
+			ours:      []Change{del("d")},
+			wantApply: []Change{del("d/x")},
 		},
 		{
 			name:          "collision demotes only the collided delete from apply",
@@ -529,5 +562,320 @@ func TestApplyDelta_ReleasedStateIsUnavailable(t *testing.T) {
 	}
 	if keys := viewKeys(snap); len(keys) != 0 {
 		t.Errorf("diff views leaked: %v", keys)
+	}
+}
+
+// deltaTheirsKey is the seeded committed layer standing in for another
+// sandbox's captured state in the fake ApplyDelta tests.
+const deltaTheirsKey = "croft/theirs/committed/1"
+
+// deltaTestSandbox primes a sandbox that has Applied a base state, so
+// ApplyDelta has a merge base, and seeds the theirs layer. The returned
+// state is the base; deltaState builds the incoming state on top of it.
+func deltaTestSandbox(t *testing.T) (*ContainerdSandbox, *fakeSnapshotter, *fakeTasks, *fakeLeases, *fakeDiffService, WorkspaceState) {
+	t.Helper()
+	sb, snap, tasks, fl, fds := changesTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	base, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if err := sb.Apply(ctx, base); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	snap.seed(deltaTheirsKey)
+	return sb, snap, tasks, fl, fds, base
+}
+
+// deltaState is the incoming state: theirs' seeded layer over the base.
+func deltaState(base WorkspaceState) WorkspaceState {
+	return WorkspaceState{SnapshotKey: deltaTheirsKey, BaseKey: base.SnapshotKey, Image: base.Image}
+}
+
+// decodeDeltaWrites extracts path → decoded content from WriteFile execs
+// (the set -e/base64 script), concatenating chunks across multi-exec writes.
+func decodeDeltaWrites(t *testing.T, reqs []ExecRequest) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, r := range reqs {
+		if r.Command != "sh" || len(r.Args) < 6 || !strings.Contains(r.Args[1], "base64 -d") {
+			continue
+		}
+		path := r.Args[3]
+		dec, err := base64.StdEncoding.DecodeString(strings.Join(r.Args[6:], ""))
+		if err != nil {
+			t.Fatalf("decode write payload for %s: %v", path, err)
+		}
+		out[path] += string(dec)
+	}
+	return out
+}
+
+// scriptPaths lists the resolved-path arguments ($1) of every exec that ran
+// the given script, in order.
+func scriptPaths(reqs []ExecRequest, script string) []string {
+	var out []string
+	for _, r := range reqs {
+		if r.Command == "sh" && len(r.Args) >= 4 && r.Args[1] == script {
+			out = append(out, r.Args[3])
+		}
+	}
+	return out
+}
+
+// TestApplyDelta_CleanMergeAppliesTheirsOnlyChanges is the load-bearing fake
+// merge: theirs' add and delete apply, theirs' edit that ours made
+// identically is kept (not re-applied), and ours' own edit is untouched. It
+// also pins the two-leg compare shape (views for committed sides, direct
+// mounts for the active side) and the blob lease/pin hygiene across both legs.
+func TestApplyDelta_CleanMergeAppliesTheirsOnlyChanges(t *testing.T) {
+	sb, snap, tasks, fl, fds, base := deltaTestSandbox(t)
+	ctx := context.Background()
+
+	// Theirs (base → theirs layer): an add, an edit ours made identically,
+	// and a delete.
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/theirs-new.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("T\n")},
+		tarEntry{name: "workspace/both-same.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("same\n")},
+		tarEntry{name: "workspace/.wh.gone.txt", mode: 0, typeflag: tar.TypeReg},
+	))
+	// Ours (base → active): the identical edit, plus our own.
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/both-same.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("same\n")},
+		tarEntry{name: "workspace/ours-only.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("O\n")},
+	))
+
+	before := len(tasks.allReqs)
+	if err := sb.ApplyDelta(ctx, deltaState(base)); err != nil {
+		t.Fatalf("ApplyDelta: %v", err)
+	}
+	execs := tasks.allReqs[before:]
+
+	// The add applied with its blob content; the kept entries did not.
+	writes := decodeDeltaWrites(t, execs)
+	if got := writes["/workspace/theirs-new.txt"]; got != "T\n" {
+		t.Errorf("theirs-new.txt written = %q, want %q", got, "T\n")
+	}
+	if len(writes) != 1 {
+		t.Errorf("writes = %v, want only theirs-new.txt (identical and ours-only edits must not be re-applied)", writes)
+	}
+	// The delete applied, plus the write's preceding rm (every delta write
+	// rm -rf's its path first — the blob cannot distinguish add from
+	// modify, so the base's type under the path is unknown).
+	if paths := scriptPaths(execs, deltaRemoveScript); fmt.Sprint(paths) != "[/workspace/gone.txt /workspace/theirs-new.txt]" {
+		t.Errorf("rm execs = %v, want [gone.txt theirs-new.txt]", paths)
+	}
+
+	// Two compares: theirs (base→theirs) mounts BOTH sides through views
+	// (both committed); ours (base→active) views the base and mounts the
+	// active layer directly.
+	calls := fds.compareCalls()
+	if len(calls) != 2 {
+		t.Fatalf("Compare calls = %d, want 2", len(calls))
+	}
+	sb.mu.Lock()
+	active := sb.activeKey
+	sb.mu.Unlock()
+	for _, target := range []string{calls[0].lower, calls[0].upper} {
+		if !strings.Contains(target, "/diffview/") {
+			t.Errorf("theirs side mounted at %q, want a diffview (committed layer)", target)
+		}
+	}
+	if !strings.Contains(calls[1].lower, "/diffview/") {
+		t.Errorf("ours lower mounted at %q, want a diffview", calls[1].lower)
+	}
+	if calls[1].upper != "/mnt/"+active {
+		t.Errorf("ours upper mounted at %q, want the active layer /mnt/%s directly", calls[1].upper, active)
+	}
+
+	// Hygiene: both per-call diff leases deleted, every view removed, both
+	// content pins added and dropped.
+	for _, id := range diffLeaseIDs(fl) {
+		found := false
+		fl.mu.Lock()
+		for _, d := range fl.deleted {
+			if d == id {
+				found = true
+			}
+		}
+		fl.mu.Unlock()
+		if !found {
+			t.Errorf("diff lease %s was not deleted after ApplyDelta", id)
+		}
+	}
+	if keys := viewKeys(snap); len(keys) != 0 {
+		t.Errorf("diff views leaked: %v", keys)
+	}
+	fl.mu.Lock()
+	var addedContent, removedContent int
+	for _, p := range fl.added {
+		if p.res.Type == "content" {
+			addedContent++
+		}
+	}
+	for _, p := range fl.removed {
+		if p.res.Type == "content" {
+			removedContent++
+		}
+	}
+	fl.mu.Unlock()
+	if addedContent != 2 || removedContent != 2 {
+		t.Errorf("content pins: %d added, %d removed; want 2 and 2 (one per leg)", addedContent, removedContent)
+	}
+}
+
+// TestApplyDelta_ConflictRefusesWithZeroMutations pins the atomic refusal:
+// divergent edits to the same file produce ErrDeltaConflict naming the path,
+// and not a single mutation exec runs.
+func TestApplyDelta_ConflictRefusesWithZeroMutations(t *testing.T) {
+	sb, _, tasks, _, fds, base := deltaTestSandbox(t)
+	ctx := context.Background()
+
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/f.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("their edit\n")},
+	))
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/f.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("our edit\n")},
+	))
+
+	before := len(tasks.allReqs)
+	err := sb.ApplyDelta(ctx, deltaState(base))
+	if !errors.Is(err, ErrDeltaConflict) {
+		t.Fatalf("err = %v, want ErrDeltaConflict", err)
+	}
+	if !strings.Contains(err.Error(), "f.txt") {
+		t.Errorf("error %q does not name the conflicting path", err)
+	}
+	if len(tasks.allReqs) != before {
+		t.Errorf("refusal ran %d execs, want 0 (the workspace must be untouched)", len(tasks.allReqs)-before)
+	}
+}
+
+// TestApplyDelta_NoopMergesRunNoMutations pins the two no-op classes: an
+// empty theirs, and both sides having made identical edits.
+func TestApplyDelta_NoopMergesRunNoMutations(t *testing.T) {
+	empty := buildTar(t, tarEntry{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir})
+	same := buildTar(t, tarEntry{name: "workspace/f.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("same\n")})
+
+	tests := []struct {
+		name         string
+		theirs, ours []byte
+	}{
+		{"empty theirs", empty, empty},
+		{"identical edits", same, same},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sb, _, tasks, _, fds, base := deltaTestSandbox(t)
+			ctx := context.Background()
+			fds.queueBlob(tt.theirs)
+			fds.queueBlob(tt.ours)
+
+			before := len(tasks.allReqs)
+			if err := sb.ApplyDelta(ctx, deltaState(base)); err != nil {
+				t.Fatalf("ApplyDelta: %v", err)
+			}
+			if len(tasks.allReqs) != before {
+				t.Errorf("no-op merge ran %d execs, want 0", len(tasks.allReqs)-before)
+			}
+		})
+	}
+}
+
+// TestApplyDelta_TypeReplacementOrdersOps pins the application order for a
+// file→directory replacement arriving as a dir entry plus children: the
+// conditional mkdir script runs, then the child write — and for a deleted
+// sibling, the rm runs before both (removes precede creates).
+func TestApplyDelta_TypeReplacementOrdersOps(t *testing.T) {
+	sb, _, tasks, _, fds, base := deltaTestSandbox(t)
+	ctx := context.Background()
+
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/.wh.oldfile", mode: 0, typeflag: tar.TypeReg},
+		tarEntry{name: "workspace/p/", mode: 0o755, typeflag: tar.TypeDir},
+		tarEntry{name: "workspace/p/f.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("F\n")},
+	))
+	fds.queueBlob(buildTar(t, tarEntry{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir}))
+
+	before := len(tasks.allReqs)
+	if err := sb.ApplyDelta(ctx, deltaState(base)); err != nil {
+		t.Fatalf("ApplyDelta: %v", err)
+	}
+	execs := tasks.allReqs[before:]
+
+	// Order: rm oldfile, mkdir p, then the child write with its own
+	// preceding rm (every delta write rm's its path first).
+	var order []string
+	for _, r := range execs {
+		if r.Command != "sh" || len(r.Args) < 4 {
+			continue
+		}
+		switch {
+		case r.Args[1] == deltaRemoveScript:
+			order = append(order, "rm:"+r.Args[3])
+		case r.Args[1] == deltaMkdirScript:
+			order = append(order, "mkdir:"+r.Args[3])
+		case strings.Contains(r.Args[1], "base64 -d"):
+			order = append(order, "write:"+r.Args[3])
+		}
+	}
+	want := "[rm:/workspace/oldfile mkdir:/workspace/p rm:/workspace/p/f.txt write:/workspace/p/f.txt]"
+	if fmt.Sprint(order) != want {
+		t.Errorf("op order = %v, want %s", order, want)
+	}
+}
+
+// TestApplyDelta_SymlinkFromBlobTarget pins symlink application: the target
+// comes from theirs' blob (Linkname), applied via rm-then-ln.
+func TestApplyDelta_SymlinkFromBlobTarget(t *testing.T) {
+	sb, _, tasks, _, fds, base := deltaTestSandbox(t)
+	ctx := context.Background()
+
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "theirs-target"},
+	))
+	fds.queueBlob(buildTar(t, tarEntry{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir}))
+
+	before := len(tasks.allReqs)
+	if err := sb.ApplyDelta(ctx, deltaState(base)); err != nil {
+		t.Fatalf("ApplyDelta: %v", err)
+	}
+
+	var found bool
+	for _, r := range tasks.allReqs[before:] {
+		if r.Command == "sh" && len(r.Args) >= 5 && r.Args[1] == deltaSymlinkScript {
+			found = true
+			if r.Args[3] != "theirs-target" || r.Args[4] != "/workspace/link" {
+				t.Errorf("ln args = %q %q, want target then link path", r.Args[3], r.Args[4])
+			}
+		}
+	}
+	if !found {
+		t.Error("no ln -s exec for the symlink entry")
+	}
+}
+
+// TestApplyDelta_SpecialFileRefusesBeforeMutation pins the applicability
+// refusal: a FIFO in theirs fails the whole call before any mutation exec.
+func TestApplyDelta_SpecialFileRefusesBeforeMutation(t *testing.T) {
+	sb, _, tasks, _, fds, base := deltaTestSandbox(t)
+	ctx := context.Background()
+
+	fds.queueBlob(buildTar(t,
+		tarEntry{name: "workspace/ok.txt", mode: 0o644, typeflag: tar.TypeReg, content: []byte("fine\n")},
+		tarEntry{name: "workspace/pipe", mode: 0o644, typeflag: tar.TypeFifo},
+	))
+	fds.queueBlob(buildTar(t, tarEntry{name: "workspace/", mode: 0o755, typeflag: tar.TypeDir}))
+
+	before := len(tasks.allReqs)
+	err := sb.ApplyDelta(ctx, deltaState(base))
+	if err == nil || !strings.Contains(err.Error(), "cannot apply special file pipe") {
+		t.Fatalf("err = %v, want a cannot-apply-special-file refusal", err)
+	}
+	if len(tasks.allReqs) != before {
+		t.Errorf("refusal ran %d execs, want 0", len(tasks.allReqs)-before)
 	}
 }

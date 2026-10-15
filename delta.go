@@ -35,14 +35,19 @@ import (
 //     delete/modify, divergent edits, mode disagreement, type change) is a
 //     conflict.
 //
-// One rule reaches beyond single paths: a delete on one side conflicts with
-// any non-delete change strictly underneath it on the other (theirs removes
-// dir/ while ours wrote dir/f, or vice versa). The per-path walk cannot see
-// it — the paths differ — but the intents contradict, and silently applying
-// the delete would drop the kept child (or resurrect the deleted subtree on
-// the child's write). Deleted directories carry per-child whiteouts in the
-// same side's change set, so this rule fires only when the child appeared
-// after the base — exactly the divergent-intent case.
+// One rule reaches beyond single paths: a rigid entry on one side — a
+// delete, or any non-directory change — conflicts with any non-delete
+// change strictly underneath it on the other side (theirs removes dir/
+// while ours wrote dir/f; theirs replaces dir/ with a file while ours
+// added dir/f). The per-path walk cannot see it — the paths differ — but
+// the intents contradict, and silently applying both would drop the kept
+// child, resurrect the deleted subtree, or write a file through a path
+// the other side turned into a directory. Directories are the one
+// flexible type: children coexist with them. Deletes underneath a rigid
+// entry are compatible (both sides removing), and deleted directories
+// carry per-child whiteouts in their own side's change set, so this rule
+// fires only when the child appeared after the base — exactly the
+// divergent-intent case.
 //
 // conflicts carries theirs-side entries: the incoming paths the merge could
 // not reconcile, which is what the ErrDeltaConflict error names. It is sorted
@@ -79,24 +84,26 @@ func mergeChanges(theirs, ours []Change, theirsContent, oursContent map[string][
 	}
 	apply = append(apply, theirs[ti:]...)
 
-	// Delete-vs-underneath collisions, in both directions.
-	for _, d := range apply {
-		if d.Kind != ChangeDelete {
+	// Rigid-vs-underneath collisions, in both directions. The conflict entry
+	// is always theirs-side: theirs' rigid entry when it collides with ours,
+	// theirs' underneath entry when ours is the rigid side.
+	for _, t := range theirs {
+		if !isRigid(t) {
 			continue
 		}
-		forEachUnder(ours, d.Path, func(o Change) bool {
+		forEachUnder(ours, t.Path, func(o Change) bool {
 			if o.Kind != ChangeDelete {
-				addConflict(d)
+				addConflict(t)
 				return false
 			}
 			return true
 		})
 	}
-	for _, d := range ours {
-		if d.Kind != ChangeDelete {
+	for _, o := range ours {
+		if !isRigid(o) {
 			continue
 		}
-		forEachUnder(theirs, d.Path, func(t Change) bool {
+		forEachUnder(theirs, o.Path, func(t Change) bool {
 			if t.Kind != ChangeDelete {
 				addConflict(t)
 			}
@@ -134,6 +141,14 @@ func identicalChanges(t, o Change, theirsContent, oursContent map[string][]byte)
 		return false
 	}
 	return bytes.Equal(theirsContent[t.Path], oursContent[o.Path])
+}
+
+// isRigid reports whether an entry contradicts any change underneath its
+// path on the other side: deletes and every non-directory type (regular
+// file, symlink, special file) do; directories are the one type children
+// coexist with.
+func isRigid(c Change) bool {
+	return c.Kind == ChangeDelete || !c.IsDir
 }
 
 // forEachUnder calls fn for every entry whose path lies strictly under dir
@@ -184,12 +199,25 @@ type deltaOp struct {
 // refusal-is-atomic contract extends to entries the workspace cannot express.
 //
 // Ordering is load-bearing: removes first (a path theirs deleted and then
-// recreated as another type — file → directory, file → symlink — must be
-// cleared before the new type is created), then directories (path-sorted, so
-// parents precede children), then regular files, then symlinks last (a
-// symlink's target path may be created by an earlier op, and ln must not be
-// shadowed by a write to the same path). apply arrives sorted by path, and
-// the partition preserves that order within each group.
+// recreated as another type — file → directory — must be cleared before the
+// new type is created), then directories (path-sorted, so parents precede
+// children), then regular files, then symlinks last (a symlink's target path
+// may be created by an earlier op, and ln must not be shadowed by a write to
+// the same path). apply arrives sorted by path, and the partition preserves
+// that order within each group.
+//
+// Every write and symlink is preceded by rm -rf of its path: the workspace
+// holds the base's entry there (ours never touched it — the merge rules
+// guarantee that), and the base's type is unknowable here — the parser
+// reports every blob entry as ChangeModify (a diff blob cannot distinguish
+// add from modify), and delta runs no classification reader task. The write
+// must replace whatever is there: truncate-through on a symlink would
+// corrupt its target, on a directory it fails, and on a FIFO open(2) blocks.
+// rm -rf is uniformly correct and a cheap no-op when the path is absent (the
+// add case). Directories use a conditional script instead: a dir landing on
+// a NON-directory (the base's file replaced by a dir) must clear it first,
+// but an existing directory must survive — ours may hold kept children in
+// it, which the rigid-entry rule permits.
 //
 // No size guard: the delta carries full file contents transiently, the same
 // documented blob-cost risk the diff machinery carries (the roadmap rules
@@ -224,7 +252,12 @@ func planDelta(apply []Change, theirsContent map[string][]byte) ([]deltaOp, erro
 		default:
 			// Regular file: content from the blob; a missing entry is an
 			// empty file (the parser omits empty bodies).
-			writes = append(writes, deltaOp{kind: opWrite, path: c.Path, content: theirsContent[c.Path], mode: c.Mode})
+			writes = append(writes, deltaOp{
+				kind:    opWrite,
+				path:    c.Path,
+				content: theirsContent[c.Path],
+				mode:    c.Mode,
+			})
 		}
 	}
 
@@ -239,10 +272,23 @@ func planDelta(apply []Change, theirsContent map[string][]byte) ([]deltaOp, erro
 // ErrDeltaConflict is returned by ApplyDelta when the incoming state's
 // changes conflict with the workspace's own changes since their common base:
 // both sides touched the same path incompatibly (divergent edits, mode
-// disagreement, modify vs delete, type change), or one side deleted a
-// directory the other wrote into. The refusal is atomic — the workspace is
-// untouched — and the error names the conflicting paths.
+// disagreement, modify vs delete, type change), or one side's rigid entry
+// (delete, file, symlink) contradicts a change underneath it on the other.
+// The refusal is atomic — the workspace is untouched — and the error names
+// the conflicting paths.
 var ErrDeltaConflict = errors.New("croft: delta conflicts with the workspace's own changes")
+
+// The delta application scripts. rm -rf covers files, symlinks, and
+// directories alike; mkdirScript's conditional rm replaces a non-directory
+// the base left at the path without ever removing an existing directory
+// (ours may hold kept children in it); the symlink script rm-then-ln's
+// because ln -s refuses to replace an existing path. The image contract:
+// sh, rm, mkdir, chmod, ln — plus whatever WriteFile already needs.
+const (
+	deltaRemoveScript  = `rm -rf -- "$1"`
+	deltaMkdirScript   = "set -e\nif [ ! -d \"$1\" ]; then rm -rf -- \"$1\"; fi\nmkdir -p -- \"$1\"\nchmod \"$2\" \"$1\""
+	deltaSymlinkScript = `rm -rf -- "$2" && ln -s -- "$1" "$2"`
+)
 
 // ApplyDelta merges ws's changes — everything since ws.BaseKey — onto the
 // current workspace at the tree level: a three-way merge of two daemon-side
@@ -333,22 +379,35 @@ func (s *ContainerdSandbox) applyDeltaImpl(ctx context.Context, ws WorkspaceStat
 		resolved := s.resolve(op.path)
 		switch op.kind {
 		case opRemove:
-			if _, err := s.shell(ctx, `rm -rf -- "$1"`, resolved); err != nil {
+			if _, err := s.shell(ctx, deltaRemoveScript, resolved); err != nil {
 				return fmt.Errorf("containerd sandbox: delta remove %s: %w", op.path, err)
 			}
 		case opMkdir:
 			mode := strconv.FormatUint(uint64(effectivePerm(op.mode)), 8)
-			if _, err := s.shell(ctx, `mkdir -p -- "$1" && chmod "$2" "$1"`, resolved, mode); err != nil {
+			// The conditional rm handles the base-type replacement (the
+			// base's regular file became a directory in theirs) without
+			// ever removing an existing directory ours may hold kept
+			// children in. See planDelta.
+			if _, err := s.shell(ctx, deltaMkdirScript, resolved, mode); err != nil {
 				return fmt.Errorf("containerd sandbox: delta mkdir %s: %w", op.path, err)
 			}
 		case opWrite:
+			// rm -rf before every write: the base's entry at this path may
+			// be any type (the blob cannot distinguish add from modify, and
+			// delta runs no classification task), and truncate-through a
+			// symlink corrupts its target, truncate on a directory fails,
+			// open(2) on a FIFO blocks. A no-op when the path is absent.
+			// See planDelta.
+			if _, err := s.shell(ctx, deltaRemoveScript, resolved); err != nil {
+				return fmt.Errorf("containerd sandbox: delta replace %s: %w", op.path, err)
+			}
 			if err := s.writeFileImpl(ctx, op.path, op.content, op.mode); err != nil {
 				return fmt.Errorf("containerd sandbox: delta write: %w", err)
 			}
 		case opSymlink:
 			// rm-then-ln: the path may hold the base's regular file (a
 			// type replacement), and ln -s refuses to replace it.
-			if _, err := s.shell(ctx, `rm -rf -- "$2" && ln -s -- "$1" "$2"`, op.target, resolved); err != nil {
+			if _, err := s.shell(ctx, deltaSymlinkScript, op.target, resolved); err != nil {
 				return fmt.Errorf("containerd sandbox: delta symlink %s: %w", op.path, err)
 			}
 		}
