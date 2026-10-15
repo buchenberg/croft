@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -145,12 +146,22 @@ func TestApply_ValidatesNetwork(t *testing.T) {
 }
 
 // TestCreate_ValidatesSecrets pins the config-typo convention for secret
-// mounts: empty source, non-absolute paths, workdir collision, and duplicate
-// destinations all fail loudly at Create, naming the field.
+// mounts: empty source, non-absolute paths, missing source, workdir
+// collision, and duplicate destinations all fail loudly at Create, naming
+// the field.
 func TestCreate_ValidatesSecrets(t *testing.T) {
 	log := &opLog{}
 	snap := newFakeSnapshotter(log)
 	snap.seed("r")
+
+	// Real host files for cases that reach the existence check.
+	hostA := filepath.Join(t.TempDir(), "a")
+	hostB := filepath.Join(t.TempDir(), "b")
+	for _, f := range []string{hostA, hostB} {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
 
 	cases := []struct {
 		name    string
@@ -159,10 +170,13 @@ func TestCreate_ValidatesSecrets(t *testing.T) {
 	}{
 		{"empty source", []SecretMount{{Source: "", Destination: "/run/s"}}, "Source"},
 		{"relative source", []SecretMount{{Source: "token", Destination: "/run/s"}}, "Source"},
-		{"empty dest", []SecretMount{{Source: "/host/token", Destination: ""}}, "Destination"},
-		{"relative dest", []SecretMount{{Source: "/host/token", Destination: "run/s"}}, "Destination"},
-		{"workdir collision", []SecretMount{{Source: "/host/token", Destination: "/workspace/secret"}}, "workdir"},
-		{"duplicate dest", []SecretMount{{Source: "/host/a", Destination: "/run/s"}, {Source: "/host/b", Destination: "/run/s"}}, "duplicated"},
+		{"missing source", []SecretMount{{Source: "/nonexistent/token", Destination: "/run/s"}}, "does not exist"},
+		{"empty dest", []SecretMount{{Source: hostA, Destination: ""}}, "Destination"},
+		{"relative dest", []SecretMount{{Source: hostA, Destination: "run/s"}}, "Destination"},
+		{"workdir collision", []SecretMount{{Source: hostA, Destination: "/workspace/secret"}}, "workdir"},
+		{"staging mount collision", []SecretMount{{Source: hostA, Destination: "/run/croft-staging/token"}}, "staging mount"},
+		{"privileged path", []SecretMount{{Source: hostA, Destination: "/etc/shadow"}}, "privileged"},
+		{"duplicate dest", []SecretMount{{Source: hostA, Destination: "/run/s"}, {Source: hostB, Destination: "/run/s"}}, "duplicated"},
 	}
 	for _, tc := range cases {
 		sb := NewWithBackend(
@@ -177,7 +191,7 @@ func TestCreate_ValidatesSecrets(t *testing.T) {
 	}
 	// A valid secret passes.
 	sb := NewWithBackend(
-		Config{Image: "example/dev:latest", Secrets: []SecretMount{{Source: "/host/token", Destination: "/run/secrets/token"}}},
+		Config{Image: "example/dev:latest", Secrets: []SecretMount{{Source: hostA, Destination: "/run/secrets/token"}}},
 		snap, newFakeTasks(log, snap), &fakeImages{rootfs: "r"})
 	if err := sb.Create(context.Background()); err != nil {
 		t.Errorf("valid Secrets: Create: %v", err)

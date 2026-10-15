@@ -254,11 +254,11 @@ func (c Config) validateSecrets() error {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source %q is not absolute: it must name a path on the daemon host", i, s.Source)
 		}
 		// Best-effort existence check: a remote client may not share the
-		// daemon's filesystem, so a stat failure is not a hard error. When
-		// the path is visible and missing, fail loudly now rather than
-		// letting runc fail later with an opaque message.
-		if _, statErr := os.Stat(s.Source); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
-			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source %q: %w", i, s.Source, statErr)
+		// daemon's filesystem, so a stat failure is tolerated. When the
+		// path is locally visible and missing (ENOENT), fail loudly now
+		// rather than letting runc fail later with an opaque message.
+		if _, statErr := os.Stat(s.Source); statErr != nil && errors.Is(statErr, fs.ErrNotExist) {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source %q does not exist on this host: %w", i, s.Source, statErr)
 		}
 		if s.Destination == "" {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination is required: name the in-container path", i)
@@ -277,8 +277,17 @@ func (c Config) validateSecrets() error {
 		if dst == stagingMountPath || strings.HasPrefix(dst, stagingMountPath+"/") {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q collides with the reserved staging mount %q: nesting a read-only secret inside the read-write staging mount is not supported", i, dst, stagingMountPath)
 		}
-		if dst == "/" || dst == "/proc" || dst == "/dev" || dst == "/sys" || dst == "/etc" {
-			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is a privileged system path: secrets must not shadow core system directories", i, dst)
+		// Prefix-aware denylist: reject any destination under a system or
+		// runtime-owned directory, not just exact matches — /dev/shm,
+		// /sys/fs/cgroup, and /usr/lib must not be shadowable either.
+		// The root "/" is exact-match only (every path is under it).
+		if dst == "/" {
+			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is the filesystem root: secrets must not shadow the root", i, dst)
+		}
+		for _, forbidden := range []string{"/proc", "/dev", "/sys", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/root"} {
+			if strings.HasPrefix(dst, forbidden+"/") {
+				return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is under the privileged system path %q: secrets must not shadow runtime- or system-owned directories", i, dst, forbidden)
+			}
 		}
 		if seen[dst] {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is duplicated: each in-container path may be bound once", i, dst)
