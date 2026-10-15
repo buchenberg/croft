@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.0 (unreleased)
+
+- Added: `Config.Limits` — CPU shares/quota, memory, and pids caps, threaded
+  into the OCI spec of every container generation a sandbox starts (init and
+  reader tasks alike). Nil keeps the unbounded default with an identical
+  spec (roadmap decision D2, the broker's fairness floor).
+
 ## v0.4.0
 
 The roadmap's phases 1–3 ship as one release (decision D1): the lean core,

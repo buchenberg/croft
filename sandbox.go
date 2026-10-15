@@ -99,6 +99,45 @@ type Config struct {
 	// daemon. Set this to a directory the calling user can write to in order to
 	// drive the backend without root.
 	FIFODir string
+
+	// Limits bounds the sandbox's container resources (CPU, memory, process
+	// count). Nil means unbounded: every container this sandbox starts —
+	// including the reader tasks behind Changes/Diff/ReadFilesAt — runs with
+	// the runtime's defaults. A non-nil Limits with zero-valued fields is
+	// valid: unset fields pass nothing through, so partial limits compose
+	// with the image and runtime defaults.
+	//
+	// Limits apply at container creation (Create, Apply, Capture's restart,
+	// reader tasks): changing Config.Limits takes effect on the next
+	// container generation, never on a running one.
+	Limits *Limits
+}
+
+// Limits bounds a sandbox's container resources, mapped onto the OCI runtime
+// spec's Linux resources (cgroup v2 on a modern daemon): CPUShares to
+// cpu.weight, CPUQuota to the cpu.max bandwidth cap, MemoryBytes to
+// memory.max, Pids to pids.max. Zero-valued fields are left unset — the
+// runtime's defaults apply — so a Limits carrying only MemoryBytes constrains
+// memory alone.
+type Limits struct {
+	// CPUShares is the relative CPU weight against other containers
+	// (cgroup v1 cpu.shares semantics; the runtime converts it to the
+	// cgroup v2 cpu.weight scale). Zero uses the runtime default.
+	CPUShares uint64
+
+	// CPUQuota caps CPU bandwidth: at most CPUQuota microseconds of CPU
+	// time per scheduling period (the runtime's default period, typically
+	// 100ms — 50000 therefore limits the container to half a CPU). Zero
+	// or negative leaves it unset.
+	CPUQuota int64
+
+	// MemoryBytes is the hard memory limit in bytes. Zero or negative
+	// leaves it unset.
+	MemoryBytes int64
+
+	// Pids caps the number of processes in the container's cgroup — the
+	// fork-bomb fairness bound. Zero or negative leaves it unset.
+	Pids int64
 }
 
 // workdir returns the effective in-container workspace path.

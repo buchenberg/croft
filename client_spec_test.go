@@ -60,17 +60,114 @@ func newConfigImage(t *testing.T, cfg v1.ImageConfig) configImage {
 // settings, then the init args — rather than each opt in isolation.
 func generateInitSpec(t *testing.T, cfg v1.ImageConfig) (*oci.Spec, error) {
 	t.Helper()
+	return generateInitSpecWithConfig(t, Config{}, cfg)
+}
+
+// generateInitSpecWithConfig is generateInitSpec with the adapter's own
+// Config set — the path Config.Limits (and any future spec-affecting knob)
+// travels.
+func generateInitSpecWithConfig(t *testing.T, scfg Config, cfg v1.ImageConfig) (*oci.Spec, error) {
+	t.Helper()
 	// GenerateSpec requires a containerd namespace (the default spec's
 	// cgroup path resolves against it).
 	ctx := namespaces.WithNamespace(context.Background(), "croft-test")
 	img := newConfigImage(t, cfg)
-	tasks := &containerdTasks{}
+	tasks := &containerdTasks{cfg: scfg}
 	opts, err := tasks.initSpecOpts(ctx, img)
 	if err != nil {
 		return nil, err
 	}
 	opts = append(opts, oci.WithProcessArgs(tasks.initArgs()...))
 	return oci.GenerateSpec(ctx, nil, &containers.Container{}, opts...)
+}
+
+// TestInitSpecOpts_Limits pins the D2 threading: a full Config.Limits
+// arrives in the generated spec's Linux resources, which is exactly what
+// NewContainer's WithNewSpec hands the runtime.
+func TestInitSpecOpts_Limits(t *testing.T) {
+	spec, err := generateInitSpecWithConfig(t, Config{Limits: &Limits{
+		CPUShares:   512,
+		CPUQuota:    50000,
+		MemoryBytes: 192 << 20,
+		Pids:        64,
+	}}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("generateInitSpecWithConfig: %v", err)
+	}
+
+	res := spec.Linux.Resources
+	if res == nil {
+		t.Fatal("spec.Linux.Resources = nil, want the configured limits")
+	}
+	if res.CPU == nil || res.CPU.Shares == nil || *res.CPU.Shares != 512 {
+		t.Errorf("CPU.Shares = %+v, want 512", res.CPU)
+	}
+	if res.CPU.Quota == nil || *res.CPU.Quota != 50000 {
+		t.Errorf("CPU.Quota = %+v, want 50000", res.CPU.Quota)
+	}
+	if res.Memory == nil || res.Memory.Limit == nil || *res.Memory.Limit != 192<<20 {
+		t.Errorf("Memory.Limit = %+v, want %d", res.Memory, int64(192<<20))
+	}
+	if res.Pids == nil || res.Pids.Limit == nil || *res.Pids.Limit != 64 {
+		t.Errorf("Pids = %+v, want limit 64", res.Pids)
+	}
+	// The merge must preserve the default spec's device allowlist: a memory
+	// cap is not a license to drop device containment.
+	if len(res.Devices) == 0 {
+		t.Error("Resources.Devices = empty, want the default spec's device allowlist preserved by the merge")
+	}
+}
+
+// TestInitSpecOpts_NoLimitsLeavesResourcesUnset pins the unbounded default:
+// no Limits (or an all-zero/non-positive one) adds no resource opt, so the
+// spec's limit sections stay exactly as the default spec left them — CPU,
+// Memory, and Pids unset, runtime defaults in force. (The default spec does
+// carry a Resources stub with the device allowlist; that is
+// GenerateSpec's own, not croft's.)
+func TestInitSpecOpts_NoLimitsLeavesResourcesUnset(t *testing.T) {
+	for name, scfg := range map[string]Config{
+		"nil limits":   {},
+		"zero limits":  {Limits: &Limits{}},
+		"non-positive": {Limits: &Limits{CPUQuota: -1, MemoryBytes: -1, Pids: -1}},
+	} {
+		spec, err := generateInitSpecWithConfig(t, scfg, v1.ImageConfig{})
+		if err != nil {
+			t.Fatalf("%s: generateInitSpecWithConfig: %v", name, err)
+		}
+		res := spec.Linux.Resources
+		if res == nil {
+			continue // nothing set at all — trivially unbounded
+		}
+		if res.CPU != nil || res.Memory != nil || res.Pids != nil {
+			t.Errorf("%s: resources = CPU %+v, Memory %+v, Pids %+v; want all unset (unbounded default)",
+				name, res.CPU, res.Memory, res.Pids)
+		}
+	}
+}
+
+// TestLinuxResources pins the partial-limits mapping: only set fields are
+// carried, so a memory-only Limits must not clobber CPU or pids defaults
+// with zeros.
+func TestLinuxResources(t *testing.T) {
+	res := linuxResources(&Limits{MemoryBytes: 64 << 20})
+	if res == nil {
+		t.Fatal("linuxResources = nil, want memory-only resources")
+	}
+	if res.CPU != nil {
+		t.Errorf("CPU = %+v, want nil (unset field passes nothing through)", res.CPU)
+	}
+	if res.Pids != nil {
+		t.Errorf("Pids = %+v, want nil", res.Pids)
+	}
+	if res.Memory == nil || res.Memory.Limit == nil || *res.Memory.Limit != 64<<20 {
+		t.Errorf("Memory = %+v, want limit %d", res.Memory, int64(64<<20))
+	}
+
+	// Quota alone yields a CPU section without shares.
+	res = linuxResources(&Limits{CPUQuota: 25000})
+	if res == nil || res.CPU == nil || res.CPU.Shares != nil || res.CPU.Quota == nil || *res.CPU.Quota != 25000 {
+		t.Errorf("quota-only resources = %+v, want CPU{Quota: 25000} without shares", res)
+	}
 }
 
 // TestInitSpecOpts pins the WithImageConfig parity this translation keeps:

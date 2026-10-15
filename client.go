@@ -497,7 +497,7 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 	}
 	cfg := image.Config
 
-	opts := make([]oci.SpecOpts, 0, 3)
+	opts := make([]oci.SpecOpts, 0, 4)
 	if len(cfg.Env) > 0 {
 		opts = append(opts, oci.WithEnv(cfg.Env))
 	} else {
@@ -513,7 +513,87 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 	if cfg.User != "" {
 		opts = append(opts, withNumericUser(cfg.User))
 	}
+	// Config.Limits (roadmap decision D2): the broker's fairness floor.
+	// Applied to every container generation this sandbox starts — init
+	// tasks and reader tasks alike go through this function — and only
+	// when something is actually set, so the unlimited default produces
+	// the identical spec it always has.
+	if res := linuxResources(t.cfg.Limits); res != nil {
+		opts = append(opts, withLinuxResources(res))
+	}
 	return opts, nil
+}
+
+// withLinuxResources merges the mapped limits into the spec's Linux
+// resources. The v2 oci package has no whole-resources option (v1's
+// client-level WithLinuxResources did not survive the move), and the granular
+// ones do not fit: WithCPUCFS writes a period alongside the quota — 0 here,
+// where only the quota is configured — instead of leaving the runtime's
+// default period in force.
+//
+// It merges rather than replaces: GenerateSpec's default Resources carries
+// the device allowlist (deny-all entry), and overwriting the whole struct
+// would silently drop it — device containment is not croft's to give away
+// when a host asks for a memory cap.
+func withLinuxResources(res *specs.LinuxResources) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Linux == nil {
+			s.Linux = &specs.Linux{}
+		}
+		if s.Linux.Resources == nil {
+			s.Linux.Resources = &specs.LinuxResources{}
+		}
+		r := s.Linux.Resources
+		if res.CPU != nil {
+			r.CPU = res.CPU
+		}
+		if res.Memory != nil {
+			r.Memory = res.Memory
+		}
+		if res.Pids != nil {
+			r.Pids = res.Pids
+		}
+		return nil
+	}
+}
+
+// linuxResources maps the public Limits onto the OCI spec's Linux
+// resources, returning nil when nothing is set so no resource option is
+// applied at all and the runtime's defaults stand. Only non-zero fields
+// are carried: a partial Limits composes with the image and runtime
+// defaults instead of clobbering them with zeros.
+func linuxResources(l *Limits) *specs.LinuxResources {
+	if l == nil {
+		return nil
+	}
+	res := &specs.LinuxResources{}
+	set := false
+	if l.CPUShares != 0 || l.CPUQuota > 0 {
+		res.CPU = &specs.LinuxCPU{}
+		if l.CPUShares != 0 {
+			shares := l.CPUShares
+			res.CPU.Shares = &shares
+		}
+		if l.CPUQuota > 0 {
+			quota := l.CPUQuota
+			res.CPU.Quota = &quota
+		}
+		set = true
+	}
+	if l.MemoryBytes > 0 {
+		limit := l.MemoryBytes
+		res.Memory = &specs.LinuxMemory{Limit: &limit}
+		set = true
+	}
+	if l.Pids > 0 {
+		pids := l.Pids
+		res.Pids = &specs.LinuxPids{Limit: &pids}
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return res
 }
 
 // withNumericUser applies a numeric uid[:gid] image user directly onto the

@@ -322,6 +322,8 @@ _ = sb.ReleaseState(ctx, superseded)
 other containerd users), `Image` (required — the base rootfs), `Runtime`,
 `Snapshotter` (default `overlayfs`; others differ in commit semantics),
 `InitArgs` (the keep-alive command, default `sleep infinity`), `Workdir`
-(default `/workspace`), `WriteChunkBytes` (per-exec write payload), and
+(default `/workspace`), `WriteChunkBytes` (per-exec write payload),
 `FIFODir` (client-side stdio FIFOs — set it to drive the daemon without
-root). See `Config` in `croft.go` for the full contract of each field.
+root), and `Limits` (CPU shares/quota, memory, pids caps on every container
+generation the sandbox starts; nil is unbounded — the multitenancy fairness
+floor). See `Config` in `croft.go` for the full contract of each field.
