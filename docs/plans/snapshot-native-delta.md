@@ -204,3 +204,58 @@ reader-task interaction notes.
 - Patch payloads or a `MaxDeltaBytes` knob (documented risk instead).
 - Merge policy above the library — who may merge what is the broker's
   problem, not croft's.
+
+## Landing notes (implementation deviations)
+
+Recorded as landed in branch `phase3/snapshot-native-delta`; each is an
+amendment by implementation, consistent with the roadmap's consolidation
+rules:
+
+- **Content comes from the blobs, not `ReadFilesAt`** (Task 3's plan text
+  predates phase 2's final shape). Both legs parse with
+  `parseChangeTarWithContent`, so theirs' and ours' post-images are the
+  diff blobs' own entries: no reader task, no second read of anything, and
+  the identical-bytes check compares blob-to-blob. The pre-fetch plan's
+  property survives — all content is in hand before the first mutation.
+- **`mergeChanges` takes the two content maps** as extra parameters; the
+  plan's `([]Change, []Change)` signature cannot express the
+  identical-bytes rule. Still pure, still table-tested first (Task 2's
+  gate).
+- **The cross-path conflict rule generalizes beyond deletes**: any rigid
+  entry — a delete, or any non-directory change — conflicts with a
+  non-delete change strictly underneath it on the other side. Delete-only
+  missed the type-replacement collision (theirs turns `dir/` into a file
+  while ours adds `dir/f`): the per-path walk cannot see it, and applying
+  both would write through a path the other side made a file. Directories
+  are the one flexible type; deletes underneath a rigid entry stay
+  compatible (both sides removing).
+- **Every applied write and symlink is preceded by `rm -rf` of its path**,
+  not just type-changing ones: a diff blob cannot distinguish add from
+  modify (the parser reports `ChangeModify` for all non-whiteout entries)
+  and the delta runs no classification reader task, so the base's type
+  under any written path is unknowable. `rm -rf` is uniformly correct and
+  a no-op on absence. Directories instead use a guarded script
+  (`[ ! -d ] || [ -L ]` → `rm -rf`): an existing real directory must
+  survive — ours may hold kept children inside it — while anything else at
+  the path, a symlink-to-directory included, is replaced (a plain `-d`
+  guard follows the link and the chmod would rewrite the target). The
+  script also clears special bits symbolically (`chmod -s,-t`) before the
+  numeric mode: short numeric modes preserve a directory's setgid under
+  preservation-quirk implementations (verified on uutils and BusyBox), and
+  five-digit padding is not portable (POSIX numeric modes cap at four
+  digits).
+- **The image contract gains `ln` alongside `rm`** (§1.4 named only `rm`):
+  theirs' symlink entries apply as `rm -rf` + `ln -s`, with the target
+  carried by the blob's `Linkname`. BusyBox and coreutils both carry it —
+  the same argument the plan made for `rm`.
+- **`writeFileImpl` formats modes via `effectivePerm`, not `Perm()`**:
+  `Perm()` drops setuid/setgid/sticky, and a merge that applied a setuid
+  file without its special bit would report a fresh diff against the very
+  state it merged. Ordinary modes format identically.
+- **No size guard** (Task 3's `maxDiffInlineBytes` reference): the constant
+  never landed in phase 2, and the roadmap rules `MaxDeltaBytes` a
+  documented risk until a host hits the ceiling. Documented in `planDelta`.
+- **`TestLive_ApplyDeltaAfterBaseReleasedFails` uses the ghost-base key**:
+  a released layer survives until the daemon's GC runs (and here it is also
+  a chain parent), exactly the nondeterminism phase 2's unavailable-state
+  test solved the same way. `ReleaseState` is still exercised.

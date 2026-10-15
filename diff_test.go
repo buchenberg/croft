@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"strings"
@@ -17,17 +18,45 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
+// mountTarget returns the first mount's target, the fake snapshotter's
+// key-derived identity ("/mnt/"+key), or "" for an empty set.
+func mountTarget(m []mount.Mount) string {
+	if len(m) == 0 {
+		return ""
+	}
+	return m[0].Target
+}
+
 // fakeDiffService is a programmable stand-in for the daemon-side diff
 // collaborator. It records deletions so tests can assert the blob lifecycle,
 // and serves a programmable blob from Read so Changes/Diff tests can drive
 // the parser from inline tars.
+//
+// queue, when non-empty, overrides the single desc/blob pair: each Compare
+// consumes the next entry in call order and Read serves the blob matching
+// the returned descriptor. ApplyDelta tests use it to serve the two legs of
+// the three-way merge (theirs first, then ours — applyDeltaImpl's fixed
+// order). Exceeding the queue is an error, not a wraparound.
 type fakeDiffService struct {
 	mu         sync.Mutex
 	compareErr error
 	desc       ocispec.Descriptor
 	blob       []byte
 	deleted    []digest.Digest
+	queue      []fakeBlob
+	qi         int
+	compares   []fakeCompareCall
 }
+
+// fakeBlob is one queued (descriptor, blob) pair.
+type fakeBlob struct {
+	desc ocispec.Descriptor
+	blob []byte
+}
+
+// fakeCompareCall records one Compare's mount targets, so tests can assert
+// which sides mounted through views and which mounted directly.
+type fakeCompareCall struct{ lower, upper string }
 
 func newFakeDiffService() *fakeDiffService {
 	return &fakeDiffService{
@@ -39,18 +68,54 @@ func newFakeDiffService() *fakeDiffService {
 	}
 }
 
-func (f *fakeDiffService) Compare(_ context.Context, _, _ []mount.Mount) (ocispec.Descriptor, error) {
+// queueBlob appends a blob served by the next Compare call (in queue order).
+func (f *fakeDiffService) queueBlob(tar []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := len(f.queue)
+	f.queue = append(f.queue, fakeBlob{
+		desc: ocispec.Descriptor{
+			MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+			Digest:    digest.FromString(fmt.Sprintf("test-diff-blob-%d", i)),
+			Size:      int64(len(tar)),
+		},
+		blob: tar,
+	})
+}
+
+// compareCalls returns the recorded Compare mount targets.
+func (f *fakeDiffService) compareCalls() []fakeCompareCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeCompareCall(nil), f.compares...)
+}
+
+func (f *fakeDiffService) Compare(_ context.Context, lower, upper []mount.Mount) (ocispec.Descriptor, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.compareErr != nil {
 		return ocispec.Descriptor{}, f.compareErr
 	}
+	f.compares = append(f.compares, fakeCompareCall{lower: mountTarget(lower), upper: mountTarget(upper)})
+	if len(f.queue) > 0 {
+		if f.qi >= len(f.queue) {
+			return ocispec.Descriptor{}, fmt.Errorf("fake diff: Compare called %d times with only %d blobs queued", f.qi+1, len(f.queue))
+		}
+		e := f.queue[f.qi]
+		f.qi++
+		return e.desc, nil
+	}
 	return f.desc, nil
 }
 
-func (f *fakeDiffService) Read(_ context.Context, _ ocispec.Descriptor) ([]byte, error) {
+func (f *fakeDiffService) Read(_ context.Context, desc ocispec.Descriptor) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for _, e := range f.queue {
+		if e.desc.Digest == desc.Digest {
+			return e.blob, nil
+		}
+	}
 	return f.blob, nil
 }
 
@@ -563,6 +628,18 @@ func buildGzippedTar(t *testing.T, entries ...tarEntry) []byte {
 		t.Fatalf("close gzip: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// changeMap indexes a change list by path for lookup assertions. Lives here
+// rather than in the live-tagged file because untagged tests use it too —
+// a `go test -tags nolive` build must see every helper the untagged suite
+// references.
+func changeMap(changes []Change) map[string]Change {
+	m := make(map[string]Change, len(changes))
+	for _, c := range changes {
+		m[c.Path] = c
+	}
+	return m
 }
 
 // assertChanges compares two change lists field by field.

@@ -243,6 +243,13 @@ type ContainerdSandbox struct {
 	rootfsKey string
 	// activeKey is the writable snapshot the running task is rooted at.
 	activeKey string
+	// baseKey is the snapshot key of the last state this sandbox Applied —
+	// the layer its working tree diverged from. Create clears it, Apply sets
+	// it, Capture records it verbatim into WorkspaceState.BaseKey, and
+	// ApplyDelta leaves it untouched (a merge does not move the lineage
+	// base). Empty means the sandbox never Applied: a fresh lineage with no
+	// merge base.
+	baseKey string
 	// committedChain lists the committed layers this sandbox's active layer
 	// descends from, oldest first. It records fork lineage — the next Capture's
 	// parent key — not teardown: committed layers are states, outlive the
@@ -385,6 +392,7 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	s.rootfsKey = rootfsKey
 	s.activeKey = active
 	s.committedChain = nil
+	s.baseKey = ""
 	s.seq = 0
 	s.mu.Unlock()
 
@@ -420,7 +428,7 @@ func (s *ContainerdSandbox) destroyImpl(ctx context.Context) error {
 	id := s.id
 	active := s.activeKey
 	rootfs := s.rootfsKey
-	s.id, s.activeKey, s.committedChain, s.rootfsKey = "", "", nil, ""
+	s.id, s.activeKey, s.committedChain, s.rootfsKey, s.baseKey = "", "", nil, "", ""
 	s.mu.Unlock()
 
 	var errs []error
@@ -471,7 +479,7 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 	}
 
 	s.mu.Lock()
-	id, active, parent := s.id, s.activeKey, s.parentKeyLocked()
+	id, active, parent, base := s.id, s.activeKey, s.parentKeyLocked(), s.baseKey
 	// active empty with an id set is the cleanly-stopped state advance leaves
 	// behind when a successor could not be started: there is no running layer
 	// to commit, so this is the same "not created (anymore)" case.
@@ -520,7 +528,7 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 		return WorkspaceState{}, err
 	}
 
-	return snapshotState(s.cfg.Image, committed, parent), nil
+	return snapshotState(s.cfg.Image, committed, parent, base), nil
 }
 
 // advance is Capture's successor path, shared by the success case and the
@@ -659,6 +667,10 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 	s.id = id
 	s.activeKey = next
 	s.committedChain = kept
+	// The tree after Apply is exactly ws's layer, so ws is what the working
+	// tree diverges from: the merge base for every state captured from here
+	// until the next Apply.
+	s.baseKey = committed
 	s.mu.Unlock()
 
 	// Best effort: the abandoned active layer is this sandbox's private
@@ -801,7 +813,13 @@ func (s *ContainerdSandbox) writeFileImpl(ctx context.Context, path string, data
 		return err
 	}
 	path = s.resolve(path)
-	mode := strconv.FormatUint(uint64(perm.Perm()), 8)
+	// effectivePerm, not perm.Perm(): Perm() masks to 0777 and would drop
+	// setuid/setgid/sticky, silently changing the file's identity. ApplyDelta
+	// relies on this to preserve a state's special bits, and its merge rules
+	// compare full modes — applying a merge that loses setuid would make the
+	// next diff against the merged state report a change that was just
+	// "applied".
+	mode := strconv.FormatUint(uint64(effectivePerm(perm)), 8)
 
 	chunk := s.cfg.WriteChunkBytes
 	if chunk <= 0 {
@@ -954,11 +972,13 @@ func newSandboxID() string {
 }
 
 // snapshotState encodes a committed snapshot as a workspace state. Capture
-// returns this shape and Apply consumes it.
-func snapshotState(image, snapshotKey, parentKey string) WorkspaceState {
+// returns this shape and Apply consumes it. baseKey is the sandbox's current
+// merge base ("" when it never Applied), recorded verbatim.
+func snapshotState(image, snapshotKey, parentKey, baseKey string) WorkspaceState {
 	return WorkspaceState{
 		SnapshotKey: snapshotKey,
 		ParentKey:   parentKey,
+		BaseKey:     baseKey,
 		Image:       image,
 	}
 }

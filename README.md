@@ -22,6 +22,7 @@ Capture      commit the active layer, pin it as a state, continue on a fresh lay
 Apply        resume this (or any) sandbox from a captured state
 Changes      list the differences between a state and the current workspace
 Diff         render those differences as a unified text diff
+ApplyDelta   merge a state's changes onto the current workspace (tree-level)
 ReleaseState drop a state's pin; the daemon's GC reclaims the layer
 Destroy      stop the task, remove the active layer; committed states survive
 ```
@@ -42,7 +43,7 @@ The properties, honestly:
 - **A state's identity is its snapshot key** — sequence-derived, so two
   captures of identical content are distinct states. Identity, not content
   equality; croft has no digest, and a host that wants a record identity
-  hashes the three-field struct itself.
+  hashes the four-field struct itself.
 
 ## Diffing states
 
@@ -68,6 +69,33 @@ applying it, via a throwaway reader task. A state whose layer has been
 released makes `Changes`, `Diff`, and `ReadFilesAt` return
 `ErrStateUnavailable`.
 
+## Merging states
+
+`ApplyDelta` merges a state's changes into the current workspace without
+rebinding to it — the git-era delta's successor, with no git anywhere. It is a
+tree-level three-way merge: two daemon-side diffs against the state's recorded
+merge base (`BaseKey`, the layer its capturing sandbox last Applied), one from
+the base to the incoming state ("theirs") and one from the base to the current
+workspace ("ours"). Theirs-only changes apply, ours-only changes are kept,
+edits both sides made identically are kept once, and everything else —
+divergent edits to the same file, mode disagreement, modify-vs-delete, or one
+side deleting a subtree the other wrote into — is a conflict:
+`ErrDeltaConflict` names the offending paths and the workspace is completely
+untouched. The refusal is atomic; a merge that starts applying is not
+transactional, matching the git-era version's clean path.
+
+```go
+// sandbox B worked on from the same base as A:
+theirs, _ := sbB.Capture(ctx)      // theirs.BaseKey = the shared base
+err := sbA.ApplyDelta(ctx, theirs) // merge B's work into A's diverged tree
+```
+
+Granularity is per-file, not per-line: two divergent edits to the same file
+conflict even when they touch different lines (line-level merge is a scoped
+follow-up). The merge needs the base layer still pinned — a released base
+surfaces as `ErrStateUnavailable`, and a state captured from a sandbox that
+never Applied has an empty `BaseKey` and cannot be merged.
+
 ## Quick start
 
 ```go
@@ -92,7 +120,9 @@ the small coreutils croft itself uses: `mkdir` (Create provisions the
 workdir), and `cat`, `dirname`, `printf`, `base64`, and `chmod` (ReadFile and
 WriteFile). The diff machinery adds `ls` and `readlink` (reader tasks read
 pre-images, enumerate directories, and resolve symlink targets from a
-captured state). BusyBox and coreutils both carry all of them.
+captured state); the delta machinery adds `rm` and `ln` (ApplyDelta clears
+replaced and deleted paths and recreates symlinks). BusyBox and coreutils
+both carry all of them.
 
 ## Scale envelope
 
@@ -113,10 +143,12 @@ each field.
 
 ## State format
 
-`WorkspaceState` is a plain three-field record — `SnapshotKey`, `ParentKey`,
-`Image` — so it can be stored, logged, and handed back by value. Daemon-visible
-identifiers: snapshot keys use the `croft/` prefix; leases and containers are
-labeled `croft.lease` and `croft.sandbox`; the states lease is `croft-states`.
+`WorkspaceState` is a plain four-field record — `SnapshotKey`, `ParentKey`,
+`BaseKey` (the last applied layer the state's changes are relative to: the
+delta's merge base), `Image` — so it can be stored, logged, and handed back by
+value. Daemon-visible identifiers: snapshot keys use the `croft/` prefix;
+leases and containers are labeled `croft.lease` and `croft.sandbox`; the states
+lease is `croft-states`.
 
 ## Testing
 

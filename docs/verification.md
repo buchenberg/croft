@@ -36,6 +36,13 @@ the fakes cannot reach everything a real daemon does:
   `Diff` renders a unified text diff; `ReadFilesAt` reads pre-images from a
   captured state; and a released state surfaces `ErrStateUnavailable`
   (`TestLive_Changes*`, `TestLive_Diff*`, `TestLive_ReadFilesAt`).
+- **Snapshot-native delta.** `ApplyDelta` merges two sandboxes' divergent
+  work over a shared base — add, delete, identical edit, and ours-kept
+  classes — refuses a divergent same-file edit atomically (the workspace
+  stays bit-identical), applies a symlink retarget and a new directory on a
+  workspace that was never a git repository, maps a released base to
+  `ErrStateUnavailable`, and leaves no diff lease or diffview snapshot
+  behind (`TestLive_ApplyDelta*`).
 
 ## Running the live suite
 

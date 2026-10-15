@@ -11,6 +11,17 @@ type WorkspaceState struct {
 	// ParentKey is the snapshot this one was prepared from, recording the
 	// layer lineage.
 	ParentKey string
+	// BaseKey is the snapshot key of the last state the capturing sandbox
+	// had Applied — the layer its working tree diverged from. It is the
+	// merge base ApplyDelta diffs against: the state's delta spans every
+	// layer since BaseKey, not just the last capture. Empty means the
+	// sandbox never Applied anything (a fresh lineage), so the state has
+	// no merge base and cannot be merged; ApplyDelta rejects it with a
+	// clear error. BaseKey and ParentKey are equal on the first capture
+	// after an Apply but diverge on repeated captures — the next capture's
+	// parent is the previous capture, while the base stays the last applied
+	// state. Both are load-bearing.
+	BaseKey string
 	// Image is the image the workspace was provisioned from.
 	Image string
 }
