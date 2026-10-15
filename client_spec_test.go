@@ -13,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // configImage is a containerd.Image whose config descriptor carries the
@@ -170,6 +171,44 @@ func TestLinuxResources(t *testing.T) {
 	res = linuxResources(&Limits{CPUQuota: 25000})
 	if res == nil || res.CPU == nil || res.CPU.Shares != nil || res.CPU.Quota == nil || *res.CPU.Quota != 25000 {
 		t.Errorf("quota-only resources = %+v, want CPU{Quota: 25000} without shares", res)
+	}
+}
+
+// TestInitSpecOpts_Network pins the posture mapping — and with it the
+// corrected premise of the network phase: containerd's default spec already
+// unshares the network namespace, so the isolated default ("", "none") needs
+// no opt at all, and "host" is the mode that must change the spec, by
+// removing the NEWNET entry so runc skips the unshare.
+func TestInitSpecOpts_Network(t *testing.T) {
+	hasNetNS := func(spec *oci.Spec) bool {
+		for _, ns := range spec.Linux.Namespaces {
+			if ns.Type == specs.NetworkNamespace {
+				return true
+			}
+		}
+		return false
+	}
+
+	for name, scfg := range map[string]Config{
+		"default": {},
+		"none":    {Network: "none"},
+	} {
+		spec, err := generateInitSpecWithConfig(t, scfg, v1.ImageConfig{})
+		if err != nil {
+			t.Fatalf("%s: generateInitSpecWithConfig: %v", name, err)
+		}
+		if !hasNetNS(spec) {
+			t.Errorf("%s: spec carries no network-namespace entry, want the default spec's private netns kept", name)
+		}
+	}
+
+	spec, err := generateInitSpecWithConfig(t, Config{Network: "host"}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("host: generateInitSpecWithConfig: %v", err)
+	}
+	if hasNetNS(spec) {
+		t.Errorf("host: spec still carries a network-namespace entry (%v), want it removed so runc shares the host's netns",
+			spec.Linux.Namespaces)
 	}
 }
 

@@ -127,6 +127,25 @@ type Config struct {
 	// while the sandbox starts containers is a data race — decide limits
 	// before New, not after.
 	Limits *Limits
+
+	// Network selects the workspace's network posture.
+	//
+	// "" or "none" (the default): the container's own network namespace
+	// with only loopback — no egress, no ingress, DNS fails fast. This
+	// is the posture croft's containers have always had: containerd's
+	// default spec unshares the network namespace, and croft wires no
+	// CNI. It is the right default for workspaces running untrusted
+	// code.
+	//
+	// "host": share the daemon host's network namespace — package
+	// installs, git remotes, and egress work, and so does everything
+	// else the host can reach. An explicit opt-in; every container
+	// generation this sandbox starts inherits it, reader tasks
+	// included.
+	//
+	// Any other value is rejected loudly at Create and Apply (the
+	// config-typo convention).
+	Network string
 }
 
 // Limits bounds a sandbox's container resources, mapped onto the OCI runtime
@@ -168,6 +187,19 @@ func (c Config) workdir() string {
 		return "/workspace"
 	}
 	return c.Workdir
+}
+
+// validateNetwork checks Config.Network against the two supported postures.
+// Called at Create and Apply — every entry that starts a container
+// generation — so a typo fails loudly before any daemon call instead of
+// silently running the workspace under the wrong network posture.
+func (c Config) validateNetwork() error {
+	switch c.Network {
+	case "", "host", "none":
+		return nil
+	default:
+		return fmt.Errorf("containerd sandbox: Config.Network %q is not a supported posture: use \"host\" or \"none\"", c.Network)
+	}
 }
 
 // taskService is the container/task half of containerd this sandbox needs.
@@ -396,6 +428,9 @@ func (s *ContainerdSandbox) Create(ctx context.Context) error {
 func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	if s.cfg.Image == "" {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
+	}
+	if err := s.cfg.validateNetwork(); err != nil {
+		return err
 	}
 	if err := s.requireBackend(ctx); err != nil {
 		return err
@@ -647,6 +682,9 @@ func (s *ContainerdSandbox) Apply(ctx context.Context, ws WorkspaceState) error 
 func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) error {
 	if ws.SnapshotKey == "" {
 		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
+	}
+	if err := s.cfg.validateNetwork(); err != nil {
+		return err
 	}
 	committed := ws.SnapshotKey
 	if err := s.requireBackend(ctx); err != nil {
