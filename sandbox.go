@@ -259,8 +259,6 @@ func (c Config) validateSecrets() error {
 		// letting runc fail later with an opaque message.
 		if _, statErr := os.Stat(s.Source); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Source %q: %w", i, s.Source, statErr)
-		} else if statErr == nil {
-			// exists — good
 		}
 		if s.Destination == "" {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination is required: name the in-container path", i)
@@ -269,7 +267,11 @@ func (c Config) validateSecrets() error {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q is not absolute: it must name an in-container path", i, s.Destination)
 		}
 		dst := path.Clean(s.Destination)
-		if dst == workdir || strings.HasPrefix(dst, workdir+"/") {
+		// Under-workdir check: path.Clean normalizes trailing slashes and
+		// dot segments, and the root workdir "/" matches everything — a
+		// secret cannot be mounted anywhere if the workdir is the entire
+		// filesystem, which is correct.
+		if workdir == "/" || dst == workdir || strings.HasPrefix(dst, workdir+"/") {
 			return fmt.Errorf("containerd sandbox: Config.Secrets[%d].Destination %q collides with the workdir root %q: secrets mount read-only at their destination and the workdir is where agents write", i, dst, workdir)
 		}
 		if dst == stagingMountPath || strings.HasPrefix(dst, stagingMountPath+"/") {
@@ -288,9 +290,12 @@ func (c Config) validateSecrets() error {
 
 // validateStaging checks Config.StagingDir for the same config-typo
 // convention: when set it must be an absolute host path that exists and is a
-// directory. When unset the argv-free write path is simply unavailable and
-// WriteFile falls back to the documented base64-in-argv posture. Called at
-// Create, Apply, and withReaderTask.
+// directory, and the workdir must not overlap the reserved staging mount —
+// workspace writes under the staging mount land on the host bind rather
+// than the snapshot, so Capture/Apply cannot preserve or restore them. When
+// unset the argv-free write path is simply unavailable and WriteFile falls
+// back to the documented base64-in-argv posture. Called at Create, Apply,
+// and withReaderTask.
 func (c Config) validateStaging() error {
 	if c.StagingDir == "" {
 		return nil
@@ -304,6 +309,10 @@ func (c Config) validateStaging() error {
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("containerd sandbox: Config.StagingDir %q is not a directory", c.StagingDir)
+	}
+	workdir := path.Clean(c.workdir())
+	if workdir == stagingMountPath || strings.HasPrefix(workdir, stagingMountPath+"/") || strings.HasPrefix(stagingMountPath, workdir+"/") {
+		return fmt.Errorf("containerd sandbox: Config.Workdir %q overlaps the reserved staging mount %q: workspace writes would land on the host bind rather than the snapshot", c.workdir(), stagingMountPath)
 	}
 	return nil
 }
@@ -1157,11 +1166,14 @@ chmod "$perm" "$p"`
 // writeFileViaStaging writes a file without putting content in argv: the
 // payload is written to a fresh file in the host staging directory
 // (Config.StagingDir), which is bind-mounted read-write at
-// /run/croft-staging. A single exec then moves it into place atomically —
-// copy to a temp name in the destination's directory, then rename(2) — so
-// the content appears in no argv at any point.
+// stagingMountPath. A single exec then moves it into place atomically —
+// copy to a short temp name in the destination's directory, then rename(2)
+// with no-target-directory semantics — so the content appears in no argv
+// at any point.
 //
-// The staging file is removed on every outcome path, cancel-free.
+// The host staging file is removed on every outcome path, cancel-free. The
+// container-side temp file is tracked by name so Go can clean it up if the
+// shell trap does not run (SIGKILL during copy).
 func (s *ContainerdSandbox) writeFileViaStaging(ctx context.Context, path string, data []byte, mode string) error {
 	name := "w-" + newSandboxID()
 	staged := filepath.Join(s.cfg.StagingDir, name)
@@ -1183,7 +1195,7 @@ func (s *ContainerdSandbox) writeFileViaStaging(ctx context.Context, path string
 		_ = os.Remove(staged)
 		return fmt.Errorf("containerd sandbox: write %s: close staging file: %w", path, err)
 	}
-	// Always remove the staging file, even on failure paths.
+	// Always remove the host staging file, even on failure paths.
 	defer func() {
 		_ = os.Remove(staged)
 	}()
@@ -1191,21 +1203,40 @@ func (s *ContainerdSandbox) writeFileViaStaging(ctx context.Context, path string
 	// The in-container staging path. The bind mount is at stagingMountPath.
 	containerStaged := stagingMountPath + "/" + name
 
-	// Copy to a temp name in the destination's directory, then rename.
-	// mv across the staging mount boundary would be copy+unlink (EXDEV),
-	// so cat+mv within the destination directory gives the atomic rename.
-	// The trap ensures the temp file is removed even if cat or chmod fails.
+	// The temp basename is the staging file's own random name (short,
+	// fixed-length), not the requested path plus a suffix — a 255-byte
+	// basename would exceed NAME_MAX with any suffix appended.
+	tmpBase := ".croft-" + name
+	containerTmp := filepath.Join(filepath.Dir(path), tmpBase)
+
+	// Copy to a short temp name in the destination's directory, then
+	// rename with no-target-directory semantics. mv across the staging
+	// mount boundary would be copy+unlink (EXDEV), so cat+mv within the
+	// destination directory gives the atomic rename. mv -T prevents
+	// moving the temp inside an existing directory at $p. umask 077
+	// ensures the temp is private even under a permissive umask. The
+	// trap cleans up on shell-level failure; Go cleans up the temp on
+	// failure after the exec returns (SIGKILL during copy).
 	const script = `set -e
 p=$1; perm=$2; src=$3
-mkdir -p -- "$(dirname -- "$p")"
-tmp="$p.croft-tmp.$$"
+d=$(dirname -- "$p")
+mkdir -p -- "$d"
+tmp="$d/.croft-$4"
 trap 'rm -f -- "$tmp"' EXIT
+umask 077
 cat -- "$src" > "$tmp"
 chmod "$perm" "$tmp"
-mv -f -- "$tmp" "$p"
+mv -T -f -- "$tmp" "$p"
 trap - EXIT`
 
-	if _, err := s.shell(ctx, script, path, mode, containerStaged); err != nil {
+	if _, err := s.shell(ctx, script, path, mode, containerStaged, name); err != nil {
+		// Best-effort container-side cleanup: the shell trap may not have
+		// run if the exec was killed mid-copy.
+		_, _ = s.tasks.Exec(context.WithoutCancel(ctx), s.ID(), ExecRequest{
+			Command: "rm",
+			Args:    []string{"-f", "--", containerTmp},
+			Cwd:     "/",
+		})
 		return fmt.Errorf("containerd sandbox: write %s: %w", path, err)
 	}
 	return nil
