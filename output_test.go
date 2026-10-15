@@ -111,3 +111,33 @@ func writeInChunks(t *testing.T, b *cappedBuffer, s string, n int) {
 		s = s[take:]
 	}
 }
+
+// TestCappedBuffer_NegativeLimitIsUnbounded pins the config-typo guard: a
+// negative limit must behave as unbounded, not slice a negative tail
+// capacity — the buffer runs inside cio's copy goroutine, where a panic
+// would take the host process down.
+func TestCappedBuffer_NegativeLimitIsUnbounded(t *testing.T) {
+	for _, limit := range []int{-1, -4096} {
+		b := cappedBuffer{limit: limit}
+		b.Write([]byte("abc"))
+		b.Write([]byte(strings.Repeat("x", 100_000)))
+		if got := len(b.String()); got != 100_003 {
+			t.Errorf("limit %d: len = %d, want 100003 (unbounded, no panic)", limit, got)
+		}
+	}
+}
+
+// TestCappedBuffer_SingleHugeWrite pins the pre-trim: one write far larger
+// than the budget still yields the exact head/tail/marker rendering — the
+// incoming chunk is trimmed to the tail window before appending, so
+// retained memory is bounded by the budget rather than the write size.
+func TestCappedBuffer_SingleHugeWrite(t *testing.T) {
+	input := "HEAD1" + strings.Repeat("m", 1_000_000) + "TAIL9"
+	b := cappedBuffer{limit: 10}
+	b.Write([]byte(input))
+
+	want := "HEAD1" + fmt.Sprintf(truncationMarker, len(input)-10) + "TAIL9"
+	if got := b.String(); got != want {
+		t.Errorf("got %d bytes (%q...), want the head/marker/tail rendering", len(got), got[:min(80, len(got))])
+	}
+}

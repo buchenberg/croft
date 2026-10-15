@@ -11,7 +11,10 @@ import (
 const truncationMarker = "[... %d bytes truncated ...]"
 
 // cappedBuffer collects one exec stream (stdout or stderr) under the
-// Config.MaxOutputBytes ceiling. The cap applies per stream, independently.
+// Config.MaxOutputBytes ceiling. The cap applies per stream, independently,
+// and only on the public Exec path: internal protocol reads (ReadFile's cat,
+// the diff reader tasks) are data transport, not diagnostics, and stay
+// lossless — see ExecRequest.capOutput.
 //
 // Under the cap it is exact: every byte survives, in order. Over the cap it
 // keeps the first limit/2 bytes and the LAST limit-limit/2 bytes with the
@@ -23,12 +26,15 @@ const truncationMarker = "[... %d bytes truncated ...]"
 // boundary. Documented, not corrected — output is diagnostic text, and
 // rune-aware trimming would make the kept size nondeterministic.
 //
-// Zero limit means unbounded: a plain accumulation, the behavior before this
-// knob existed and the default that changes nothing.
+// A non-positive limit means unbounded: a plain accumulation, the behavior
+// before this knob existed and the default that changes nothing. Negative
+// values are treated as unbounded rather than rejected or panic-sliced —
+// the buffer runs inside cio's copy goroutine, where a panic would take the
+// host process down for what is a config typo.
 type cappedBuffer struct {
 	limit int
 
-	// Unbounded mode (limit == 0).
+	// Unbounded mode (limit <= 0).
 	unbounded bytes.Buffer
 
 	// Bounded mode: head fills first (limit/2 bytes), then tail keeps a
@@ -44,7 +50,7 @@ type cappedBuffer struct {
 func (b *cappedBuffer) Write(p []byte) (int, error) {
 	n := len(p)
 	b.total += int64(n)
-	if b.limit == 0 {
+	if b.limit <= 0 {
 		return b.unbounded.Write(p)
 	}
 
@@ -56,6 +62,15 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	}
 	if len(p) > 0 {
 		tailCap := b.limit - headRoom
+		// Trim the incoming write first: only its last tailCap bytes can
+		// survive the window anyway, and appending the whole write would
+		// retain a backing allocation the size of the write — a single
+		// 32 KiB chunk against a 1 KiB cap must not allocate 31 KiB of
+		// doomed tail. Retained memory stays bounded by the budget, not
+		// by the write size.
+		if len(p) > tailCap {
+			p = p[len(p)-tailCap:]
+		}
 		b.tail = append(b.tail, p...)
 		if len(b.tail) > tailCap {
 			b.tail = b.tail[len(b.tail)-tailCap:]
@@ -67,7 +82,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 // String renders the stream: every byte when it fit under the cap,
 // otherwise the kept head and tail around the truncation marker.
 func (b *cappedBuffer) String() string {
-	if b.limit == 0 {
+	if b.limit <= 0 {
 		return b.unbounded.String()
 	}
 	if b.total <= int64(b.limit) {

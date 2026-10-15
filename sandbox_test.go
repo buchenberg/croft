@@ -997,3 +997,58 @@ func TestWithDiffServiceWiresTheCollaborator(t *testing.T) {
 		t.Error("WithDiffService must wire the diff collaborator")
 	}
 }
+
+// TestExec_CapOutputMarksPublicTrafficOnly pins the cap's scope: the
+// unexported capOutput flag rides exactly the public Exec requests — the
+// caller's and the stdin wrapper's — and never the internal protocol reads
+// (ReadFile's cat, WriteFile's chunks), whose stdout is data the library
+// returns or parses and must stay lossless under any Config.MaxOutputBytes.
+func TestExec_CapOutputMarksPublicTrafficOnly(t *testing.T) {
+	sb, _, tasks, _ := newTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := sb.Exec(ctx, ExecRequest{Command: "true"}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !tasks.lastReq.capOutput {
+		t.Error("public Exec request is not marked capOutput")
+	}
+
+	if _, err := sb.Exec(ctx, ExecRequest{Command: "cat", Stdin: []byte("data")}); err != nil {
+		t.Fatalf("Exec with stdin: %v", err)
+	}
+	// lastReq is the cleanup rm (internal, uncapped); the wrapper is the
+	// second-to-last... find it explicitly.
+	var wrapper *ExecRequest
+	for i := range tasks.allReqs {
+		if tasks.allReqs[i].Command == "/bin/sh" {
+			wrapper = &tasks.allReqs[i]
+		}
+	}
+	if wrapper == nil {
+		t.Fatal("no stdin wrapper exec recorded")
+	}
+	if !wrapper.capOutput {
+		t.Error("stdin wrapper request is not marked capOutput")
+	}
+	if tasks.lastReq.capOutput {
+		t.Errorf("internal cleanup exec is marked capOutput: %+v", tasks.lastReq)
+	}
+
+	if _, err := sb.ReadFile(ctx, "f.txt"); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if tasks.lastReq.capOutput {
+		t.Error("ReadFile's cat exec is marked capOutput: data reads must stay lossless")
+	}
+
+	if err := sb.WriteFile(ctx, "g.txt", []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if tasks.lastReq.capOutput {
+		t.Error("WriteFile's chunk exec is marked capOutput")
+	}
+}

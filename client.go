@@ -680,11 +680,18 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 		return ExecResult{}, err
 	}
 
-	// Per-stream output ceilings (Config.MaxOutputBytes; 0 = unbounded).
+	// Per-stream output ceilings (Config.MaxOutputBytes), for public Exec
+	// traffic only — req.capOutput is set by the sandbox's Exec path and by
+	// nothing else, because ReadFile/reader-task execs carry file bytes the
+	// library returns or parses: capping those would corrupt data transport.
 	// Bounded-but-buffered, not streamed: a live tail is a scoped follow-up
 	// (the cio plumbing already streams, so the cost there is API design).
-	stdout := &cappedBuffer{limit: t.cfg.MaxOutputBytes}
-	stderr := &cappedBuffer{limit: t.cfg.MaxOutputBytes}
+	limit := 0
+	if req.capOutput {
+		limit = t.cfg.MaxOutputBytes
+	}
+	stdout := &cappedBuffer{limit: limit}
+	stderr := &cappedBuffer{limit: limit}
 	spec := &specs.Process{
 		Args: append([]string{req.Command}, req.Args...),
 		Cwd:  req.Cwd,

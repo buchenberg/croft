@@ -93,12 +93,16 @@ type Config struct {
 	WriteChunkBytes int
 
 	// MaxOutputBytes caps each of an exec's stdout and stderr in memory,
-	// applied per stream independently. Over the cap, the first and last
-	// MaxOutputBytes/2 bytes survive with a "[... N bytes truncated ...]"
-	// marker between them — heads carry the command's banner, tails the
-	// actual error. The cut is byte-based: a UTF-8 sequence or line may
-	// split at a boundary (output is diagnostic text). Zero, the default,
-	// means unbounded — the behavior before this knob existed.
+	// applied per stream independently to public Exec traffic only —
+	// ReadFile and the diff reader tasks carry data, not diagnostics, and
+	// stay lossless regardless of this knob. Over the cap, the first and
+	// last MaxOutputBytes/2 bytes survive with a "[... N bytes truncated
+	// ...]" marker between them — heads carry the command's banner, tails
+	// the actual error. The cut is byte-based: a UTF-8 sequence or line may
+	// split at a boundary (output is diagnostic text). Zero or negative
+	// means unbounded — the behavior before this knob existed; a negative
+	// value is treated as unbounded rather than rejected, matching
+	// WriteChunkBytes' tolerance for non-positive knobs.
 	MaxOutputBytes int
 
 	// FIFODir is where the containerd *client* creates the FIFOs that carry an
@@ -766,6 +770,10 @@ func (s *ContainerdSandbox) execImpl(ctx context.Context, req ExecRequest) (Exec
 	if req.Cwd == "" {
 		req.Cwd = s.cfg.workdir()
 	}
+	// Public Exec traffic: the only path where Config.MaxOutputBytes
+	// applies. Internal protocol reads (ReadFile's cat, reader tasks)
+	// carry data and stay lossless.
+	req.capOutput = true
 	if len(req.Stdin) > 0 {
 		return s.execWithStdin(ctx, id, req)
 	}
@@ -802,15 +810,23 @@ func (s *ContainerdSandbox) execWithStdin(ctx context.Context, id string, req Ex
 	}
 	defer s.removeStagedStdin(ctx, id, stdinPath)
 
-	req.Stdin = nil
 	wrapped := ExecRequest{
 		Command: "/bin/sh",
 		Args:    append([]string{"-c", `exec "$@" < ` + stdinPath, "croft", req.Command}, req.Args...),
 		Cwd:     req.Cwd,
 		Env:     req.Env,
 		Timeout: req.Timeout,
+
+		capOutput: req.capOutput,
 	}
-	return s.tasks.Exec(ctx, id, wrapped)
+	res, err := s.tasks.Exec(ctx, id, wrapped)
+	if err != nil {
+		// The adapter only ever sees the wrapper: name the caller's
+		// command too, so a timed-out `cat` does not report as a failed
+		// /bin/sh.
+		return res, fmt.Errorf("exec %s with staged stdin: %w", req.Command, err)
+	}
+	return res, nil
 }
 
 // removeStagedStdin deletes a staged stdin temp file, cancel-free and

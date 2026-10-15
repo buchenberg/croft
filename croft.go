@@ -159,6 +159,17 @@ type ExecRequest struct {
 	// /proc/*/cmdline while staging runs: stdin-shaped data, never
 	// secrets.
 	Stdin []byte
+
+	// capOutput marks the request as public Exec traffic, where
+	// Config.MaxOutputBytes applies. It is unexported and set only by the
+	// sandbox's Exec path: internal protocol reads — ReadFile's cat, the
+	// diff reader tasks, WriteFile's own acks — carry file bytes and
+	// command output that the library parses, so capping them would
+	// silently corrupt data transport (a large ReadFile would come back
+	// with a truncation marker inside the file's bytes). Diagnostics are
+	// capped; data is not. A backend implementation reading this field
+	// sees it set exactly for caller-facing Execs.
+	capOutput bool
 }
 
 // ExecResult is the outcome of one command execution. Stdout and Stderr are

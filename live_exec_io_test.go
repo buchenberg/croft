@@ -125,15 +125,37 @@ func TestLive_ExecOutputCapTruncatesMiddle(t *testing.T) {
 	if res.Stdout != "hi\n" {
 		t.Errorf("under-cap stdout = %q, want %q", res.Stdout, "hi\n")
 	}
+
+	// The cap applies to public Exec diagnostics only, never to data
+	// transport: ReadFile of a file larger than the cap must come back
+	// byte-identical — its cat stdout is the file's bytes, and truncating
+	// them would silently corrupt the read.
+	big := strings.Repeat("0123456789abcdef", cap4KiB) // 64 KiB, 16x the cap
+	bigPath := "bigger-than-cap.bin"
+	if err := sb.WriteFile(ctx, bigPath, []byte(big), 0o644); err != nil {
+		t.Fatalf("write big file: %v", err)
+	}
+	got, err := sb.ReadFile(ctx, bigPath)
+	if err != nil {
+		t.Fatalf("read big file: %v", err)
+	}
+	if string(got) != big {
+		t.Errorf("ReadFile returned %d bytes (marker present: %v), want the exact %d bytes: "+
+			"the output cap must not apply to data reads",
+			len(got), strings.Contains(string(got), "bytes truncated"), len(big))
+	}
 }
 
 // startBackgroundTicker launches a writer that appends a tick line to
 // /tmp/bg.log every 200ms, via the documented recipe: nohup, redirected,
-// backgrounded. The launching Exec must return immediately — the point of the
-// recipe is that Exec waits for its command, and this command's job is to
-// not be the workload.
+// backgrounded. The launching Exec must return immediately — the point of
+// the recipe is that Exec waits for its command, and this command's job is
+// to not be the workload. The log file is created synchronously first, so
+// polling never races the child's startup: waitTicks reads an existing
+// (possibly still empty) file from the very first poll.
 func startBackgroundTicker(t *testing.T, ctx context.Context, sb *ContainerdSandbox, cwd string) {
 	t.Helper()
+	mustExec(t, ctx, sb, cwd, "/bin/sh", "-c", ": > /tmp/bg.log")
 	start := time.Now()
 	res, err := sb.Exec(ctx, ExecRequest{
 		Command: "/bin/sh",
