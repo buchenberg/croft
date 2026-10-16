@@ -14,7 +14,7 @@ boundaries.
 | 4 — Exec I/O | [exec-io.md](exec-io.md) | croft v0.5.0 | landed (branch `phase4/exec-io`) |
 | 5 — Network policy | [network-policy.md](network-policy.md) | croft v0.6.0 | landed (branch `phase5/network-policy`) |
 | 6 — Secrets delivery | [secrets-delivery.md](secrets-delivery.md) | croft v0.7.0 | landed (branch `phase6/secrets-delivery`) |
-| 7 — MCP broker | [multi-tenant-sandbox-broker.md](multi-tenant-sandbox-broker.md) | croft-broker v0.1.0+ | Phase 0 landed (spike: 11 tools, in-memory registry) |
+| 7 — MCP broker | [multi-tenant-sandbox-broker.md](multi-tenant-sandbox-broker.md) | croft-broker v0.1.0 | landed (v0.1.0 tagged) |
 
 The architectural-review remediation plan is superseded by phase 1; its
 surviving items are folded in there and the original is archived in
