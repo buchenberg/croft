@@ -331,3 +331,95 @@ that gap — the change that makes "idle reaper survives broker restart" and
 This is Phase 1.5 in practice — it unlocks the Phase 2 and Phase 4 exit
 criteria but does not change the tool surface. It can land as a single
 commit on the same branch before merge.
+
+## 15. Azure SaaS deployment
+
+The broker's authorization and tenancy layer is SaaS-ready; this section
+is the deployment plan for running it on Azure. The core problem: the
+broker needs a containerd daemon on the same host as the sandboxes, which
+shapes the topology.
+
+### Topology
+
+```
+Azure Front Door / App Gateway (TLS termination, WAF)
+        │
+        ▼
+┌─ AKS cluster ──────────────────────────────────┐
+│  Broker pod (croft-broker, HTTP+SSE)           │
+│    ├── CROFT_BROKER_LISTEN=:8080               │
+│    ├── Azure Database for PostgreSQL (registry)│
+│    └── containerd (hostPath /var/run/...)      │
+│                                                 │
+│  Per-tenant: one containerd namespace           │
+│  Sandboxes run as containers on the node        │
+└─────────────────────────────────────────────────┘
+```
+
+**Why AKS (not Azure Container Instances):** ACI sandboxes are
+orchestrated per-request and have no local snapshotter — croft's
+overlayfs layers and cheap forks need a node-local containerd. AKS gives
+that with managed upgrades.
+
+### Component mapping
+
+| Concern | Azure service | Notes |
+|---|---|---|
+| TLS termination | Azure Front Door or App Gateway | End-to-end TLS; broker listens plain HTTP internally |
+| WAF / DDoS | Azure Front Door WAF | Rate limiting at the edge |
+| Registry DB | Azure Database for PostgreSQL (Flexible Server) | Replaces SQLite; same schema, connection string via Managed Identity |
+| Container runtime | containerd on AKS nodes (hostPath) | Already present on AKS nodes; broker mounts the socket |
+| Secrets (tenant tokens) | Azure Key Vault | Token hashes in DB; raw tokens never logged; KV for rotation |
+| Audit log | Azure Monitor / Log Analytics | `events` table exported via diagnostic settings |
+| Horizontal scaling | AKS horizontal pod autoscaler + per-tenant sharding | One broker pod per tenant group; no shared in-memory state |
+| Metrics | Azure Monitor / Prometheus | `Metrics.Snapshot()` exposed via `/health` or `/metrics` |
+| Namespace teardown | Azure CLI / operator verb | Delete tenant → delete containerd namespace → AKS node disk reclaimed |
+
+### Horizontal scaling (the hard part)
+
+Roadmap risk #4: the broker is a single process because running sandboxes
+are in-process. Two options:
+
+1. **Per-tenant sharding (v1):** one broker pod per tenant (or tenant
+   group). The registry DB is shared (Postgres); the in-memory sandbox
+   map is per-pod. Each pod owns its tenants' containerd namespaces.
+   The routing layer (Front Door) sends requests to the right pod by
+   tenant token. Simple, correct, limited to ~100s of tenants per node.
+
+2. **Active-active (v2, if needed):** externalize the sandbox map to
+   Redis or Postgres advisory locks. A sandbox's operations route to the
+   pod that owns it (sticky by sandbox ID). More complex; only worth it
+   beyond ~1000 tenants.
+
+### What needs building (in order)
+
+| # | Task | Size | Unblocks |
+|---|---|---|---|
+| 1 | Postgres registry (replace SQLite with pgx, same schema) | 1-2 days | Multi-pod, managed backups |
+| 2 | Managed Identity for Postgres auth | hours | No connection strings in env |
+| 3 | `/health` with readiness probe (registry + daemon reachable) | hours | AKS rolling updates |
+| 4 | Prometheus `/metrics` endpoint | hours | Azure Monitor dashboards |
+| 5 | Rate limiting (per-tenant token bucket in broker) | 1 day | Edge WAF handles the rest |
+| 6 | AKS deployment manifests (Helm chart or Kustomize) | 1-2 days | Production deploy |
+| 7 | Azure Front Door + WAF config | hours | TLS, DDoS, edge rate limits |
+| 8 | Key Vault integration for token rotation | 1 day | Tenant credential lifecycle |
+| 9 | Per-tenant sharding router | 2-3 days | Horizontal scaling |
+| 10 | Chaos test: kill pod mid-capture, verify state recovery | 1 day | Phase 4 exit criteria |
+
+### Cost envelope (rough, 50 tenants)
+
+- AKS Standard tier: ~$73/mo (cluster fee) + node pool (2× D4s_v5 ≈ $280/mo)
+- Azure Database for PostgreSQL Flexible (B1ms): ~$30/mo
+- Front Door Standard: ~$33/mo + data transfer
+- Key Vault: ~$1/mo per 10K operations
+- **Total: ~$420/mo** for 50 tenants × ~5 sandboxes each
+
+### Security posture
+
+- TLS end-to-end (Front Door → broker via internal TLS or trusted header)
+- Tenant tokens are 32-byte random values; only SHA-256 hashes in Postgres
+- `Config.Secrets` for tenant credential files (never `WriteFile`)
+- Network: broker pods in an AKS NetworkPolicy namespace; sandbox
+  containers use croft's isolated network default (loopback-only)
+- Audit events exported to Log Analytics with 90-day retention
+- No secrets in logs; `--log-level=warn` in production
