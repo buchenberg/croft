@@ -258,6 +258,36 @@ func (s *ContainerdSandbox) unpinState(ctx context.Context, key string) error {
 	return nil
 }
 
+// ListPinnedStates returns the snapshot keys currently pinned under the
+// namespace-scoped states lease. This is the StateLister extension the
+// broker's GC sweeper needs for the daemon→DB reconciliation direction:
+// pinned states absent from the registry (pre-registry captures, crashes)
+// can be found and adopted or released.
+//
+// A nil manager (tests, NewWithBackend without WithLeases) returns nil.
+func (s *ContainerdSandbox) ListPinnedStates(ctx context.Context) ([]string, error) {
+	mgr := s.leaseManager()
+	if mgr == nil {
+		return nil, nil
+	}
+	lctx := s.stateLeaseCtx(ctx)
+	resources, err := mgr.ListResources(lctx, leases.Lease{ID: statesLeaseID})
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil // no states lease yet: nothing pinned
+		}
+		return nil, fmt.Errorf("containerd sandbox: list pinned states: %w", err)
+	}
+	prefix := "snapshots/" + s.snapshotterName()
+	var keys []string
+	for _, r := range resources {
+		if r.Type == prefix {
+			keys = append(keys, r.ID)
+		}
+	}
+	return keys, nil
+}
+
 // namespaceSnapshotter injects the containerd namespace — and the sandbox's
 // lease, when it holds one — into every call the sandbox makes. Only the methods
 // sandbox.go uses are overridden; the rest are inherited from the embedded

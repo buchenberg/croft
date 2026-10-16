@@ -47,6 +47,7 @@ type fakeLeases struct {
 	delResErr     error
 	createBlocks  bool // Create waits for the context instead of returning
 	createStarted chan struct{}
+	resources     map[string][]leases.Resource // keyed by lease ID
 }
 
 func (f *fakeLeases) Create(ctx context.Context, opts ...leases.Opt) (leases.Lease, error) {
@@ -115,6 +116,10 @@ func (f *fakeLeases) AddResource(_ context.Context, l leases.Lease, r leases.Res
 		return f.addResErr
 	}
 	f.added = append(f.added, fakePin{lease: l.ID, res: r})
+	if f.resources == nil {
+		f.resources = make(map[string][]leases.Resource)
+	}
+	f.resources[l.ID] = append(f.resources[l.ID], r)
 	return nil
 }
 
@@ -125,6 +130,15 @@ func (f *fakeLeases) DeleteResource(_ context.Context, l leases.Lease, r leases.
 		return f.delResErr
 	}
 	f.removed = append(f.removed, fakePin{lease: l.ID, res: r})
+	if f.resources != nil {
+		var kept []leases.Resource
+		for _, existing := range f.resources[l.ID] {
+			if !(existing.ID == r.ID && existing.Type == r.Type) {
+				kept = append(kept, existing)
+			}
+		}
+		f.resources[l.ID] = kept
+	}
 	return nil
 }
 
@@ -152,8 +166,10 @@ func (f *fakeLeases) releasedFrom(lease, id string) bool {
 	return false
 }
 
-func (f *fakeLeases) ListResources(context.Context, leases.Lease) ([]leases.Resource, error) {
-	return nil, nil
+func (f *fakeLeases) ListResources(_ context.Context, l leases.Lease) ([]leases.Resource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resources[l.ID], nil
 }
 
 // TestNamespaceSnapshotter_InjectsLeaseOnlyWhenHeld is the load-bearing unit
@@ -506,6 +522,64 @@ func TestCapture_PinsCommittedStatesUnderStatesLease(t *testing.T) {
 	}
 	if !fl.pinnedOn(statesLeaseID, k2) {
 		t.Errorf("state %s is not pinned: a state must be a GC root beyond the sandbox lease", k2)
+	}
+}
+
+// TestListPinnedStates pins the StateLister extension: the snapshot keys
+// pinned under the states lease are enumerable, so the broker's GC sweeper
+// can find daemon-side pins the registry does not know about.
+func TestListPinnedStates(t *testing.T) {
+	sb, _, _, _ := newTestSandbox(t)
+	fl := &fakeLeases{}
+	sb.leases = fl
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Before any capture: nothing pinned.
+	keys, err := sb.ListPinnedStates(ctx)
+	if err != nil {
+		t.Fatalf("ListPinnedStates: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("ListPinnedStates before capture = %v, want empty", keys)
+	}
+
+	first, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	second, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("second Capture: %v", err)
+	}
+
+	keys, err = sb.ListPinnedStates(ctx)
+	if err != nil {
+		t.Fatalf("ListPinnedStates: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("ListPinnedStates = %v, want 2 keys", keys)
+	}
+	found := map[string]bool{}
+	for _, k := range keys {
+		found[k] = true
+	}
+	if !found[first.SnapshotKey] {
+		t.Errorf("first state %s not in ListPinnedStates %v", first.SnapshotKey, keys)
+	}
+	if !found[second.SnapshotKey] {
+		t.Errorf("second state %s not in ListPinnedStates %v", second.SnapshotKey, keys)
+	}
+
+	// After ReleaseState, the pin is gone.
+	if err := sb.ReleaseState(ctx, first); err != nil {
+		t.Fatalf("ReleaseState: %v", err)
+	}
+	keys, _ = sb.ListPinnedStates(ctx)
+	if len(keys) != 1 {
+		t.Errorf("ListPinnedStates after release = %v, want 1 key", keys)
 	}
 }
 
