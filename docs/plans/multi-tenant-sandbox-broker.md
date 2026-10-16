@@ -268,3 +268,66 @@ critical path for any real multi-tenant deployment.
 5. **Apply rebinds identity** — "apply is single-use per state on this
    backend" means the broker must not promise that two sandboxes resuming
    the same state share identity; document, don't paper over.
+
+## 14. Durability plan (SQLite across restarts)
+
+The Phase 1–2 implementation persists tenants and audit events to SQLite
+but keeps sandboxes and states in-memory. This section is the plan to close
+that gap — the change that makes "idle reaper survives broker restart" and
+"kill broker mid-capture, restart, workspace resumable" real.
+
+### What must survive a restart
+
+| Data | Survives? | Mechanism |
+|---|---|---|
+| Tenants | ✅ already | `tenants` table |
+| Audit events | ✅ already | `events` table |
+| Sandbox metadata (id, tenant, image, workdir, namespace, status) | **to add** | `sandboxes` table (schema exists; rows not written) |
+| State records (digest, tenant, sandbox, state_json, kind) | **to add** | `states` table (schema exists; rows not written) |
+| Running containers | ❌ never | croft's `Destroy` is idempotent; a restart finds them via the `croft.sandbox` label |
+
+### Changes
+
+1. **Persist on write**: `CreateSandbox` calls `SQLiteRegistry.CreateSandbox`;
+   `Capture` calls `SQLiteRegistry.InsertState`; `DestroySandbox` calls
+   `SQLiteRegistry.DestroySandbox`; `ReleaseState` calls
+   `SQLiteRegistry.ReleaseState`. Each write goes to SQLite before the
+   operation is acknowledged to the client (same capture-before-ack rule
+   the plan already states for states).
+
+2. **Reload on startup**: `NewWithSQLite` (or a `Broker.Recover()` method)
+   reads all non-destroyed sandboxes and non-released states from SQLite
+   and repopulates the in-memory maps. Sandbox entries with no live croft
+   container are marked `parked` (the state is still valid; the next
+   exec/apply rebuilds via `Apply`).
+
+3. **Crash window**: the worst case is a capture acknowledged to the
+   client but not yet committed to SQLite. The daemon-side layer exists
+   but the registry has no record. The GC sweeper's daemon→DB direction
+   (Phase 3 upstream extension) will find and adopt such orphans; until
+   then, the window is documented as bounded by the SQLite commit latency
+   (sub-millisecond for a local file).
+
+4. **Sandbox ID mapping**: the broker's `sb-N` ID is the registry key;
+   the croft sandbox's internal ID is not exposed. On restart, a `parked`
+   sandbox has no croft object — `Apply` creates a fresh one via the
+   factory and binds it to the recorded state. No croft ID persistence
+   is needed.
+
+### Tests
+
+- `TestRecover_SandboxesSurviveRestart`: create sandbox → write to SQLite →
+  new Broker from same DB → sandbox metadata is present.
+- `TestRecover_StatesSurviveRestart`: capture → write to SQLite →
+  new Broker → state digest is findable and the state JSON round-trips.
+- `TestRecover_ParkedSandboxResumes`: create + capture + destroy → restart →
+  apply rebuilds the workspace from the recorded state.
+- `TestRecover_MidCaptureCrash`: simulate a crash between croft Capture
+  and the SQLite write → the state is absent from the registry (documented
+  window) → the GC sweeper's daemon→DB pass adopts it when available.
+
+### Sequencing
+
+This is Phase 1.5 in practice — it unlocks the Phase 2 and Phase 4 exit
+criteria but does not change the tool surface. It can land as a single
+commit on the same branch before merge.
