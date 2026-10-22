@@ -75,7 +75,7 @@ for consumers: croft `v0.3.0` is cached by the public Go module proxy and
 served immutably, so public consumers pinned to it (yaah's CI) build
 unchanged. New versions from a private repo cannot be fetched by the public
 proxy, so the first consumer that pins a post-v0.3.0 release — the yaah
-migration PR against v0.4.0 — needs either `GOPRIVATE=github.com/buchenberg/croft`
+migration PR against v0.4.0 — needs either `GOPRIVATE=github.com/buchenberg/goatherd-croft`
 plus credentials in its CI, or the repo public again by then. Decide at the
 v0.4.0 boundary; croft-broker is created private when phase 7 starts.
 

@@ -15,7 +15,7 @@ are individually incomplete:
   But `Exec` and `FileIO` return `ErrUnsupported`. The worktree is a
   directory, not an isolation boundary. Agents run on the host kernel.
 
-- **Croft** (`github.com/buchenberg/croft`): real isolation (namespaces +
+- **Croft** (`github.com/buchenberg/goatherd-croft`): real isolation (namespaces +
   separate rootfs), exec inside containers, file I/O across the boundary,
   resource limits, network policy, secret delivery. But it's Linux-only,
   needs containerd, and its state digests are sequence-derived (violating
