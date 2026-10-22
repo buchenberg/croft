@@ -1,4 +1,4 @@
-module github.com/buchenberg/croft
+module github.com/buchenberg/goatherd-croft
 
 go 1.26.3
 

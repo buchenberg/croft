@@ -56,7 +56,7 @@ The system needs:
 | Durable trace store | `SQLiteTraceStore` | ✅ tested |
 | Cross-implementation digests | `CanonicalJSONBytes` (Python-compatible) | ✅ frozen |
 
-### Croft (github.com/buchenberg/croft)
+### Croft (github.com/buchenberg/goatherd-croft)
 
 | Capability | Method | Status |
 |---|---|---|

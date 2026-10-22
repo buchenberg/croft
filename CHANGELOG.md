@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.0
+
+Module renamed: `github.com/buchenberg/croft` is now
+`github.com/buchenberg/goatherd-croft` (repo renamed to match; old URLs
+redirect). The package name stays `croft`. No API changes.
 ## v0.7.0
 
 - Added: `Config.Secrets` (`[]SecretMount`) — host files bind-mounted
