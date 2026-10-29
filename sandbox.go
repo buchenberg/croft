@@ -1,12 +1,15 @@
 package croft
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -74,6 +77,13 @@ type Config struct {
 	// Image is the base image provisioned for the workspace. Required: a
 	// sandbox with no base filesystem has nothing to run.
 	Image string
+
+	// ContentDigest makes Capture populate WorkspaceState.ContentDigest with
+	// the daemon differ's content-addressed digest of the workspace
+	// (croft-dlb). It costs one full-tree diff against the image rootfs per
+	// capture; the no-change fast path — the part settlement needs — does not
+	// require it. NewWithBackend can enable it with WithContentDigest instead.
+	ContentDigest bool
 
 	// Runtime is the OCI runtime name, for example "io.containerd.runc.v2".
 	// Empty uses containerd's default.
@@ -472,6 +482,18 @@ type ContainerdSandbox struct {
 	// parent key — not teardown: committed layers are states, outlive the
 	// sandbox, and are never removed by Destroy or Apply.
 	committedChain []string
+	// contentDigest enables the content-addressed digest on captured states
+	// (croft-dlb). Off by default: the digest costs one daemon-side diff of the
+	// whole workspace against the image rootfs per capture, and the no-change
+	// fast path — the part settlement needs — does not require it.
+	wantContentDigest bool
+	// states remembers the exact WorkspaceState each committed (or applied)
+	// key produced, keyed by snapshot key. A no-change Capture returns the
+	// remembered state verbatim, so unchanged content at an unchanged position
+	// is identity-stable by construction — including across an Apply, where the
+	// caller's state carries lineage this sandbox would otherwise have to
+	// reconstruct (croft-dlb).
+	states map[string]WorkspaceState
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
 	// diffSeq orders diff-view snapshot keys within this sandbox. Separate
@@ -491,7 +513,7 @@ var _ Sandbox = (*ContainerdSandbox)(nil)
 // New returns a sandbox bound to cfg, backed by a real containerd client. The
 // client is connected lazily on first use.
 func New(cfg Config) *ContainerdSandbox {
-	return &ContainerdSandbox{cfg: cfg}
+	return &ContainerdSandbox{cfg: cfg, wantContentDigest: cfg.ContentDigest}
 }
 
 // NewWithBackend returns a sandbox backed by the supplied implementations.
@@ -529,6 +551,14 @@ func WithLeases(mgr leases.Manager) BackendOption {
 // change-set operations.
 func WithDiffService(ds diffService) BackendOption {
 	return func(s *ContainerdSandbox) { s.diff = ds }
+}
+
+// WithContentDigest makes Capture populate WorkspaceState.ContentDigest with
+// the daemon differ's content-addressed digest of the workspace (croft-dlb).
+// It costs one full-tree diff against the image rootfs per capture; hosts that
+// only need the no-change fast path can leave it off.
+func WithContentDigest() BackendOption {
+	return func(s *ContainerdSandbox) { s.wantContentDigest = true }
 }
 
 // ID returns the current container identity, or "" before Create. It changes
@@ -620,6 +650,7 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	s.committedChain = nil
 	s.baseKey = ""
 	s.seq = 0
+	s.states = nil
 	s.mu.Unlock()
 
 	return nil
@@ -655,6 +686,7 @@ func (s *ContainerdSandbox) destroyImpl(ctx context.Context) error {
 	active := s.activeKey
 	rootfs := s.rootfsKey
 	s.id, s.activeKey, s.committedChain, s.rootfsKey, s.baseKey = "", "", nil, "", ""
+	s.states = nil
 	s.mu.Unlock()
 
 	var errs []error
@@ -722,6 +754,51 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 		return WorkspaceState{}, fmt.Errorf("containerd sandbox: stop task before capture: %w", err)
 	}
 
+	// croft-dlb: a no-change capture is the previous state, not a new one.
+	// Diffing the active layer against its parent is the only honest way to
+	// know; when the change set is empty, committing would mint a fresh
+	// sequence key and make two captures of identical content digest
+	// differently. The task is restarted on the unchanged active layer and
+	// the parent's remembered state is returned verbatim. A fresh lineage has
+	// no committed parent to name (rootfs is the image's, not a state), so it
+	// still commits once.
+	if len(s.committedChain) > 0 && s.diff != nil {
+		s.mu.Lock()
+		parent := s.committedChain[len(s.committedChain)-1]
+		remembered, hasState := s.states[parent]
+		s.mu.Unlock()
+
+		if unchanged, derr := s.layerUnchanged(ctx, parent, active); derr == nil && unchanged {
+			if rerr := s.restart(ctx, id, active); rerr != nil {
+				// The task is stopped and the layer is still the active one;
+				// clear the key so the sandbox reads as cleanly stopped and a
+				// later Apply can recover it (the same invariant advance's
+				// stopped paths keep).
+				s.mu.Lock()
+				s.activeKey = ""
+				s.mu.Unlock()
+				return WorkspaceState{}, fmt.Errorf("containerd sandbox: restart task after no-change capture: %w", rerr)
+			}
+			if hasState {
+				return remembered, nil
+			}
+			s.mu.Lock()
+			parentParent, base := s.rootfsKey, s.baseKey
+			if n := len(s.committedChain); n >= 2 {
+				parentParent = s.committedChain[n-2]
+			}
+			s.mu.Unlock()
+			st := snapshotState(s.cfg.Image, parent, parentParent, base, s.contentDigest(ctx, parent))
+			s.mu.Lock()
+			if s.states == nil {
+				s.states = make(map[string]WorkspaceState)
+			}
+			s.states[parent] = st
+			s.mu.Unlock()
+			return st, nil
+		}
+	}
+
 	committed := s.key(id, "committed", n)
 	if err := s.snap.Commit(ctx, committed, active); err != nil {
 		// The task is stopped; restart it on the old layer so the sandbox is
@@ -754,7 +831,61 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 		return WorkspaceState{}, err
 	}
 
-	return snapshotState(s.cfg.Image, committed, parent, base), nil
+	st := snapshotState(s.cfg.Image, committed, parent, base, s.contentDigest(ctx, committed))
+	s.mu.Lock()
+	if s.states == nil {
+		s.states = make(map[string]WorkspaceState)
+	}
+	s.states[committed] = st
+	s.mu.Unlock()
+	return st, nil
+}
+
+// layerUnchanged reports whether the active layer differs from lower at all.
+// It reads the raw differ blob instead of parseChangeTar's workdir-filtered
+// view: a change outside Config.Workdir (an install into /usr, say) is still a
+// change, and taking the fast path for it would return a state whose layer
+// lacks it.
+func (s *ContainerdSandbox) layerUnchanged(ctx context.Context, lower, upper string) (bool, error) {
+	desc, drop, err := s.diffBlobBetween(ctx, lower, upper)
+	if err != nil {
+		return false, err
+	}
+	blob, rerr := s.diff.Read(ctx, desc)
+	drop()
+	if rerr != nil {
+		return false, fmt.Errorf("containerd sandbox: read diff blob: %w", rerr)
+	}
+	r, err := sniffGunzip(bytes.NewReader(blob))
+	if err != nil {
+		return false, err
+	}
+	tr := tar.NewReader(r)
+	if _, err := tr.Next(); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true, nil
+		}
+		return false, fmt.Errorf("containerd sandbox: read diff tar: %w", err)
+	}
+	return false, nil
+}
+
+// contentDigest returns the content-addressed digest of the workspace tree at
+// key, relative to the image rootfs. It is the daemon differ's blob digest, so
+// identical content with the same image yields the same value across moved
+// timelines. Empty when there is no diff service or the differ fails: identity
+// is advisory, and Capture must not fail for it.
+func (s *ContainerdSandbox) contentDigest(ctx context.Context, key string) string {
+	if s.diff == nil || !s.wantContentDigest {
+		return ""
+	}
+	desc, drop, err := s.diffBlobBetweenPurpose(ctx, s.rootfsKey, key, "content-digest", "croft-content-", false)
+	if err != nil {
+		return ""
+	}
+	digest := desc.Digest.String()
+	drop()
+	return digest
 }
 
 // advance is Capture's successor path, shared by the success case and the
@@ -898,14 +1029,52 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 		kept = append(kept, committed)
 	}
 
+	// An Apply-only sandbox may never have run Create, so the image rootfs key
+	// is unset. Resolve it here: contentDigest and the fast path's parent
+	// fallback both need it, and the state's own image is the right source.
+	rootfs := s.rootfsKey
+	if rootfs == "" {
+		img := ws.Image
+		if img == "" {
+			img = s.cfg.Image
+		}
+		if img != "" {
+			if k, kerr := s.images.RootfsSnapshot(ctx, img); kerr == nil {
+				rootfs = k
+			}
+		}
+	}
+
 	s.mu.Lock()
 	s.id = id
 	s.activeKey = next
 	s.committedChain = kept
+	s.rootfsKey = rootfs
 	// The tree after Apply is exactly ws's layer, so ws is what the working
 	// tree diverges from: the merge base for every state captured from here
 	// until the next Apply.
 	s.baseKey = committed
+	// Remember the caller's state verbatim: a no-change capture must return
+	// it unchanged, including the lineage (ParentKey/BaseKey/ContentDigest)
+	// this sandbox may not be able to reconstruct after the apply trimmed the
+	// chain (croft-dlb fork property).
+	if s.states == nil {
+		s.states = make(map[string]WorkspaceState)
+	}
+	// Prune states the apply trimmed out of the chain; they can no longer be
+	// returned by a fast-path capture and would otherwise leak for the
+	// sandbox's lifetime. Keep the applied state and its retained ancestors.
+	live := make(map[string]bool, len(kept)+1)
+	for _, k := range kept {
+		live[k] = true
+	}
+	live[committed] = true
+	for k := range s.states {
+		if !live[k] {
+			delete(s.states, k)
+		}
+	}
+	s.states[committed] = ws
 	s.mu.Unlock()
 
 	// Best effort: the abandoned active layer is this sandbox's private
@@ -1366,11 +1535,12 @@ func newSandboxID() string {
 // snapshotState encodes a committed snapshot as a workspace state. Capture
 // returns this shape and Apply consumes it. baseKey is the sandbox's current
 // merge base ("" when it never Applied), recorded verbatim.
-func snapshotState(image, snapshotKey, parentKey, baseKey string) WorkspaceState {
+func snapshotState(image, snapshotKey, parentKey, baseKey, contentDigest string) WorkspaceState {
 	return WorkspaceState{
-		SnapshotKey: snapshotKey,
-		ParentKey:   parentKey,
-		BaseKey:     baseKey,
-		Image:       image,
+		SnapshotKey:   snapshotKey,
+		ParentKey:     parentKey,
+		BaseKey:       baseKey,
+		Image:         image,
+		ContentDigest: contentDigest,
 	}
 }

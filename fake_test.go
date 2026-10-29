@@ -145,6 +145,19 @@ func (f *fakeSnapshotter) View(_ context.Context, key, parent string, _ ...snaps
 	return []mount.Mount{{Type: "overlay", Source: "overlay", Target: "/mnt/" + key}}, nil
 }
 
+// commitCount returns how many snapshots this fake has committed.
+func (f *fakeSnapshotter) commitCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, op := range f.log.ops {
+		if strings.HasPrefix(op, "commit:") {
+			n++
+		}
+	}
+	return n
+}
+
 func (f *fakeSnapshotter) Commit(_ context.Context, name, key string, _ ...snapshots.Opt) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
