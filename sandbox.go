@@ -75,6 +75,13 @@ type Config struct {
 	// sandbox with no base filesystem has nothing to run.
 	Image string
 
+	// ContentDigest makes Capture populate WorkspaceState.ContentDigest with
+	// the daemon differ's content-addressed digest of the workspace
+	// (croft-dlb). It costs one full-tree diff against the image rootfs per
+	// capture; the no-change fast path — the part settlement needs — does not
+	// require it. NewWithBackend can enable it with WithContentDigest instead.
+	ContentDigest bool
+
 	// Runtime is the OCI runtime name, for example "io.containerd.runc.v2".
 	// Empty uses containerd's default.
 	Runtime string
@@ -472,6 +479,18 @@ type ContainerdSandbox struct {
 	// parent key — not teardown: committed layers are states, outlive the
 	// sandbox, and are never removed by Destroy or Apply.
 	committedChain []string
+	// contentDigest enables the content-addressed digest on captured states
+	// (croft-dlb). Off by default: the digest costs one daemon-side diff of the
+	// whole workspace against the image rootfs per capture, and the no-change
+	// fast path — the part settlement needs — does not require it.
+	wantContentDigest bool
+	// states remembers the exact WorkspaceState each committed (or applied)
+	// key produced, keyed by snapshot key. A no-change Capture returns the
+	// remembered state verbatim, so unchanged content at an unchanged position
+	// is identity-stable by construction — including across an Apply, where the
+	// caller's state carries lineage this sandbox would otherwise have to
+	// reconstruct (croft-dlb).
+	states map[string]WorkspaceState
 	// seq orders snapshot keys within this sandbox.
 	seq uint64
 	// diffSeq orders diff-view snapshot keys within this sandbox. Separate
@@ -491,7 +510,7 @@ var _ Sandbox = (*ContainerdSandbox)(nil)
 // New returns a sandbox bound to cfg, backed by a real containerd client. The
 // client is connected lazily on first use.
 func New(cfg Config) *ContainerdSandbox {
-	return &ContainerdSandbox{cfg: cfg}
+	return &ContainerdSandbox{cfg: cfg, wantContentDigest: cfg.ContentDigest}
 }
 
 // NewWithBackend returns a sandbox backed by the supplied implementations.
@@ -529,6 +548,14 @@ func WithLeases(mgr leases.Manager) BackendOption {
 // change-set operations.
 func WithDiffService(ds diffService) BackendOption {
 	return func(s *ContainerdSandbox) { s.diff = ds }
+}
+
+// WithContentDigest makes Capture populate WorkspaceState.ContentDigest with
+// the daemon differ's content-addressed digest of the workspace (croft-dlb).
+// It costs one full-tree diff against the image rootfs per capture; hosts that
+// only need the no-change fast path can leave it off.
+func WithContentDigest() BackendOption {
+	return func(s *ContainerdSandbox) { s.wantContentDigest = true }
 }
 
 // ID returns the current container identity, or "" before Create. It changes
@@ -722,6 +749,44 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 		return WorkspaceState{}, fmt.Errorf("containerd sandbox: stop task before capture: %w", err)
 	}
 
+	// croft-dlb: a no-change capture is the previous state, not a new one.
+	// Diffing the active layer against its parent is the only honest way to
+	// know; when the change set is empty, committing would mint a fresh
+	// sequence key and make two captures of identical content digest
+	// differently. The task is restarted on the unchanged active layer and
+	// the parent's remembered state is returned verbatim. A fresh lineage has
+	// no committed parent to name (rootfs is the image's, not a state), so it
+	// still commits once.
+	if len(s.committedChain) > 0 && s.diff != nil {
+		s.mu.Lock()
+		parent := s.committedChain[len(s.committedChain)-1]
+		remembered, hasState := s.states[parent]
+		s.mu.Unlock()
+
+		if changes, _, derr := s.computeChangesBetween(ctx, parent, active, false); derr == nil && len(changes) == 0 {
+			if rerr := s.restart(ctx, id, active); rerr != nil {
+				return WorkspaceState{}, fmt.Errorf("containerd sandbox: restart task after no-change capture: %w", rerr)
+			}
+			if hasState {
+				return remembered, nil
+			}
+			s.mu.Lock()
+			parentParent, base := s.rootfsKey, s.baseKey
+			if n := len(s.committedChain); n >= 2 {
+				parentParent = s.committedChain[n-2]
+			}
+			s.mu.Unlock()
+			st := snapshotState(s.cfg.Image, parent, parentParent, base, s.contentDigest(ctx, parent))
+			s.mu.Lock()
+			if s.states == nil {
+				s.states = make(map[string]WorkspaceState)
+			}
+			s.states[parent] = st
+			s.mu.Unlock()
+			return st, nil
+		}
+	}
+
 	committed := s.key(id, "committed", n)
 	if err := s.snap.Commit(ctx, committed, active); err != nil {
 		// The task is stopped; restart it on the old layer so the sandbox is
@@ -754,7 +819,32 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 		return WorkspaceState{}, err
 	}
 
-	return snapshotState(s.cfg.Image, committed, parent, base), nil
+	st := snapshotState(s.cfg.Image, committed, parent, base, s.contentDigest(ctx, committed))
+	s.mu.Lock()
+	if s.states == nil {
+		s.states = make(map[string]WorkspaceState)
+	}
+	s.states[committed] = st
+	s.mu.Unlock()
+	return st, nil
+}
+
+// contentDigest returns the content-addressed digest of the workspace tree at
+// key, relative to the image rootfs. It is the daemon differ's blob digest, so
+// identical content with the same image yields the same value across moved
+// timelines. Empty when there is no diff service or the differ fails: identity
+// is advisory, and Capture must not fail for it.
+func (s *ContainerdSandbox) contentDigest(ctx context.Context, key string) string {
+	if s.diff == nil || !s.wantContentDigest {
+		return ""
+	}
+	desc, drop, err := s.diffBlobBetweenPurpose(ctx, s.rootfsKey, key, "content-digest", "croft-content-", false)
+	if err != nil {
+		return ""
+	}
+	digest := desc.Digest.String()
+	drop()
+	return digest
 }
 
 // advance is Capture's successor path, shared by the success case and the
@@ -906,6 +996,14 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 	// tree diverges from: the merge base for every state captured from here
 	// until the next Apply.
 	s.baseKey = committed
+	// Remember the caller's state verbatim: a no-change capture must return
+	// it unchanged, including the lineage (ParentKey/BaseKey/ContentDigest)
+	// this sandbox may not be able to reconstruct after the apply trimmed the
+	// chain (croft-dlb fork property).
+	if s.states == nil {
+		s.states = make(map[string]WorkspaceState)
+	}
+	s.states[committed] = ws
 	s.mu.Unlock()
 
 	// Best effort: the abandoned active layer is this sandbox's private
@@ -1366,11 +1464,12 @@ func newSandboxID() string {
 // snapshotState encodes a committed snapshot as a workspace state. Capture
 // returns this shape and Apply consumes it. baseKey is the sandbox's current
 // merge base ("" when it never Applied), recorded verbatim.
-func snapshotState(image, snapshotKey, parentKey, baseKey string) WorkspaceState {
+func snapshotState(image, snapshotKey, parentKey, baseKey, contentDigest string) WorkspaceState {
 	return WorkspaceState{
-		SnapshotKey: snapshotKey,
-		ParentKey:   parentKey,
-		BaseKey:     baseKey,
-		Image:       image,
+		SnapshotKey:   snapshotKey,
+		ParentKey:     parentKey,
+		BaseKey:       baseKey,
+		Image:         image,
+		ContentDigest: contentDigest,
 	}
 }

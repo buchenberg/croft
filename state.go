@@ -24,4 +24,12 @@ type WorkspaceState struct {
 	BaseKey string
 	// Image is the image the workspace was provisioned from.
 	Image string
+	// ContentDigest is the content-addressed digest of this state's workspace
+	// tree, relative to the image rootfs — the daemon differ's blob digest.
+	// Two states with identical content (and the same image) carry the same
+	// ContentDigest even when their snapshot keys differ, which is what lets a
+	// host compare content across a moved timeline. Empty when the capture
+	// could not compute it (a sandbox without a diff service, or a differ
+	// failure); Capture still succeeds.
+	ContentDigest string
 }

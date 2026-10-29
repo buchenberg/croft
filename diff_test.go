@@ -1594,10 +1594,16 @@ func TestChanges_ConcurrentWithSharedLock(t *testing.T) {
 		t.Errorf("created %d diff leases across %d concurrent calls, want %d", len(ids), goroutines, goroutines)
 	}
 	fl.mu.Lock()
-	deleted := len(fl.deleted)
+	deleted := 0
+	for _, id := range fl.deleted {
+		// Content-digest leases (croft-dlb) are Capture's, not these calls'.
+		if strings.HasPrefix(id, "croft-diff-") {
+			deleted++
+		}
+	}
 	fl.mu.Unlock()
 	if deleted != goroutines {
-		t.Errorf("deleted %d leases, want %d: every call must drop its blob", deleted, goroutines)
+		t.Errorf("deleted %d diff leases, want %d: every call must drop its blob", deleted, goroutines)
 	}
 }
 

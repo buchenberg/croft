@@ -328,6 +328,12 @@ func (s *ContainerdSandbox) diffBlob(ctx context.Context, ws WorkspaceState) (oc
 // of the mounts. A side whose layer has been released surfaces as
 // ErrStateUnavailable.
 func (s *ContainerdSandbox) diffBlobBetween(ctx context.Context, lowerKey, upperKey string) (ocispec.Descriptor, func(), error) {
+	return s.diffBlobBetweenPurpose(ctx, lowerKey, upperKey, "diff", "croft-diff-", true)
+}
+
+// diffBlobBetweenPurpose is diffBlobBetween with the lease's purpose named, so
+// a content-digest computation (croft-dlb) is not counted as a caller's diff.
+func (s *ContainerdSandbox) diffBlobBetweenPurpose(ctx context.Context, lowerKey, upperKey, purpose, leasePrefix string, withLease bool) (ocispec.Descriptor, func(), error) {
 	if s.diff == nil {
 		return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: diff service not configured")
 	}
@@ -338,10 +344,10 @@ func (s *ContainerdSandbox) diffBlobBetween(ctx context.Context, lowerKey, upper
 	// need GC protection for the duration, and the Compare's blob needs a
 	// pin. Nil manager means test fakes — no daemon, no GC, nothing to pin.
 	var leaseID string
-	if mgr != nil {
+	if mgr != nil && withLease {
 		l, err := mgr.Create(s.stateLeaseCtx(ctx),
-			leases.WithID("croft-diff-"+newSandboxID()),
-			leases.WithLabels(map[string]string{sandboxLeaseLabel: "diff"}),
+			leases.WithID(leasePrefix+newSandboxID()),
+			leases.WithLabels(map[string]string{sandboxLeaseLabel: purpose}),
 		)
 		if err != nil {
 			return ocispec.Descriptor{}, nil, fmt.Errorf("containerd sandbox: create diff lease: %w", err)

@@ -838,7 +838,7 @@ func TestExec_StdinStagingFailureCleansUp(t *testing.T) {
 }
 
 func TestSnapshotState_RoundTrip(t *testing.T) {
-	state := snapshotState("example/dev:latest", "layer-7", "layer-3", "layer-1")
+	state := snapshotState("example/dev:latest", "layer-7", "layer-3", "layer-1", "")
 
 	if state.SnapshotKey != "layer-7" {
 		t.Errorf("SnapshotKey = %q, want layer-7", state.SnapshotKey)
@@ -1244,5 +1244,113 @@ func TestExec_CapOutputMarksPublicTrafficOnly(t *testing.T) {
 	}
 	if tasks.lastReq.capOutput {
 		t.Error("WriteFile's chunk exec is marked capOutput")
+	}
+}
+
+// TestCapture_NoChangeFastPath pins croft-dlb's runtime contract: two captures
+// of unchanged content at an unchanged position return the same state, and the
+// second emits no new committed snapshot.
+func TestCapture_NoChangeFastPath(t *testing.T) {
+	sb, snap, _, _, fds := changesTestSandbox(t)
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	first, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("first Capture: %v", err)
+	}
+	commits := snap.commitCount()
+
+	// No write between the captures; the differ reports an empty change set.
+	fds.blob = buildTar(t)
+	second, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("second Capture: %v", err)
+	}
+
+	if second != first {
+		t.Fatalf("unchanged content must return the same state\nfirst:  %+v\nsecond: %+v", first, second)
+	}
+	if got := snap.commitCount(); got != commits {
+		t.Fatalf("the fast path must not commit a new snapshot (commits %d -> %d)", commits, got)
+	}
+}
+
+// TestCapture_ForkProperty pins the other half of croft-dlb: a second sandbox
+// that applies a state and captures unchanged content returns that same state,
+// including lineage it did not reconstruct itself.
+func TestCapture_ForkProperty(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	fds := newFakeDiffService()
+	newSB := func() *ContainerdSandbox {
+		return NewWithBackend(Config{Image: "example/dev:latest"}, snap, newFakeTasks(log, snap), images,
+			WithLeases(&fakeLeases{}), WithDiffService(fds))
+	}
+	ctx := context.Background()
+
+	first := newSB()
+	if err := first.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	state, err := first.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	second := newSB()
+	if err := second.Apply(ctx, state); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	fds.blob = buildTar(t)
+	got, err := second.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture after Apply: %v", err)
+	}
+	if got != state {
+		t.Fatalf("apply + unchanged capture must return the same state\nwant: %+v\ngot:  %+v", state, got)
+	}
+}
+
+// TestCapture_ContentDigestOptIn pins the exposed content identity: when the
+// option is on, Capture records the differ's blob digest, and an unchanged
+// re-capture returns the same state (and digest) without committing.
+func TestCapture_ContentDigestOptIn(t *testing.T) {
+	log := &opLog{}
+	snap := newFakeSnapshotter(log)
+	snap.seed("rootfs-image-digest")
+	tasks := newFakeTasks(log, snap)
+	images := &fakeImages{rootfs: "rootfs-image-digest"}
+	fds := newFakeDiffService()
+	sb := NewWithBackend(Config{Image: "example/dev:latest"}, snap, tasks, images,
+		WithLeases(&fakeLeases{}), WithDiffService(fds), WithContentDigest())
+	ctx := context.Background()
+	if err := sb.Create(ctx); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	first, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if first.ContentDigest != fds.desc.Digest.String() {
+		t.Fatalf("ContentDigest = %q, want the differ blob digest %s", first.ContentDigest, fds.desc.Digest)
+	}
+
+	fds.blob = buildTar(t)
+	commits := snap.commitCount()
+	second, err := sb.Capture(ctx)
+	if err != nil {
+		t.Fatalf("second Capture: %v", err)
+	}
+	if second != first {
+		t.Fatalf("unchanged content must keep its state and digest\nfirst:  %+v\nsecond: %+v", first, second)
+	}
+	if got := snap.commitCount(); got != commits {
+		t.Fatalf("no-change capture committed a layer (%d -> %d)", commits, got)
 	}
 }
