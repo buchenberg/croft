@@ -403,7 +403,7 @@ func (s *ContainerdSandbox) diffBlobBetweenPurpose(ctx context.Context, lowerKey
 	// the same blob (same sides → same digest), and eager deletion would
 	// break the other call's Read. The lease deletion in drop unpins the
 	// blob; the daemon's GC reclaims it once nothing references it.
-	if mgr != nil {
+	if mgr != nil && withLease {
 		res := leases.Resource{ID: desc.Digest.String(), Type: "content"}
 		if err := mgr.AddResource(ctx, leases.Lease{ID: leaseID}, res); err != nil {
 			drop()

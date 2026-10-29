@@ -1,12 +1,15 @@
 package croft
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -647,6 +650,7 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	s.committedChain = nil
 	s.baseKey = ""
 	s.seq = 0
+	s.states = nil
 	s.mu.Unlock()
 
 	return nil
@@ -682,6 +686,7 @@ func (s *ContainerdSandbox) destroyImpl(ctx context.Context) error {
 	active := s.activeKey
 	rootfs := s.rootfsKey
 	s.id, s.activeKey, s.committedChain, s.rootfsKey, s.baseKey = "", "", nil, "", ""
+	s.states = nil
 	s.mu.Unlock()
 
 	var errs []error
@@ -763,8 +768,15 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 		remembered, hasState := s.states[parent]
 		s.mu.Unlock()
 
-		if changes, _, derr := s.computeChangesBetween(ctx, parent, active, false); derr == nil && len(changes) == 0 {
+		if unchanged, derr := s.layerUnchanged(ctx, parent, active); derr == nil && unchanged {
 			if rerr := s.restart(ctx, id, active); rerr != nil {
+				// The task is stopped and the layer is still the active one;
+				// clear the key so the sandbox reads as cleanly stopped and a
+				// later Apply can recover it (the same invariant advance's
+				// stopped paths keep).
+				s.mu.Lock()
+				s.activeKey = ""
+				s.mu.Unlock()
 				return WorkspaceState{}, fmt.Errorf("containerd sandbox: restart task after no-change capture: %w", rerr)
 			}
 			if hasState {
@@ -827,6 +839,35 @@ func (s *ContainerdSandbox) captureImpl(ctx context.Context) (WorkspaceState, er
 	s.states[committed] = st
 	s.mu.Unlock()
 	return st, nil
+}
+
+// layerUnchanged reports whether the active layer differs from lower at all.
+// It reads the raw differ blob instead of parseChangeTar's workdir-filtered
+// view: a change outside Config.Workdir (an install into /usr, say) is still a
+// change, and taking the fast path for it would return a state whose layer
+// lacks it.
+func (s *ContainerdSandbox) layerUnchanged(ctx context.Context, lower, upper string) (bool, error) {
+	desc, drop, err := s.diffBlobBetween(ctx, lower, upper)
+	if err != nil {
+		return false, err
+	}
+	blob, rerr := s.diff.Read(ctx, desc)
+	drop()
+	if rerr != nil {
+		return false, fmt.Errorf("containerd sandbox: read diff blob: %w", rerr)
+	}
+	r, err := sniffGunzip(bytes.NewReader(blob))
+	if err != nil {
+		return false, err
+	}
+	tr := tar.NewReader(r)
+	if _, err := tr.Next(); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true, nil
+		}
+		return false, fmt.Errorf("containerd sandbox: read diff tar: %w", err)
+	}
+	return false, nil
 }
 
 // contentDigest returns the content-addressed digest of the workspace tree at
@@ -988,10 +1029,27 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 		kept = append(kept, committed)
 	}
 
+	// An Apply-only sandbox may never have run Create, so the image rootfs key
+	// is unset. Resolve it here: contentDigest and the fast path's parent
+	// fallback both need it, and the state's own image is the right source.
+	rootfs := s.rootfsKey
+	if rootfs == "" {
+		img := ws.Image
+		if img == "" {
+			img = s.cfg.Image
+		}
+		if img != "" {
+			if k, kerr := s.images.RootfsSnapshot(ctx, img); kerr == nil {
+				rootfs = k
+			}
+		}
+	}
+
 	s.mu.Lock()
 	s.id = id
 	s.activeKey = next
 	s.committedChain = kept
+	s.rootfsKey = rootfs
 	// The tree after Apply is exactly ws's layer, so ws is what the working
 	// tree diverges from: the merge base for every state captured from here
 	// until the next Apply.
@@ -1002,6 +1060,19 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 	// chain (croft-dlb fork property).
 	if s.states == nil {
 		s.states = make(map[string]WorkspaceState)
+	}
+	// Prune states the apply trimmed out of the chain; they can no longer be
+	// returned by a fast-path capture and would otherwise leak for the
+	// sandbox's lifetime. Keep the applied state and its retained ancestors.
+	live := make(map[string]bool, len(kept)+1)
+	for _, k := range kept {
+		live[k] = true
+	}
+	live[committed] = true
+	for k := range s.states {
+		if !live[k] {
+			delete(s.states, k)
+		}
 	}
 	s.states[committed] = ws
 	s.mu.Unlock()
