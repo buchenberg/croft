@@ -210,13 +210,17 @@ type Sandbox interface {
 	// snapshot, pins it, and continues on a fresh layer. Non-mutating to
 	// the caller's workspace metadata.
 	//
-	// Digest stability: when the active layer contains no changes, Capture
-	// returns the parent state verbatim instead of minting a new key, so two
-	// captures of unchanged content at an unchanged timeline are equal. A
-	// capture at a moved timeline still has a different key.
+	// Digest stability: when the sandbox has a daemon diff service (the
+	// default; a NewWithBackend host must supply WithDiffService), a committed
+	// parent exists, and the differ succeeds, an empty change set makes
+	// Capture return the parent state verbatim instead of minting a new key, so
+	// two captures of unchanged content at an unchanged timeline are equal. A
+	// fresh lineage, a missing differ, or a differ failure falls back to
+	// minting a new key. A capture at a moved timeline also has a different
+	// key.
 	// Config.ContentDigest opts into a content-addressed digest for comparing
-	// identical content across a moved timeline; it costs a full-tree diff
-	// per capture and is off by default.
+	// identical content with the same image across a moved timeline; it costs a
+	// full-tree diff per capture and is off by default.
 	Capture(ctx context.Context) (WorkspaceState, error)
 
 	// Apply resumes the workspace from a previously captured state by
