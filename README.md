@@ -40,10 +40,17 @@ The properties, honestly:
 - **Serialized** — lifecycle operations are exclusive, workspace operations
   shared: an in-flight Exec finishes before a Capture commits the layer it is
   writing to, by construction.
-- **A state's identity is its snapshot key** — sequence-derived, so two
-  captures of identical content are distinct states. Identity, not content
-  equality; croft has no digest, and a host that wants a record identity
-  hashes the four-field struct itself.
+- **A state's identity is its snapshot key** — sequence-derived. Capture is
+  digest-stable for an unchanged workspace **when it can tell**: with a daemon
+  diff service (the default when croft connects itself; a `NewWithBackend`
+  host must supply `WithDiffService`), a committed parent, and a successful
+  differ, an empty change set returns the parent's state verbatim, so repeated
+  captures of identical content at an unchanged timeline are equal. A fresh
+  lineage, a sandbox without a differ, or a differ failure falls back to
+  minting a new key. A capture at a moved timeline also has a different key.
+  `Config.ContentDigest` opts into a content-addressed digest for comparing
+  identical content **with the same image** across a moved timeline; it costs
+  a full-tree diff per capture, so it is off by default.
 - **Network-isolated by default** — the container gets its own network
   namespace with only loopback: no egress, no ingress, DNS fails fast.
   `Config.Network: "host"` is the explicit opt-in that shares the daemon
