@@ -1,0 +1,310 @@
+package croft
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// brokerHosts is the exact-host allowlist for a broker network posture. An
+// empty set is a deny-all broker: the proxy still exists and still pins the
+// container to one host port, but it admits no destination.
+type brokerHosts map[string]bool
+
+func newBrokerHosts(hosts []string) brokerHosts {
+	out := make(brokerHosts, len(hosts))
+	for _, host := range hosts {
+		out[brokerHostName(host)] = true
+	}
+	return out
+}
+
+func brokerHostName(hostPort string) string {
+	host := strings.TrimSpace(hostPort)
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	return strings.ToLower(strings.Trim(host, "[]"))
+}
+
+func (h brokerHosts) allows(hostPort string) bool {
+	return h[brokerHostName(hostPort)]
+}
+
+// brokerProxy is the host-side HTTP/CONNECT allowlist proxy. It listens on the
+// host end of the container's veth, so the container has no route except the
+// proxy address; the allowlist is the only path to the outside.
+type brokerProxy struct {
+	hosts brokerHosts
+	ln    net.Listener
+	srv   *http.Server
+	once  sync.Once
+
+	client *http.Client
+}
+
+func newBrokerProxy(hosts []string) (*brokerProxy, error) {
+	p := &brokerProxy{
+		hosts: newBrokerHosts(hosts),
+		client: &http.Client{
+			Transport: &http.Transport{
+				Proxy:                 nil,
+				ForceAttemptHTTP2:     false,
+				MaxIdleConns:          16,
+				IdleConnTimeout:       30 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	return p, nil
+}
+
+func (p *brokerProxy) serve(ln net.Listener) {
+	p.once.Do(func() {
+		p.ln = ln
+		p.srv = &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			_ = p.srv.Serve(ln)
+		}()
+	})
+}
+
+func (p *brokerProxy) close() {
+	if p.srv != nil {
+		_ = p.srv.Close()
+	}
+	if p.ln != nil {
+		_ = p.ln.Close()
+	}
+}
+
+func (p *brokerProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		p.connect(w, r)
+		return
+	}
+	target := r.URL.Host
+	if target == "" {
+		target = r.Host
+	}
+	if !p.hosts.allows(target) || !p.hosts.allows(r.Host) {
+		http.Error(w, "broker: host not allowed", http.StatusForbidden)
+		return
+	}
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	out.Header.Del("Proxy-Connection")
+	out.Header.Del("Proxy-Authorization")
+	if out.URL.Scheme == "" {
+		out.URL.Scheme = "http"
+	}
+	if out.URL.Host == "" {
+		out.URL.Host = r.Host
+	}
+	resp, err := p.client.Do(out)
+	if err != nil {
+		http.Error(w, "broker: upstream request failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (p *brokerProxy) connect(w http.ResponseWriter, r *http.Request) {
+	if !p.hosts.allows(r.Host) {
+		http.Error(w, "broker: host not allowed", http.StatusForbidden)
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", r.Host, 30*time.Second)
+	if err != nil {
+		http.Error(w, "broker: upstream connect failed", http.StatusBadGateway)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		_ = upstream.Close()
+		http.Error(w, "broker: hijack unavailable", http.StatusInternalServerError)
+		return
+	}
+	client, _, err := hijacker.Hijack()
+	if err != nil {
+		_ = upstream.Close()
+		return
+	}
+	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	go func() {
+		_, _ = io.Copy(upstream, client)
+		_ = upstream.Close()
+	}()
+	_, _ = io.Copy(client, upstream)
+	_ = client.Close()
+}
+
+// brokerNet is the per-generation veth + proxy + firewall setup.
+type brokerNet struct {
+	hostIf string
+	chain  string
+	hostIP string
+	port   int
+	proxy  *brokerProxy
+}
+
+func (b *brokerNet) env() map[string]string {
+	proxy := "http://" + net.JoinHostPort(b.hostIP, strconv.Itoa(b.port))
+	return map[string]string{
+		"HTTP_PROXY":  proxy,
+		"HTTPS_PROXY": proxy,
+		"NO_PROXY":    "127.0.0.1,localhost,::1",
+	}
+}
+
+var brokerSeq atomic.Uint32
+
+func nextBrokerAddr() (host, container string, err error) {
+	n := brokerSeq.Add(1) - 1
+	if n >= 256*64 {
+		return "", "", errors.New("containerd sandbox: broker address space exhausted")
+	}
+	hi := n / 64
+	lo := (n%64)*4 + 1
+	return fmt.Sprintf("10.42.%d.%d", hi, lo), fmt.Sprintf("10.42.%d.%d", hi, lo+1), nil
+}
+
+func brokerIfNames(id, snapshotKey string) (host, container string) {
+	var hash uint32 = 2166136261
+	for _, b := range []byte(id + "/" + snapshotKey) {
+		hash ^= uint32(b)
+		hash *= 16777619
+	}
+	return fmt.Sprintf("crh%08x", hash), fmt.Sprintf("crc%08x", hash)
+}
+
+func setupBrokerNet(ctx context.Context, id, snapshotKey string, pid uint32, hosts []string) (*brokerNet, error) {
+	if pid == 0 {
+		return nil, errors.New("containerd sandbox: broker network needs a running task pid")
+	}
+	for _, tool := range []string{"ip", "nsenter", "iptables"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			return nil, fmt.Errorf("containerd sandbox: broker network requires %s: %w", tool, err)
+		}
+	}
+	hostIP, containerIP, err := nextBrokerAddr()
+	if err != nil {
+		return nil, err
+	}
+	hostIf, containerIf := brokerIfNames(id, snapshotKey)
+	chain := "CROFT-" + strings.TrimPrefix(hostIf, "crh")
+	b := &brokerNet{hostIf: hostIf, chain: chain, hostIP: hostIP}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			b.close(context.WithoutCancel(ctx))
+		}
+	}()
+
+	run := func(name string, args ...string) error {
+		out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if err := run("ip", "link", "add", hostIf, "type", "veth", "peer", "name", containerIf); err != nil {
+		return nil, err
+	}
+	if err := run("ip", "addr", "add", hostIP+"/30", "dev", hostIf); err != nil {
+		return nil, err
+	}
+	if err := run("ip", "link", "set", hostIf, "up"); err != nil {
+		return nil, err
+	}
+	if err := run("ip", "link", "set", containerIf, "netns", strconv.FormatUint(uint64(pid), 10)); err != nil {
+		return nil, err
+	}
+	pidStr := strconv.FormatUint(uint64(pid), 10)
+	for _, args := range [][]string{
+		{"-t", pidStr, "-n", "ip", "link", "set", containerIf, "name", "eth0"},
+		{"-t", pidStr, "-n", "ip", "addr", "add", containerIP + "/30", "dev", "eth0"},
+		{"-t", pidStr, "-n", "ip", "link", "set", "eth0", "up"},
+		{"-t", pidStr, "-n", "ip", "route", "add", hostIP + "/32", "dev", "eth0"},
+	} {
+		if err := run("nsenter", args...); err != nil {
+			return nil, err
+		}
+	}
+
+	proxy, err := newBrokerProxy(hosts)
+	if err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(hostIP, "0"))
+	if err != nil {
+		return nil, fmt.Errorf("containerd sandbox: start broker proxy: %w", err)
+	}
+	proxy.serve(ln)
+	b.proxy = proxy
+	b.port = ln.Addr().(*net.TCPAddr).Port
+
+	for _, args := range [][]string{
+		{"-w", "-N", chain},
+		{"-w", "-A", chain, "-p", "tcp", "--dport", strconv.Itoa(b.port), "-j", "ACCEPT"},
+		{"-w", "-A", chain, "-j", "DROP"},
+		{"-w", "-I", "INPUT", "-i", hostIf, "-j", chain},
+	} {
+		if err := run("iptables", args...); err != nil {
+			return nil, err
+		}
+	}
+	cleanup = false
+	return b, nil
+}
+
+func (b *brokerNet) close(ctx context.Context) {
+	if b == nil {
+		return
+	}
+	run := func(name string, args ...string) {
+		_ = exec.CommandContext(ctx, name, args...).Run()
+	}
+	if b.chain != "" {
+		run("iptables", "-w", "-D", "INPUT", "-i", b.hostIf, "-j", b.chain)
+		run("iptables", "-w", "-F", b.chain)
+		run("iptables", "-w", "-X", b.chain)
+	}
+	if b.hostIf != "" {
+		run("ip", "link", "del", b.hostIf)
+	}
+	if b.proxy != nil {
+		b.proxy.close()
+	}
+}
+
+func mergeBrokerEnv(env map[string]string, broker map[string]string) map[string]string {
+	out := make(map[string]string, len(env)+len(broker))
+	for key, value := range env {
+		out[key] = value
+	}
+	for key, value := range broker {
+		out[key] = value
+	}
+	return out
+}
