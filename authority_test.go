@@ -14,6 +14,7 @@ func TestValidateWritableRoots(t *testing.T) {
 		name    string
 		workdir string
 		roots   []string
+		mask    bool
 		wantErr bool
 	}{
 		{name: "none", workdir: "/workspace"},
@@ -23,10 +24,12 @@ func TestValidateWritableRoots(t *testing.T) {
 		{name: "relative", workdir: "/workspace", roots: []string{"src"}, wantErr: true},
 		{name: "outside", workdir: "/workspace", roots: []string{"/etc"}, wantErr: true},
 		{name: "escape", workdir: "/workspace", roots: []string{"/workspace/../etc"}, wantErr: true},
+		{name: "mask-only absolute workdir", workdir: "/workspace", mask: true},
+		{name: "mask-only relative workdir", workdir: "workspace", mask: true, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := (Config{Workdir: tt.workdir, WritableRoots: tt.roots}).validateWritableRoots()
+			err := (Config{Workdir: tt.workdir, WritableRoots: tt.roots, MaskWorkspace: tt.mask}).validateWritableRoots()
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("validateWritableRoots() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -67,17 +70,49 @@ func TestWritableRootsScriptShapesWorkspaceThenGrants(t *testing.T) {
 	}
 }
 
-func TestShapedInitArgsWrapsOnlyWhenRootsExist(t *testing.T) {
+func TestWritableRootsScriptMasksReadOnlyWorkspace(t *testing.T) {
+	script := writableRootsScript("/workspace", nil)
+	if !strings.Contains(script, "mount -o remount,bind,ro '/workspace'") {
+		t.Fatalf("read-only mask missing from script:\n%s", script)
+	}
+	if strings.Contains(script, "mount -o remount,bind,rw") {
+		t.Fatalf("a mask with no grants must not remount anything writable:\n%s", script)
+	}
+}
+
+func TestShapedInitArgsWrapsWhenShapingIsEnabled(t *testing.T) {
 	base := []string{"/bin/sh", "-c", "sleep infinity"}
-	if got := shapedInitArgs("/workspace", nil, base); strings.Join(got, "\x00") != strings.Join(base, "\x00") {
+	if got := shapedInitArgs("/workspace", nil, false, base); strings.Join(got, "\x00") != strings.Join(base, "\x00") {
 		t.Errorf("unshaped init = %v, want %v", got, base)
 	}
-	got := shapedInitArgs("/workspace", []string{"/workspace/src"}, base)
-	if len(got) < len(base)+4 || got[0] != "/bin/sh" || got[1] != "-c" || got[3] != "croft-init" {
-		t.Fatalf("shaped init = %v, want a shell wrapper", got)
+	for name, args := range map[string]struct {
+		roots []string
+		mask  bool
+	}{
+		"with a writable grant": {roots: []string{"/workspace/src"}},
+		"read-only workspace":   {mask: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := shapedInitArgs("/workspace", args.roots, args.mask, base)
+			if len(got) < len(base)+4 || got[0] != "/bin/sh" || got[1] != "-c" || got[3] != "croft-init" {
+				t.Fatalf("shaped init = %v, want a shell wrapper", got)
+			}
+			if strings.Join(got[4:], "\x00") != strings.Join(base, "\x00") {
+				t.Errorf("shaped init lost the configured command: %v", got)
+			}
+		})
 	}
-	if strings.Join(got[4:], "\x00") != strings.Join(base, "\x00") {
-		t.Errorf("shaped init lost the configured command: %v", got)
+}
+
+func TestShapingEnabledIncludesReadOnlyMask(t *testing.T) {
+	if (Config{}).shapingEnabled() {
+		t.Fatal("an empty config must keep the historical unshaped posture")
+	}
+	if !(Config{MaskWorkspace: true}).shapingEnabled() {
+		t.Fatal("MaskWorkspace alone must enable shaping")
+	}
+	if !(Config{WritableRoots: []string{"/workspace/src"}}).shapingEnabled() {
+		t.Fatal("a writable grant must enable shaping")
 	}
 }
 

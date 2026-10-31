@@ -182,7 +182,8 @@ type Config struct {
 	// workspace root is masked read-only. They mirror
 	// confinement.ConfinementSpec.WritableRoots: absolute paths under
 	// Workdir, interpreted with deepest-mount-wins semantics. Empty means
-	// the whole workspace keeps its historical writable posture.
+	// the whole workspace keeps its historical writable posture unless
+	// MaskWorkspace is set.
 	//
 	// Shaping happens inside the container's mount namespace before the
 	// configured InitArgs run. It keeps the single overlay layer intact, so
@@ -191,6 +192,13 @@ type Config struct {
 	// otherwise the launch refuses rather than leaving the shaping init
 	// privileged or the probe unverifiable.
 	WritableRoots []string
+	// MaskWorkspace makes the workspace root read-only even when no
+	// WritableRoots are granted. It distinguishes an all-read-only grant
+	// declaration from the historical unshaped posture, where empty
+	// WritableRoots means the whole workspace stays writable. It has no
+	// additional effect when WritableRoots is non-empty: shaping is already
+	// enabled.
+	MaskWorkspace bool
 
 	// Secrets are host files bind-mounted read-only into the container.
 	// The container reads a normal file; the content never appears in
@@ -288,10 +296,13 @@ func (c Config) validateBrokerHosts() error {
 // workspace fails at startup instead of shaping a mount the caller did not
 // intend.
 func (c Config) validateWritableRoots() error {
-	if len(c.WritableRoots) == 0 {
+	if !c.shapingEnabled() {
 		return nil
 	}
 	workdir := path.Clean(c.workdir())
+	if !path.IsAbs(workdir) {
+		return fmt.Errorf("containerd sandbox: Config.Workdir %q must be absolute when workspace shaping is enabled", c.Workdir)
+	}
 	for i, root := range c.WritableRoots {
 		if !path.IsAbs(root) {
 			return fmt.Errorf("containerd sandbox: Config.WritableRoots[%d] %q is not absolute: use a container path under %s", i, root, workdir)

@@ -44,8 +44,8 @@ func withWritableRootsCapability() oci.SpecOpts {
 // The wrapper runs before the user's init, so every generation (Create, Apply,
 // and a recovery restart) gets the same shaped workspace. The original init
 // command is exec'd after the mounts land.
-func shapedInitArgs(workdir string, roots []string, init []string) []string {
-	if len(roots) == 0 {
+func shapedInitArgs(workdir string, roots []string, mask bool, init []string) []string {
+	if len(roots) == 0 && !mask {
 		return init
 	}
 	script := writableRootsScript(workdir, roots)
@@ -93,6 +93,12 @@ echo 'croft: setpriv is required to drop CAP_SYS_ADMIN after writable-root shapi
 exit 127
 `)
 	return b.String()
+}
+
+// shapingEnabled reports whether this config asks for a shaped workspace view.
+// MaskWorkspace alone is a valid shape: a read-only workspace with no grants.
+func (c Config) shapingEnabled() bool {
+	return c.MaskWorkspace || len(c.WritableRoots) > 0
 }
 
 // normalizeRoots sorts by path depth (shallow first, so deeper mounts land
@@ -144,7 +150,7 @@ func (s *ContainerdSandbox) startTaskAndProbe(ctx context.Context, id, snapshotK
 // probe the model can observe.
 func (s *ContainerdSandbox) probeWritableRoots(ctx context.Context, id string) error {
 	roots := normalizeRoots(s.cfg.WritableRoots)
-	if len(roots) == 0 {
+	if !s.cfg.shapingEnabled() {
 		return nil
 	}
 	workdir := path.Clean(s.cfg.workdir())

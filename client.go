@@ -469,7 +469,7 @@ func generationID(sandboxID, snapshotKey string) string {
 
 // initArgs is the long-lived process a container runs so it stays up between
 // commands; Exec provides the actual work.
-func (t *containerdTasks) shapingEnabled() bool { return len(t.cfg.WritableRoots) > 0 }
+func (t *containerdTasks) shapingEnabled() bool { return t.cfg.shapingEnabled() }
 
 func (t *containerdTasks) initArgs(shaped bool) []string {
 	init := t.cfg.InitArgs
@@ -479,7 +479,7 @@ func (t *containerdTasks) initArgs(shaped bool) []string {
 	if !shaped {
 		return init
 	}
-	return shapedInitArgs(t.cfg.workdir(), t.cfg.WritableRoots, init)
+	return shapedInitArgs(t.cfg.workdir(), t.cfg.WritableRoots, t.cfg.MaskWorkspace, init)
 }
 
 // initSpecOpts derives the init process's spec settings from the image config
