@@ -276,7 +276,7 @@ func (c Config) validateBrokerHosts() error {
 	}
 	for i, host := range c.BrokerHosts {
 		host = strings.TrimSpace(host)
-		if host == "" || strings.ContainsAny(host, " \t/") {
+		if host == "" || strings.ContainsAny(host, " \t/:") {
 			return fmt.Errorf("containerd sandbox: Config.BrokerHosts[%d] %q is not an exact host name", i, host)
 		}
 	}

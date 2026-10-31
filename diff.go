@@ -506,6 +506,9 @@ func (s *ContainerdSandbox) withReaderTask(ctx context.Context, ws WorkspaceStat
 	if err := s.cfg.validateNetwork(); err != nil {
 		return err
 	}
+	if err := s.cfg.validateBrokerHosts(); err != nil {
+		return err
+	}
 	if err := s.cfg.validateSecrets(); err != nil {
 		return err
 	}

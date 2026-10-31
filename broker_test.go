@@ -2,6 +2,7 @@ package croft
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +14,11 @@ func TestBrokerProxyAllowsExactHostAndRejectsOthers(t *testing.T) {
 		_, _ = io.WriteString(w, "allowed")
 	}))
 	defer upstream.Close()
-	host := strings.TrimPrefix(upstream.URL, "http://")
+	hostPort := strings.TrimPrefix(upstream.URL, "http://")
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		t.Fatalf("split upstream host: %v", err)
+	}
 	proxy, err := newBrokerProxy([]string{host})
 	if err != nil {
 		t.Fatalf("newBrokerProxy: %v", err)
@@ -56,6 +61,9 @@ func TestValidateBrokerHosts(t *testing.T) {
 	}
 	if err := (Config{Network: "broker", BrokerHosts: []string{"bad host"}}).validateBrokerHosts(); err == nil {
 		t.Error("a host containing whitespace must fail")
+	}
+	if err := (Config{Network: "broker", BrokerHosts: []string{"api.example.com:443"}}).validateBrokerHosts(); err == nil {
+		t.Error("a host:port entry must fail; the allowlist is host names, not host/port pairs")
 	}
 }
 

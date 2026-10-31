@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -23,12 +22,12 @@ type brokerHosts map[string]bool
 func newBrokerHosts(hosts []string) brokerHosts {
 	out := make(brokerHosts, len(hosts))
 	for _, host := range hosts {
-		out[brokerHostName(host)] = true
+		out[strings.ToLower(strings.TrimSpace(host))] = true
 	}
 	return out
 }
 
-func brokerHostName(hostPort string) string {
+func brokerTargetHost(hostPort string) string {
 	host := strings.TrimSpace(hostPort)
 	if parsed, _, err := net.SplitHostPort(host); err == nil {
 		host = parsed
@@ -37,7 +36,7 @@ func brokerHostName(hostPort string) string {
 }
 
 func (h brokerHosts) allows(hostPort string) bool {
-	return h[brokerHostName(hostPort)]
+	return h[brokerTargetHost(hostPort)]
 }
 
 // brokerProxy is the host-side HTTP/CONNECT allowlist proxy. It listens on the
@@ -114,13 +113,31 @@ func (p *brokerProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if out.URL.Host == "" {
 		out.URL.Host = r.Host
 	}
+	out.Header.Del("Connection")
+	out.Header.Del("Proxy-Connection")
+	out.Header.Del("Keep-Alive")
+	out.Header.Del("Proxy-Authenticate")
+	out.Header.Del("Proxy-Authorization")
+	out.Header.Del("Te")
+	out.Header.Del("Trailer")
+	out.Header.Del("Transfer-Encoding")
+	out.Header.Del("Upgrade")
 	resp, err := p.client.Do(out)
 	if err != nil {
 		http.Error(w, "broker: upstream request failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	for _, value := range resp.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			w.Header().Del(strings.TrimSpace(token))
+		}
+	}
 	for key, values := range resp.Header {
+		switch strings.ToLower(key) {
+		case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
@@ -159,13 +176,20 @@ func (p *brokerProxy) connect(w http.ResponseWriter, r *http.Request) {
 	_ = client.Close()
 }
 
+type brokerState struct {
+	id  string
+	net *brokerNet
+}
+
 // brokerNet is the per-generation veth + proxy + firewall setup.
 type brokerNet struct {
-	hostIf string
-	chain  string
-	hostIP string
-	port   int
-	proxy  *brokerProxy
+	hostIf    string
+	chain     string
+	hostIP    string
+	port      int
+	addrIndex uint32
+	proxy     *brokerProxy
+	closeOnce sync.Once
 }
 
 func (b *brokerNet) env() map[string]string {
@@ -177,16 +201,34 @@ func (b *brokerNet) env() map[string]string {
 	}
 }
 
-var brokerSeq atomic.Uint32
+var brokerAddrs = struct {
+	mu   sync.Mutex
+	next uint32
+	free []uint32
+}{}
 
-func nextBrokerAddr() (host, container string, err error) {
-	n := brokerSeq.Add(1) - 1
-	if n >= 256*64 {
-		return "", "", errors.New("containerd sandbox: broker address space exhausted")
+func allocBrokerAddr() (host, container string, index uint32, err error) {
+	brokerAddrs.mu.Lock()
+	defer brokerAddrs.mu.Unlock()
+	if n := len(brokerAddrs.free); n > 0 {
+		index = brokerAddrs.free[n-1]
+		brokerAddrs.free = brokerAddrs.free[:n-1]
+	} else {
+		index = brokerAddrs.next
+		if index >= 256*64 {
+			return "", "", 0, errors.New("containerd sandbox: broker address space exhausted")
+		}
+		brokerAddrs.next++
 	}
-	hi := n / 64
-	lo := (n%64)*4 + 1
-	return fmt.Sprintf("10.42.%d.%d", hi, lo), fmt.Sprintf("10.42.%d.%d", hi, lo+1), nil
+	hi := index / 64
+	lo := (index%64)*4 + 1
+	return fmt.Sprintf("10.42.%d.%d", hi, lo), fmt.Sprintf("10.42.%d.%d", hi, lo+1), index, nil
+}
+
+func releaseBrokerAddr(index uint32) {
+	brokerAddrs.mu.Lock()
+	brokerAddrs.free = append(brokerAddrs.free, index)
+	brokerAddrs.mu.Unlock()
 }
 
 func brokerIfNames(id, snapshotKey string) (host, container string) {
@@ -207,13 +249,13 @@ func setupBrokerNet(ctx context.Context, id, snapshotKey string, pid uint32, hos
 			return nil, fmt.Errorf("containerd sandbox: broker network requires %s: %w", tool, err)
 		}
 	}
-	hostIP, containerIP, err := nextBrokerAddr()
+	hostIP, containerIP, addrIndex, err := allocBrokerAddr()
 	if err != nil {
 		return nil, err
 	}
 	hostIf, containerIf := brokerIfNames(id, snapshotKey)
 	chain := "CROFT-" + strings.TrimPrefix(hostIf, "crh")
-	b := &brokerNet{hostIf: hostIf, chain: chain, hostIP: hostIP}
+	b := &brokerNet{hostIf: hostIf, chain: chain, hostIP: hostIP, addrIndex: addrIndex}
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -282,6 +324,10 @@ func (b *brokerNet) close(ctx context.Context) {
 	if b == nil {
 		return
 	}
+	b.closeOnce.Do(func() { b.closeOnceFn(ctx) })
+}
+
+func (b *brokerNet) closeOnceFn(ctx context.Context) {
 	run := func(name string, args ...string) {
 		_ = exec.CommandContext(ctx, name, args...).Run()
 	}
@@ -296,6 +342,7 @@ func (b *brokerNet) close(ctx context.Context) {
 	if b.proxy != nil {
 		b.proxy.close()
 	}
+	releaseBrokerAddr(b.addrIndex)
 }
 
 func mergeBrokerEnv(env map[string]string, broker map[string]string) map[string]string {

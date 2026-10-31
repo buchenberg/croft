@@ -449,8 +449,10 @@ type containerdTasks struct {
 	cfg     Config
 	images  *containerdImages
 	// broker is the active generation's host proxy and veth setup. Nil for
-	// every non-broker posture and for reader tasks.
-	broker atomic.Pointer[brokerNet]
+	// every non-broker posture and for reader tasks. The state carries the
+	// owning task id so stopping a reader cannot tear down the main task's
+	// network.
+	broker atomic.Pointer[brokerState]
 }
 
 func (t *containerdTasks) ctx(ctx context.Context) context.Context {
@@ -795,7 +797,7 @@ func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string,
 	}
 	if broker {
 		if old := t.broker.Swap(nil); old != nil {
-			old.close(context.WithoutCancel(ctx))
+			old.net.close(context.WithoutCancel(ctx))
 		}
 		bn, berr := setupBrokerNet(ctx, id, snapshotKey, task.Pid(), t.cfg.BrokerHosts)
 		if berr != nil {
@@ -804,7 +806,7 @@ func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string,
 			_ = ctr.Delete(ctx)
 			return fmt.Errorf("containerd sandbox: start broker for %s: %w", containerID, berr)
 		}
-		t.broker.Store(bn)
+		t.broker.Store(&brokerState{id: id, net: bn})
 	}
 	return nil
 }
@@ -817,8 +819,10 @@ func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string,
 // politely stopped.
 func (t *containerdTasks) StopTask(ctx context.Context, id string) error {
 	ctx = t.ctx(ctx)
-	if old := t.broker.Swap(nil); old != nil {
-		old.close(context.WithoutCancel(ctx))
+	if old := t.broker.Load(); old != nil && old.id == id {
+		if t.broker.CompareAndSwap(old, nil) {
+			old.net.close(context.WithoutCancel(ctx))
+		}
 	}
 
 	ctrs, err := t.sandboxContainers(ctx, id)
@@ -876,7 +880,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 		return ExecResult{}, err
 	}
 	if broker := t.broker.Load(); broker != nil {
-		req.Env = mergeBrokerEnv(req.Env, broker.env())
+		req.Env = mergeBrokerEnv(req.Env, broker.net.env())
 		if _, ok := req.Env["PATH"]; !ok {
 			req.Env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		}
