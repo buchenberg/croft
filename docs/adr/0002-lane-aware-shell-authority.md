@@ -1,7 +1,7 @@
 # ADR 0002 — Lane-aware shell authority for sub-agents
 
 - **Status:** Proposed — pending acceptance (implementation + tests)
-- **Tracking:** croft-ubz
+- **Tracking:** croft-9yd
 - **Date:** 2026-10-31
 - **Decides:** the `destructive_guard` shell denial in yaah sub-agent scopes
   (follow-on to croft-ku0 / ADR 0001)
@@ -79,7 +79,8 @@ Two gaps mean the container lane is not yet a blanket licence for a shell:
 
 1. **No seccomp profile and no `NoNewPrivileges`.** croft's spec is containerd's
    default plus `WithEnv`, `WithDefaultPathEnv`, `WithProcessCwd`, user, mounts
-   and limits (`client.go:509-570`); it adds neither. Whatever the base spec
+   and limits, and the secrets/staging mounts (`client.go:509-610`, the whole
+   of `initSpecOpts`); it adds neither. Whatever the base spec
    provides is the whole syscall story.
 2. **Nothing forces limits or egress discipline on a dispatch.** `Config.Limits`
    supports CPU, memory and **pids** (`withLinuxResources`, `client.go:623`),
@@ -125,9 +126,9 @@ alone.** Keep the guard; give it the world.
    and deliver a false negative on the path that matters. The lane is the
    soundly-checkable property; the command line is not.
 7. **Config surface, default off.** A single explicit key under the existing
-   rule block (shape: `agents.default.supervisor.rules.destructive_guard.
-   container_shell: deny | allow`, defaulting to `deny`), consistent with the
-   supervisor surface's existing "config default off, runtime opt-in" pattern.
+   rule block — `agents.default.supervisor.rules.destructive_guard.container_shell`
+   with values `deny` (default) or `allow` — consistent with the supervisor
+   surface's existing "config default off, runtime opt-in" pattern.
    The existing `...destructive_guard.enabled` switch remains the global stop.
    No per-role dimension in this ADR — role-specific authority already has a
    vocabulary (grants) and should not grow a second one for shells.
