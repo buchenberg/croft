@@ -82,13 +82,10 @@ func writableRootsScript(workdir string, roots []string) string {
 	// handing control to InitArgs: the shell's child must not be able to
 	// remount the read-only mask. Require a real capability-dropping utility
 	// rather than silently leaving the init privileged.
-	b.WriteString(`if command -v capsh >/dev/null 2>&1; then
-  exec capsh --drop=cap_sys_admin --inh= --noamb -- -c 'exec "$@"' croft-init "$@"
-fi
-if command -v setpriv >/dev/null 2>&1; then
+	b.WriteString(`if command -v setpriv >/dev/null 2>&1; then
   exec setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin --ambient-caps=-sys_admin --no-new-privs -- "$@"
 fi
-echo 'croft: capsh or setpriv is required to drop CAP_SYS_ADMIN after writable-root shaping' >&2
+echo 'croft: setpriv is required to drop CAP_SYS_ADMIN after writable-root shaping' >&2
 exit 127
 `)
 	return b.String()
