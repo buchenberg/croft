@@ -83,8 +83,8 @@ func writableRootsScript(workdir string, roots []string) string {
 	// remount the read-only mask. Require a real capability-dropping utility
 	// rather than silently leaving the init privileged.
 	b.WriteString(`if command -v setpriv >/dev/null 2>&1; then
-  setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin --ambient-caps=-sys_admin --no-new-privs -- true 2>/dev/null || {
-    echo 'croft: setpriv lacks capability-prefix support; util-linux 2.32+ is required for writable-root shaping' >&2
+  setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin --ambient-caps=-sys_admin --no-new-privs -- true || {
+    echo 'croft: setpriv capability preflight failed; writable-root shaping needs capability drops the image runtime permits' >&2
     exit 127
   }
   exec setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin --ambient-caps=-sys_admin --no-new-privs -- "$@"
