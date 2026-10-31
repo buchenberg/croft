@@ -465,10 +465,11 @@ func generationID(sandboxID, snapshotKey string) string {
 // initArgs is the long-lived process a container runs so it stays up between
 // commands; Exec provides the actual work.
 func (t *containerdTasks) initArgs() []string {
-	if len(t.cfg.InitArgs) > 0 {
-		return t.cfg.InitArgs
+	init := t.cfg.InitArgs
+	if len(init) == 0 {
+		init = []string{"/bin/sh", "-c", "sleep infinity"}
 	}
-	return []string{"/bin/sh", "-c", "sleep infinity"}
+	return shapedInitArgs(t.cfg.workdir(), t.cfg.WritableRoots, init)
 }
 
 // initSpecOpts derives the init process's spec settings from the image config
@@ -554,6 +555,12 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
 			Type: specs.NetworkNamespace,
 		}))
+	}
+	if len(t.cfg.WritableRoots) > 0 {
+		// The init wrapper performs the bind/remount shaping. User execs
+		// receive croftExecCapabilities (no CAP_SYS_ADMIN), so the masks
+		// cannot be remounted from the model's processes.
+		opts = append(opts, withWritableRootsCapability())
 	}
 	// Config.Secrets and Config.StagingDir: accumulate all bind mounts into a
 	// single oci.SpecOpts that appends to the spec's existing mounts.
@@ -858,9 +865,10 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	stdout := &cappedBuffer{limit: limit}
 	stderr := &cappedBuffer{limit: limit}
 	spec := &specs.Process{
-		Args: append([]string{req.Command}, req.Args...),
-		Cwd:  req.Cwd,
-		Env:  envSlice(req.Env),
+		Args:         append([]string{req.Command}, req.Args...),
+		Cwd:          req.Cwd,
+		Env:          envSlice(req.Env),
+		Capabilities: execCapabilities(),
 	}
 	if len(spec.Env) == 0 {
 		spec.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
