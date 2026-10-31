@@ -83,7 +83,7 @@ func writableRootsScript(workdir string, roots []string) string {
 	// remount the read-only mask. Require a real capability-dropping utility
 	// rather than silently leaving the init privileged.
 	b.WriteString(`if command -v capsh >/dev/null 2>&1; then
-  exec capsh --drop=cap_sys_admin -- -c 'exec "$@"' croft-init "$@"
+  exec capsh --drop=cap_sys_admin --inh=^cap_sys_admin --noamb -- -c 'exec "$@"' croft-init "$@"
 fi
 if command -v setpriv >/dev/null 2>&1; then
   exec setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin --ambient-caps=-sys_admin --no-new-privs -- "$@"

@@ -55,6 +55,7 @@ func TestWritableRootsScriptShapesWorkspaceThenGrants(t *testing.T) {
 		"mount -o remount,bind,ro '/workspace'",
 		"mount --bind '/workspace/src' '/workspace/src'",
 		"mount -o remount,bind,rw '/workspace/src'",
+		"capsh --drop=cap_sys_admin",
 		`exec "$@"`,
 	} {
 		if !strings.Contains(script, want) {
