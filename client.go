@@ -879,7 +879,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	if err != nil {
 		return ExecResult{}, err
 	}
-	if broker := t.broker.Load(); broker != nil {
+	if broker := t.broker.Load(); broker != nil && broker.id == id {
 		req.Env = mergeBrokerEnv(req.Env, broker.net.env())
 		if _, ok := req.Env["PATH"]; !ok {
 			req.Env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

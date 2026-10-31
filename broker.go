@@ -128,14 +128,18 @@ func (p *brokerProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	hop := map[string]bool{
+		"connection": true, "proxy-connection": true, "keep-alive": true,
+		"proxy-authenticate": true, "proxy-authorization": true,
+		"te": true, "trailer": true, "transfer-encoding": true, "upgrade": true,
+	}
 	for _, value := range resp.Header.Values("Connection") {
 		for _, token := range strings.Split(value, ",") {
-			w.Header().Del(strings.TrimSpace(token))
+			hop[strings.ToLower(strings.TrimSpace(token))] = true
 		}
 	}
 	for key, values := range resp.Header {
-		switch strings.ToLower(key) {
-		case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		if hop[strings.ToLower(key)] {
 			continue
 		}
 		for _, value := range values {
@@ -183,13 +187,16 @@ type brokerState struct {
 
 // brokerNet is the per-generation veth + proxy + firewall setup.
 type brokerNet struct {
-	hostIf    string
-	chain     string
-	hostIP    string
-	port      int
-	addrIndex uint32
-	proxy     *brokerProxy
-	closeOnce sync.Once
+	hostIf        string
+	chain         string
+	hostIP        string
+	port          int
+	addrIndex     uint32
+	proxy         *brokerProxy
+	linkCreated   bool
+	chainCreated  bool
+	ruleInstalled bool
+	closeOnce     sync.Once
 }
 
 func (b *brokerNet) env() map[string]string {
@@ -273,6 +280,7 @@ func setupBrokerNet(ctx context.Context, id, snapshotKey string, pid uint32, hos
 	if err := run("ip", "link", "add", hostIf, "type", "veth", "peer", "name", containerIf); err != nil {
 		return nil, err
 	}
+	b.linkCreated = true
 	if err := run("ip", "addr", "add", hostIP+"/30", "dev", hostIf); err != nil {
 		return nil, err
 	}
@@ -306,16 +314,20 @@ func setupBrokerNet(ctx context.Context, id, snapshotKey string, pid uint32, hos
 	b.proxy = proxy
 	b.port = ln.Addr().(*net.TCPAddr).Port
 
-	for _, args := range [][]string{
-		{"-w", "-N", chain},
-		{"-w", "-A", chain, "-p", "tcp", "--dport", strconv.Itoa(b.port), "-j", "ACCEPT"},
-		{"-w", "-A", chain, "-j", "DROP"},
-		{"-w", "-I", "INPUT", "-i", hostIf, "-j", chain},
-	} {
-		if err := run("iptables", args...); err != nil {
-			return nil, err
-		}
+	if err := run("iptables", "-w", "-N", chain); err != nil {
+		return nil, err
 	}
+	b.chainCreated = true
+	if err := run("iptables", "-w", "-A", chain, "-p", "tcp", "--dport", strconv.Itoa(b.port), "-j", "ACCEPT"); err != nil {
+		return nil, err
+	}
+	if err := run("iptables", "-w", "-A", chain, "-j", "DROP"); err != nil {
+		return nil, err
+	}
+	if err := run("iptables", "-w", "-I", "INPUT", "-i", hostIf, "-j", chain); err != nil {
+		return nil, err
+	}
+	b.ruleInstalled = true
 	cleanup = false
 	return b, nil
 }
@@ -328,21 +340,31 @@ func (b *brokerNet) close(ctx context.Context) {
 }
 
 func (b *brokerNet) closeOnceFn(ctx context.Context) {
+	clean := true
 	run := func(name string, args ...string) {
-		_ = exec.CommandContext(ctx, name, args...).Run()
+		if err := exec.CommandContext(ctx, name, args...).Run(); err != nil {
+			clean = false
+		}
 	}
-	if b.chain != "" {
+	if b.ruleInstalled {
 		run("iptables", "-w", "-D", "INPUT", "-i", b.hostIf, "-j", b.chain)
+	}
+	if b.chainCreated {
 		run("iptables", "-w", "-F", b.chain)
 		run("iptables", "-w", "-X", b.chain)
 	}
-	if b.hostIf != "" {
+	if b.linkCreated {
 		run("ip", "link", "del", b.hostIf)
 	}
 	if b.proxy != nil {
 		b.proxy.close()
 	}
-	releaseBrokerAddr(b.addrIndex)
+	// If the host state could not be removed, keep the address reserved:
+	// reusing it for a new veth while the old chain/link survives would be a
+	// routing or firewall collision. A leak is the safer failure.
+	if clean {
+		releaseBrokerAddr(b.addrIndex)
+	}
 }
 
 func mergeBrokerEnv(env map[string]string, broker map[string]string) map[string]string {
