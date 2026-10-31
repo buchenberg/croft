@@ -14,6 +14,7 @@ func TestValidateWritableRoots(t *testing.T) {
 		name    string
 		workdir string
 		roots   []string
+		mask    bool
 		wantErr bool
 	}{
 		{name: "none", workdir: "/workspace"},
@@ -23,10 +24,12 @@ func TestValidateWritableRoots(t *testing.T) {
 		{name: "relative", workdir: "/workspace", roots: []string{"src"}, wantErr: true},
 		{name: "outside", workdir: "/workspace", roots: []string{"/etc"}, wantErr: true},
 		{name: "escape", workdir: "/workspace", roots: []string{"/workspace/../etc"}, wantErr: true},
+		{name: "mask-only absolute workdir", workdir: "/workspace", mask: true},
+		{name: "mask-only relative workdir", workdir: "workspace", mask: true, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := (Config{Workdir: tt.workdir, WritableRoots: tt.roots}).validateWritableRoots()
+			err := (Config{Workdir: tt.workdir, WritableRoots: tt.roots, MaskWorkspace: tt.mask}).validateWritableRoots()
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("validateWritableRoots() error = %v, wantErr %v", err, tt.wantErr)
 			}

@@ -150,7 +150,7 @@ func (s *ContainerdSandbox) startTaskAndProbe(ctx context.Context, id, snapshotK
 // probe the model can observe.
 func (s *ContainerdSandbox) probeWritableRoots(ctx context.Context, id string) error {
 	roots := normalizeRoots(s.cfg.WritableRoots)
-	if len(roots) == 0 && !s.cfg.MaskWorkspace {
+	if !s.cfg.shapingEnabled() {
 		return nil
 	}
 	workdir := path.Clean(s.cfg.workdir())

@@ -296,10 +296,13 @@ func (c Config) validateBrokerHosts() error {
 // workspace fails at startup instead of shaping a mount the caller did not
 // intend.
 func (c Config) validateWritableRoots() error {
-	if len(c.WritableRoots) == 0 {
+	if !c.shapingEnabled() {
 		return nil
 	}
 	workdir := path.Clean(c.workdir())
+	if !path.IsAbs(workdir) {
+		return fmt.Errorf("containerd sandbox: Config.Workdir %q must be absolute when workspace shaping is enabled", c.Workdir)
+	}
 	for i, root := range c.WritableRoots {
 		if !path.IsAbs(root) {
 			return fmt.Errorf("containerd sandbox: Config.WritableRoots[%d] %q is not absolute: use a container path under %s", i, root, workdir)
