@@ -79,7 +79,7 @@ func generateInitSpecWithConfig(t *testing.T, scfg Config, cfg v1.ImageConfig) (
 	if err != nil {
 		return nil, err
 	}
-	opts = append(opts, oci.WithProcessArgs(tasks.initArgs()...))
+	opts = append(opts, oci.WithProcessArgs(tasks.initArgs(tasks.shapingEnabled())...))
 	return oci.GenerateSpec(ctx, nil, &containers.Container{}, opts...)
 }
 

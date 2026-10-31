@@ -464,11 +464,17 @@ func generationID(sandboxID, snapshotKey string) string {
 
 // initArgs is the long-lived process a container runs so it stays up between
 // commands; Exec provides the actual work.
-func (t *containerdTasks) initArgs() []string {
-	if len(t.cfg.InitArgs) > 0 {
-		return t.cfg.InitArgs
+func (t *containerdTasks) shapingEnabled() bool { return len(t.cfg.WritableRoots) > 0 }
+
+func (t *containerdTasks) initArgs(shaped bool) []string {
+	init := t.cfg.InitArgs
+	if len(init) == 0 {
+		init = []string{"/bin/sh", "-c", "sleep infinity"}
 	}
-	return []string{"/bin/sh", "-c", "sleep infinity"}
+	if !shaped {
+		return init
+	}
+	return shapedInitArgs(t.cfg.workdir(), t.cfg.WritableRoots, init)
 }
 
 // initSpecOpts derives the init process's spec settings from the image config
@@ -718,17 +724,18 @@ func withNumericUser(user string) oci.SpecOpts {
 
 // StartTask creates and starts a container generation rooted at snapshotKey.
 func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string) error {
-	return t.startTask(ctx, id, snapshotKey, t.initArgs())
+	shaped := t.shapingEnabled()
+	return t.startTask(ctx, id, snapshotKey, t.initArgs(shaped), shaped)
 }
 
 // StartReaderTask starts a reader task with the inert sleep init, never the
 // configured InitArgs — an initializer must not run on (and possibly rewrite)
 // a snapshot whose whole purpose is to serve pre-images.
 func (t *containerdTasks) StartReaderTask(ctx context.Context, id, snapshotKey string) error {
-	return t.startTask(ctx, id, snapshotKey, []string{"/bin/sh", "-c", "sleep infinity"})
+	return t.startTask(ctx, id, snapshotKey, []string{"/bin/sh", "-c", "sleep infinity"}, false)
 }
 
-func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string, initArgs []string) error {
+func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string, initArgs []string, shaped bool) error {
 	ctx = t.ctx(ctx)
 
 	img, err := t.images.image(ctx, t.cfg.Image)
@@ -741,6 +748,11 @@ func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string,
 		return err
 	}
 	specOpts = append(specOpts, oci.WithProcessArgs(initArgs...))
+	if shaped {
+		// Only the shaping init gets CAP_SYS_ADMIN. Reader tasks never run the
+		// wrapper, and user execs set croftExecCapabilities explicitly.
+		specOpts = append(specOpts, withWritableRootsCapability())
+	}
 
 	containerID := generationID(id, snapshotKey)
 	opts := []containerd.NewContainerOpts{
@@ -858,9 +870,10 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	stdout := &cappedBuffer{limit: limit}
 	stderr := &cappedBuffer{limit: limit}
 	spec := &specs.Process{
-		Args: append([]string{req.Command}, req.Args...),
-		Cwd:  req.Cwd,
-		Env:  envSlice(req.Env),
+		Args:         append([]string{req.Command}, req.Args...),
+		Cwd:          req.Cwd,
+		Env:          envSlice(req.Env),
+		Capabilities: execCapabilities(),
 	}
 	if len(spec.Env) == 0 {
 		spec.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}

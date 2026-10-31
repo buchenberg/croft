@@ -169,6 +169,20 @@ type Config struct {
 	// path (the config-typo convention).
 	Network string
 
+	// WritableRoots are container-path subtrees made writable after the
+	// workspace root is masked read-only. They mirror
+	// confinement.ConfinementSpec.WritableRoots: absolute paths under
+	// Workdir, interpreted with deepest-mount-wins semantics. Empty means
+	// the whole workspace keeps its historical writable posture.
+	//
+	// Shaping happens inside the container's mount namespace before the
+	// configured InitArgs run. It keeps the single overlay layer intact, so
+	// Capture and Compare see the same change-set they always did. The image
+	// must provide /bin/sh, mkdir, mount, touch, rm, and setpriv;
+	// otherwise the launch refuses rather than leaving the shaping init
+	// privileged or the probe unverifiable.
+	WritableRoots []string
+
 	// Secrets are host files bind-mounted read-only into the container.
 	// The container reads a normal file; the content never appears in
 	// argv, process environment, or any exec payload. Source must be an
@@ -245,6 +259,27 @@ func (c Config) validateNetwork() error {
 	default:
 		return fmt.Errorf("containerd sandbox: Config.Network %q is not a supported posture: leave it unset (the isolated default), or use \"none\" or \"host\"", c.Network)
 	}
+}
+
+// validateWritableRoots checks the grant-shaped workspace roots. They are
+// container paths under Workdir, so a host path or a path escaping the
+// workspace fails at startup instead of shaping a mount the caller did not
+// intend.
+func (c Config) validateWritableRoots() error {
+	if len(c.WritableRoots) == 0 {
+		return nil
+	}
+	workdir := path.Clean(c.workdir())
+	for i, root := range c.WritableRoots {
+		if !path.IsAbs(root) {
+			return fmt.Errorf("containerd sandbox: Config.WritableRoots[%d] %q is not absolute: use a container path under %s", i, root, workdir)
+		}
+		clean := path.Clean(root)
+		if clean != workdir && !strings.HasPrefix(clean, workdir+"/") {
+			return fmt.Errorf("containerd sandbox: Config.WritableRoots[%d] %q is outside the workspace %s", i, root, workdir)
+		}
+	}
+	return nil
 }
 
 // validateSecrets checks the configured secret mounts for the loud-failure
@@ -586,6 +621,9 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	if err := s.cfg.validateNetwork(); err != nil {
 		return err
 	}
+	if err := s.cfg.validateWritableRoots(); err != nil {
+		return err
+	}
 	if err := s.cfg.validateSecrets(); err != nil {
 		return err
 	}
@@ -617,9 +655,11 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 	// returned mounts are not needed here; Prepare's side effect is the point.
 	_ = mounts
 
-	if err := s.tasks.StartTask(ctx, id, active); err != nil {
-		// Do not leak the snapshot if the task could not start.
-		_ = s.snap.Remove(ctx, active)
+	if err := s.startTaskAndProbe(ctx, id, active); err != nil {
+		// Do not leak the snapshot if the task could not start or its
+		// authority probe failed. The parent context may be the reason the
+		// probe failed, so the cleanup must outlive it.
+		_ = s.snap.Remove(context.WithoutCancel(ctx), active)
 		return fmt.Errorf("containerd sandbox: start task: %w", err)
 	}
 
@@ -642,7 +682,6 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 		_ = s.snap.Remove(context.WithoutCancel(ctx), active)
 		return fmt.Errorf("containerd sandbox: provision workdir %s: %w", wd, err)
 	}
-
 	s.mu.Lock()
 	s.id = id
 	s.rootfsKey = rootfsKey
@@ -911,7 +950,7 @@ func (s *ContainerdSandbox) advance(ctx context.Context, id, committed string, n
 	if _, err := s.snap.Prepare(ctx, next, committed); err != nil {
 		return stopped(fmt.Errorf("containerd sandbox: prepare successor snapshot: %w", err))
 	}
-	if err := s.tasks.StartTask(ctx, id, next); err != nil {
+	if err := s.startTaskAndProbe(ctx, id, next); err != nil {
 		_ = s.snap.Remove(context.WithoutCancel(ctx), next)
 		return stopped(fmt.Errorf("containerd sandbox: restart task after capture: %w", err))
 	}
@@ -945,6 +984,9 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
 	if err := s.cfg.validateNetwork(); err != nil {
+		return err
+	}
+	if err := s.cfg.validateWritableRoots(); err != nil {
 		return err
 	}
 	if err := s.cfg.validateSecrets(); err != nil {
@@ -994,7 +1036,7 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 		return fmt.Errorf("containerd sandbox: prepare snapshot from %s: %w", committed, err)
 	}
 	_ = mounts
-	if err := s.tasks.StartTask(ctx, id, next); err != nil {
+	if err := s.startTaskAndProbe(ctx, id, next); err != nil {
 		// The prepared successor leaks otherwise — Destroy removes only the
 		// current activeKey — so it is removed here, cancel-free. The old
 		// active layer still exists at this point (its removal happens only on
