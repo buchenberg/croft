@@ -448,6 +448,11 @@ type containerdTasks struct {
 	ns      string
 	cfg     Config
 	images  *containerdImages
+	// broker is the active generation's host proxy and veth setup. Nil for
+	// every non-broker posture and for reader tasks. The state carries the
+	// owning task id so stopping a reader cannot tear down the main task's
+	// network.
+	broker atomic.Pointer[brokerState]
 }
 
 func (t *containerdTasks) ctx(ctx context.Context) context.Context {
@@ -725,17 +730,17 @@ func withNumericUser(user string) oci.SpecOpts {
 // StartTask creates and starts a container generation rooted at snapshotKey.
 func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string) error {
 	shaped := t.shapingEnabled()
-	return t.startTask(ctx, id, snapshotKey, t.initArgs(shaped), shaped)
+	return t.startTask(ctx, id, snapshotKey, t.initArgs(shaped), shaped, t.cfg.Network == "broker")
 }
 
 // StartReaderTask starts a reader task with the inert sleep init, never the
 // configured InitArgs — an initializer must not run on (and possibly rewrite)
 // a snapshot whose whole purpose is to serve pre-images.
 func (t *containerdTasks) StartReaderTask(ctx context.Context, id, snapshotKey string) error {
-	return t.startTask(ctx, id, snapshotKey, []string{"/bin/sh", "-c", "sleep infinity"}, false)
+	return t.startTask(ctx, id, snapshotKey, []string{"/bin/sh", "-c", "sleep infinity"}, false, false)
 }
 
-func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string, initArgs []string, shaped bool) error {
+func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string, initArgs []string, shaped, broker bool) error {
 	ctx = t.ctx(ctx)
 
 	img, err := t.images.image(ctx, t.cfg.Image)
@@ -790,6 +795,19 @@ func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string,
 		_ = ctr.Delete(ctx)
 		return fmt.Errorf("containerd sandbox: start task for %s: %w", containerID, err)
 	}
+	if broker {
+		if old := t.broker.Swap(nil); old != nil {
+			old.net.close(context.WithoutCancel(ctx))
+		}
+		bn, berr := setupBrokerNet(ctx, id, snapshotKey, task.Pid(), t.cfg.BrokerHosts)
+		if berr != nil {
+			_ = task.Kill(ctx, syscall.SIGKILL, containerd.WithKillAll)
+			_, _ = task.Delete(ctx, containerd.WithProcessKill)
+			_ = ctr.Delete(ctx)
+			return fmt.Errorf("containerd sandbox: start broker for %s: %w", containerID, berr)
+		}
+		t.broker.Store(&brokerState{id: id, net: bn})
+	}
 	return nil
 }
 
@@ -801,6 +819,11 @@ func (t *containerdTasks) startTask(ctx context.Context, id, snapshotKey string,
 // politely stopped.
 func (t *containerdTasks) StopTask(ctx context.Context, id string) error {
 	ctx = t.ctx(ctx)
+	if old := t.broker.Load(); old != nil && old.id == id {
+		if t.broker.CompareAndSwap(old, nil) {
+			old.net.close(context.WithoutCancel(ctx))
+		}
+	}
 
 	ctrs, err := t.sandboxContainers(ctx, id)
 	if err != nil {
@@ -855,6 +878,12 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	task, err := t.currentTask(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
+	}
+	if broker := t.broker.Load(); broker != nil && broker.id == id {
+		req.Env = mergeBrokerEnv(req.Env, broker.net.env())
+		if _, ok := req.Env["PATH"]; !ok {
+			req.Env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+		}
 	}
 
 	// Per-stream output ceilings (Config.MaxOutputBytes), for public Exec

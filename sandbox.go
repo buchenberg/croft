@@ -164,10 +164,19 @@ type Config struct {
 	// resolver: /etc/resolv.conf is the image's, so hostname-based
 	// operations also need an image with a usable resolver config.
 	//
+	// "broker": the container gets a dedicated veth with no default
+	// route. Its only reachable host address is a single-port proxy
+	// that enforces BrokerHosts. This requires a root client with ip,
+	// nsenter, and iptables; an unavailable proxy refuses the launch.
+	//
 	// Any other value is rejected loudly at every entry that starts a
 	// container generation — Create, Apply, and the ReadFilesAt reader
 	// path (the config-typo convention).
 	Network string
+	// BrokerHosts is the exact-host allowlist for Network: "broker".
+	// Empty means a deny-all broker. Hosts are case-insensitive names;
+	// wildcards are not interpreted.
+	BrokerHosts []string
 
 	// WritableRoots are container-path subtrees made writable after the
 	// workspace root is masked read-only. They mirror
@@ -248,17 +257,30 @@ func (c Config) workdir() string {
 	return c.Workdir
 }
 
-// validateNetwork checks Config.Network against the two supported postures.
+// validateNetwork checks Config.Network against the supported postures.
 // Called at Create, Apply, and withReaderTask — every entry that starts a
 // container generation — so a typo fails loudly before any daemon call
 // instead of silently running the workspace under the wrong network posture.
 func (c Config) validateNetwork() error {
 	switch c.Network {
-	case "", "host", "none":
+	case "", "host", "none", "broker":
 		return nil
 	default:
-		return fmt.Errorf("containerd sandbox: Config.Network %q is not a supported posture: leave it unset (the isolated default), or use \"none\" or \"host\"", c.Network)
+		return fmt.Errorf("containerd sandbox: Config.Network %q is not a supported posture: leave it unset (the isolated default), or use \"none\", \"host\", or \"broker\"", c.Network)
 	}
+}
+
+func (c Config) validateBrokerHosts() error {
+	if c.Network != "broker" && len(c.BrokerHosts) > 0 {
+		return fmt.Errorf("containerd sandbox: Config.BrokerHosts is set but Config.Network is %q, not \"broker\"", c.Network)
+	}
+	for i, host := range c.BrokerHosts {
+		host = strings.TrimSpace(host)
+		if host == "" || strings.ContainsAny(host, " \t/:") {
+			return fmt.Errorf("containerd sandbox: Config.BrokerHosts[%d] %q is not an exact host name", i, host)
+		}
+	}
+	return nil
 }
 
 // validateWritableRoots checks the grant-shaped workspace roots. They are
@@ -619,6 +641,9 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 		return fmt.Errorf("containerd sandbox: Config.Image is required")
 	}
 	if err := s.cfg.validateNetwork(); err != nil {
+		return err
+	}
+	if err := s.cfg.validateBrokerHosts(); err != nil {
 		return err
 	}
 	if err := s.cfg.validateWritableRoots(); err != nil {
@@ -984,6 +1009,9 @@ func (s *ContainerdSandbox) applyImpl(ctx context.Context, ws WorkspaceState) er
 		return fmt.Errorf("containerd sandbox: workspace state has no snapshot key")
 	}
 	if err := s.cfg.validateNetwork(); err != nil {
+		return err
+	}
+	if err := s.cfg.validateBrokerHosts(); err != nil {
 		return err
 	}
 	if err := s.cfg.validateWritableRoots(); err != nil {
