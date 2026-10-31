@@ -654,8 +654,9 @@ func (s *ContainerdSandbox) createImpl(ctx context.Context) error {
 
 	if err := s.startTaskAndProbe(ctx, id, active); err != nil {
 		// Do not leak the snapshot if the task could not start or its
-		// authority probe failed.
-		_ = s.snap.Remove(ctx, active)
+		// authority probe failed. The parent context may be the reason the
+		// probe failed, so the cleanup must outlive it.
+		_ = s.snap.Remove(context.WithoutCancel(ctx), active)
 		return fmt.Errorf("containerd sandbox: start task: %w", err)
 	}
 

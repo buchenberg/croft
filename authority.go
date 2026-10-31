@@ -137,11 +137,15 @@ func (s *ContainerdSandbox) probeWritableRoots(ctx context.Context, id string) e
 	workdir := path.Clean(s.cfg.workdir())
 	for _, root := range roots {
 		probe := path.Join(root, ".croft-authority-probe")
-		if res := s.probeExec(ctx, id, probe); res.ExitCode != 0 {
+		res, err := s.probeExec(ctx, id, probe)
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: writable-root probe inside %s: %w", root, err)
+		}
+		if res.ExitCode != 0 {
 			return fmt.Errorf("containerd sandbox: writable-root probe inside %s failed (exit %d: %s)", root, res.ExitCode, strings.TrimSpace(res.Stderr))
 		}
-		if res := s.cleanupProbe(ctx, id, probe); res.ExitCode != 0 {
-			return fmt.Errorf("containerd sandbox: clean writable-root probe in %s (exit %d: %s)", root, res.ExitCode, strings.TrimSpace(res.Stderr))
+		if err := s.cleanupProbe(ctx, id, probe); err != nil {
+			return fmt.Errorf("containerd sandbox: clean writable-root probe in %s: %w", root, err)
 		}
 	}
 
@@ -150,38 +154,42 @@ func (s *ContainerdSandbox) probeWritableRoots(ctx context.Context, id string) e
 	// the negative canary.
 	if !pathCovered(workdir, roots) {
 		probe := path.Join(workdir, ".croft-authority-probe-outside")
-		res := s.probeExec(ctx, id, probe)
+		res, err := s.probeExec(ctx, id, probe)
+		if err != nil {
+			return fmt.Errorf("containerd sandbox: writable-root probe outside the grants: %w", err)
+		}
 		if res.ExitCode == 0 {
 			_ = s.cleanupProbe(ctx, id, probe)
 			return fmt.Errorf("containerd sandbox: writable-root probe wrote outside the grants at %s; the workspace mask is not enforced", probe)
 		}
-		_ = s.cleanupProbe(ctx, id, probe)
+		if err := s.cleanupProbe(ctx, id, probe); err != nil {
+			return fmt.Errorf("containerd sandbox: clean outside writable-root probe: %w", err)
+		}
 	}
 	return nil
 }
 
-func (s *ContainerdSandbox) probeExec(ctx context.Context, id, p string) ExecResult {
-	res, err := s.tasks.Exec(ctx, id, ExecRequest{
+func (s *ContainerdSandbox) probeExec(ctx context.Context, id, p string) (ExecResult, error) {
+	return s.tasks.Exec(ctx, id, ExecRequest{
 		Command: "sh",
 		Args:    []string{"-c", `touch "$1"`, "croft-probe", p},
 		Cwd:     "/",
 	})
-	if err != nil {
-		return ExecResult{ExitCode: -1, Stderr: err.Error()}
-	}
-	return res
 }
 
-func (s *ContainerdSandbox) cleanupProbe(ctx context.Context, id, p string) ExecResult {
+func (s *ContainerdSandbox) cleanupProbe(ctx context.Context, id, p string) error {
 	res, err := s.tasks.Exec(ctx, id, ExecRequest{
 		Command: "sh",
 		Args:    []string{"-c", `rm -f -- "$1"`, "croft-probe", p},
 		Cwd:     "/",
 	})
 	if err != nil {
-		return ExecResult{ExitCode: -1, Stderr: err.Error()}
+		return err
 	}
-	return res
+	if res.ExitCode != 0 {
+		return fmt.Errorf("exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	return nil
 }
 
 func pathCovered(p string, roots []string) bool {

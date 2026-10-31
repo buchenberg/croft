@@ -75,7 +75,7 @@ last, so specificity wins); otherwise croft performs the same shaping
 inside the container's mount namespace in an init step before the task
 starts. If neither path is available, the launch **refuses** — the same
 probe-first fail-closed contract as `containment.LaunchConfined`. The
-task spec must not grant `CAP_SYS_ADMIN`, or the masks are remountable.
+The shaping init is the one privileged process: it receives `CAP_SYS_ADMIN` to perform the bind/remount step. User exec processes are given the default capability set **without** `CAP_SYS_ADMIN`, so the masks are not remountable from the model's processes.
 
 Per-root writable mounts with separate backing stores (the naive Option
 A) are explicitly **not** used: they would scatter the change-set across
