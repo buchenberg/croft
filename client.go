@@ -464,10 +464,15 @@ func generationID(sandboxID, snapshotKey string) string {
 
 // initArgs is the long-lived process a container runs so it stays up between
 // commands; Exec provides the actual work.
-func (t *containerdTasks) initArgs() []string {
+func (t *containerdTasks) shapingEnabled() bool { return len(t.cfg.WritableRoots) > 0 }
+
+func (t *containerdTasks) initArgs(shaped bool) []string {
 	init := t.cfg.InitArgs
 	if len(init) == 0 {
 		init = []string{"/bin/sh", "-c", "sleep infinity"}
+	}
+	if !shaped {
+		return init
 	}
 	return shapedInitArgs(t.cfg.workdir(), t.cfg.WritableRoots, init)
 }
@@ -719,7 +724,8 @@ func withNumericUser(user string) oci.SpecOpts {
 
 // StartTask creates and starts a container generation rooted at snapshotKey.
 func (t *containerdTasks) StartTask(ctx context.Context, id, snapshotKey string) error {
-	return t.startTask(ctx, id, snapshotKey, t.initArgs(), len(t.cfg.WritableRoots) > 0)
+	shaped := t.shapingEnabled()
+	return t.startTask(ctx, id, snapshotKey, t.initArgs(shaped), shaped)
 }
 
 // StartReaderTask starts a reader task with the inert sleep init, never the

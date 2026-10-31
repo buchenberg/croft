@@ -177,7 +177,9 @@ type Config struct {
 	//
 	// Shaping happens inside the container's mount namespace before the
 	// configured InitArgs run. It keeps the single overlay layer intact, so
-	// Capture and Compare see the same change-set they always did.
+	// Capture and Compare see the same change-set they always did. The image
+	// must provide /bin/sh, mount, and capsh or setpriv; otherwise the launch
+	// refuses rather than leaving the shaping init privileged.
 	WritableRoots []string
 
 	// Secrets are host files bind-mounted read-only into the container.

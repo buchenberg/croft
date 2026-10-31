@@ -78,7 +78,19 @@ func writableRootsScript(workdir string, roots []string) string {
 		fmt.Fprintf(&b, "mount --bind %s %s\n", shellQuote(root), shellQuote(root))
 		fmt.Fprintf(&b, "mount -o remount,bind,rw %s\n", shellQuote(root))
 	}
-	b.WriteString("exec \"$@\"\n")
+	// The shaping init is the only process with CAP_SYS_ADMIN. Drop it before
+	// handing control to InitArgs: the shell's child must not be able to
+	// remount the read-only mask. Require a real capability-dropping utility
+	// rather than silently leaving the init privileged.
+	b.WriteString(`if command -v capsh >/dev/null 2>&1; then
+  exec capsh --drop=cap_sys_admin -- -c 'exec "$@"' croft-init "$@"
+fi
+if command -v setpriv >/dev/null 2>&1; then
+  exec setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin --ambient-caps=-sys_admin --no-new-privs -- "$@"
+fi
+echo 'croft: capsh or setpriv is required to drop CAP_SYS_ADMIN after writable-root shaping' >&2
+exit 127
+`)
 	return b.String()
 }
 

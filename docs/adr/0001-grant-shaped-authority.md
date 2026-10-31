@@ -74,8 +74,8 @@ the runtime honors ordered parent-before-child mounts (deepest mounts
 last, so specificity wins); otherwise croft performs the same shaping
 inside the container's mount namespace in an init step before the task
 starts. If neither path is available, the launch **refuses** — the same
-probe-first fail-closed contract as `containment.LaunchConfined`. The
-The shaping init is the one privileged process: it receives `CAP_SYS_ADMIN` to perform the bind/remount step. User exec processes are given the default capability set **without** `CAP_SYS_ADMIN`, so the masks are not remountable from the model's processes.
+probe-first fail-closed contract as `containment.LaunchConfined`.
+The shaping init is the one privileged process: it receives `CAP_SYS_ADMIN` to perform the bind/remount step, then drops it before handing control to `InitArgs`. User exec processes are given the default capability set **without** `CAP_SYS_ADMIN`, so the masks are not remountable from the model's processes. The image must provide `/bin/sh`, `mount`, and `capsh` or `setpriv`; otherwise the launch refuses.
 
 Per-root writable mounts with separate backing stores (the naive Option
 A) are explicitly **not** used: they would scatter the change-set across
