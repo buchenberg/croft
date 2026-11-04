@@ -53,13 +53,15 @@ jobs:
           # Prefix match that requires the next character to be a boundary
           # (end of line, space, tab): "## v0.9.2 - 2026-01-01" matches the
           # v0.9.2 section, while "## v0.9.22" and "## v0.9.2-rc1" do not.
-          # The scan exits only on the next versioned heading, so a stray
-          # level-2 subheading inside a section would not truncate notes —
-          # though this CHANGELOG's sections use bare "## vX.Y.Z" headings
-          # and nothing deeper.
+          # The scan exits on the next versioned OR Unreleased heading — the
+          # two shapes any CHANGELOG section can have in this repo — so an
+          # "## Unreleased" left in place below the new section (added above
+          # instead of renamed) cannot leak into the notes. The guard is
+          # deliberately narrower than "any ## heading": inners are checked,
+          # not trusted — see below.
           awk -v tag="$tag" '
             BEGIN { heading = "## " tag }
-            seen && /^## v/ { exit }
+            seen && /^## (v[0-9]|Unreleased)/ { exit }
             substr($0, 1, length(heading)) == heading {
               c = substr($0, length(heading) + 1, 1)
               if (c == "" || c == " " || c == "\t") { seen = 1; next }
@@ -70,6 +72,18 @@ jobs:
           # one-line section; both are pre-merge authoring failures.
           if ! grep -q . release-notes.md; then
             echo "refusing: CHANGELOG.md has no ## $tag section (or it is empty) at this tag" >&2
+            exit 1
+          fi
+          # No level-2 heading may survive inside the notes. One means either
+          # an unknown section shape after this section (the scan above
+          # deliberately terminates only on vX / Unreleased) or an inner
+          # subheading of the notes themselves — both are CHANGELOG authoring
+          # errors that would otherwise ship silently, as leaked content
+          # or truncated scan. Refuse and name the line; the fix is renaming
+          # the heading or demoting it to "###".
+          if grep -n '^## ' release-notes.md > /tmp/release-notes-headings; then
+            echo "refusing: level-2 headings inside the ## $tag notes (renamed or demote them):" >&2
+            cat /tmp/release-notes-headings >&2
             exit 1
           fi
           echo "-- release notes for $tag --" >&2
