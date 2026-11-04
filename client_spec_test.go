@@ -477,7 +477,7 @@ func TestInitSpecOpts_DefaultSeccompAndNoNewPrivileges(t *testing.T) {
 	if !ok {
 		t.Fatal("clone3: no rule in the default profile")
 	}
-	if clone3.ErrnoRet == nil || *clone3.ErrnoRet != errnoEnosys {
+	if clone3.ErrnoRet == nil || *clone3.ErrnoRet != errnoNoSys {
 		t.Errorf("clone3 errnoRet = %+v, want ENOSYS (glibc falls back to clone on ENOSYS, not EPERM)", clone3.ErrnoRet)
 	}
 }

@@ -895,7 +895,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	if broker := t.broker.Load(); broker != nil && broker.id == id {
 		req.Env = mergeBrokerEnv(req.Env, broker.net.env())
 		if _, ok := req.Env["PATH"]; !ok {
-			req.Env["PATH"] = strings.TrimPrefix(execDefaultPATH, "PATH=")
+			req.Env["PATH"] = execDefaultPATH
 		}
 	}
 

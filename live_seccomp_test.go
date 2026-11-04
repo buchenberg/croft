@@ -40,11 +40,12 @@ import (
 	"time"
 )
 
-// seccompProbeSource is the in-container probe. Output is one line:
-// clone_newuser:<errno name>, where EPERM is the expected mask denial. A
-// successful clone prints SUCCESS instead — clone either succeeds outright or
-// fails with a specific errno; there is no ambiguous third case with these
-// flags (SIGCHLD alone, then CLONE_NEWUSER added).
+// seccompProbeSource is the in-container probe. Output is exactly one token:
+// the raw errno number of the refused clone, or SUCCESS when the clone went
+// through. The test pins the literal "1" (EPERM is 1 on every Linux arch); the
+// number is printed, not asserted, by the probe so a wrong-but-real denial —
+// the failure mode this probe exists to catch — cannot impersonate EPERM the
+// way a hardcoded "EPERM:" label would.
 const seccompProbeSource = `
 package main
 
@@ -64,7 +65,7 @@ func main() {
 		return
 	}
 	// RawSyscall6's err is uintptr; only errno values 1..4095 are kernels'.
-	fmt.Fprintf(os.Stdout, "EPERM:%d", uint(errno))
+	fmt.Fprintf(os.Stdout, "%d", uint(errno))
 }
 `
 
@@ -130,18 +131,14 @@ func TestLive_SeccompAndNoNewPrivileges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exec probe: %v", err)
 	}
-	// EPERM:0x10000000|SIGCHLD — the clone failed on the NEWUSER bits. Any
-	// other outcome — SUCCESS above all — means the mask rule did not reach
-	// the kernel.
-	if !strings.HasPrefix(ires, "EPERM:") {
-		t.Errorf("clone(CLONE_NEWUSER) in container = %q, want EPERM (SUCCESS means the NEWUSER mask rule did not apply)", ires)
-	}
-	// The decline must come from the filter, not from a syscall number
-	// mismatch on this kernel: the same clone syscall number (x86_64 56 /
-	// here resolved via syscall.SYS_CLONE) arcana are the probe's own use of
-	// the stdlib constant, so a mismatch would fail the build, not this run.
-	if !strings.Contains(ires, "1") {
-		t.Errorf("clone denial errno = %q, want EPERM (1): the pipe beyond the mask is fine, the code must not change", ires)
+	// The probe prints the clone's raw errno. The mask rule denies with
+	// EPERM (1), and it is the only value short of SUCCESS that proves the
+	// rule reached the kernel: "EPERM:1" would have been trivially forged by
+	// a probe that mislabeled any errno, so the assertion is exact. A wrong
+	// number means the mask rule did not apply as written; SUCCESS means the
+	// seccomp profile did not reach the exec'd process at all.
+	if ires != "1" {
+		t.Errorf("clone(CLONE_NEWUSER) in container = %q, want the EPERM errno 1 (SUCCESS means the profile did not reach the exec)", ires)
 	}
 }
 

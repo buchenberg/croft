@@ -8,11 +8,11 @@
   loading, kexec, BPF, perf events, userfaultfd, io_uring setup), the
   ptrace/process_vm family, keyring access (keyctl/add_key/request_key),
   namespace creation and joining (unshare/setns), open_by_handle_at,
-  swap/accounting/reboot. clone and clone3 carry a CLONE_NEWUSER mask so
-  user-namespace creation fails while thread and process creation keep
-  working; clone3 answers ENOSYS, not EPERM, so glibc ≥ 2.34 falls back to
-  the filtered clone instead of breaking process creation. Denials return
-  EPERM.
+  swap/accounting/reboot, and the pidfd fd-theft and process-memory calls.
+  clone carries a CLONE_NEWUSER argument mask so user-namespace creation
+  fails while thread and process creation keep working; clone3 answers
+  ENOSYS, not EPERM, so glibc ≥ 2.34 falls back to the filtered clone
+  instead of breaking process creation. Denials return EPERM.
 - Added: `Config.Seccomp` (*specs.LinuxSeccomp) — nil (the default) installs
   the default profile above; a non-nil profile replaces it wholesale. The
   contract is "only more restrictive": there is no off switch, and croft

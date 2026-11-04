@@ -251,7 +251,8 @@ and the staging directory (`Config.StagingDir`: when set, `WriteFile`
 writes host-side and moves files into place atomically, closing the argv
 exposure), and the syscall filter (`Config.Seccomp`: nil applies croft's
 default profile — a deny-list of kernel-exploit primitives with a
-`CLONE_NEWUSER` mask on `clone`/`clone3`; a caller-supplied profile replaces
+`CLONE_NEWUSER` mask on `clone` (`clone3` answers ENOSYS so glibc falls back
+to the masked `clone`); a caller-supplied profile replaces
 it, on the contract that it is only more restrictive — there is no off
 switch). See `Config` in `sandbox.go` for the full contract of each field.
 

@@ -30,6 +30,7 @@ package croft
 
 import (
 	"context"
+	"syscall"
 
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
@@ -45,11 +46,14 @@ import (
 // while thread and process creation keep working.
 const cloneNewUser = 0x10000000
 
-// errnoPerm is the uint form of EPERM, and errnoEnosys the uint form of ENOSYS;
-// seccomp's ErrnoRet fields carry plain uints.
+// errnoPerm and errnoNoSys are seccomp's ErrnoRet fields (plain uints) fed
+// from the syscall package's constants, so each carries the value native to
+// the compiled arch — the wrong ENOSYS number on a MIPS-family daemon would
+// tell glibc not to fall back from clone3, which is the exact failure the
+// ENOSYS denial exists to avoid.
 const (
-	errnoPerm   = 1
-	errnoEnosys = 38
+	errnoPerm  = uint(syscall.EPERM)
+	errnoNoSys = uint(syscall.ENOSYS)
 )
 
 // deniedSeccompSyscalls are the syscalls always refused inside a croft
@@ -58,13 +62,17 @@ const (
 //   - Kernel-code injection / privilege escalation: module loading, kexec,
 //     BPF, perf, userfaultfd (the page-fault race window), io_uring (the
 //     submission path, once setup exists, is exploitable independently).
-//   - Cross-process interference inside the sandbox: ptrace and the
-//     process_vm cross-memory family. YAMA already narrows these kernel-side;
+//   - Cross-process interference inside the sandbox: ptrace, the
+//     process_vm cross-memory family, kcmp, and the pidfd fd-theft and
+//     process-memory calls. YAMA already narrows some of these kernel-side;
 //     refusing them at the filter removes the policy dependency.
+//     pidfd_open stays allowed: it only mints a handle, and the handle is
+//     useless for fd theft (pidfd_getfd) or memory reading (process_vm_*)
+//     once those are refused.
 //   - Cryptographic-key material: the keyctl family, so an in-container
 //     process cannot enumerate or read host keyrings the way it can't read
 //     host files.
-//   - Namepace escape or traversal: unshare and setns, so no new namespace
+//   - Namespace escape or traversal: unshare and setns, so no new namespace
 //     can be mounted from inside and no existing one joined. clone keeps
 //     working for the namespaceless cases; see cloneNewUser.
 //   - Host-state disruption from a shared daemon: swap and accounting
@@ -83,6 +91,11 @@ var deniedSeccompSyscalls = []string{
 	"ptrace",
 	"process_vm_readv",
 	"process_vm_writev",
+	"pidfd_getfd",
+	"kcmp",
+	"move_pages",
+	"migrate_pages",
+	"process_madvise",
 	"keyctl",
 	"add_key",
 	"request_key",
@@ -110,7 +123,7 @@ var deniedSeccompSyscalls = []string{
 //     Docker's handling.
 func defaultSeccompProfile() *specs.LinuxSeccomp {
 	perm := uint(errnoPerm)
-	enosys := uint(errnoEnosys)
+	enosys := errnoNoSys
 	cloneArgs := specs.LinuxSeccompArg{
 		Index:    0,
 		Value:    cloneNewUser,

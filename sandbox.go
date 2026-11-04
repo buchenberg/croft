@@ -183,9 +183,10 @@ type Config struct {
 	// sandbox starts. Nil (the default) applies defaultSeccompProfile — a
 	// deny-list of the syscalls whose only sandbox use is exploit primitive
 	// (module loading, kexec, BPF, perf, ptrace, keyrings, namespace
-	// creation, io_uring setup), each failing with EPERM, plus clone/clone3
-	// carrying a CLONE_NEWUSER mask so user-namespace creation fails while
-	// thread and process creation keep working. A non-nil Seccomp replaces
+	// creation, io_uring setup), each failing with EPERM, plus clone
+	// carrying a CLONE_NEWUSER argument mask so user-namespace creation
+	// fails while thread and process creation keep working (clone3 answers
+	// ENOSYS so glibc falls back to that masked clone). A non-nil Seccomp replaces
 	// it wholesale and exists so a caller can go *further* — an
 	// allowlist with DefaultAction SCMP_ACT_ERRNO, argument filters, an
 	// architecturally narrower profile; there is no off switch, and "only
