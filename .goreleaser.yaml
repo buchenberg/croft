@@ -1,0 +1,37 @@
+# GoReleaser — release-only pipeline for a Go library.
+#
+# croft ships no binaries: the module (github.com/buchenberg/goatherd-croft)
+# is consumed from source, and pkg.go.dev reads its version straight off the
+# git tag. So there is nothing to build, archive, or checksum — what GoReleaser
+# contributes here is the release *object*: validated tag, generated from the
+# CHANGELOG section by the workflow in .github/workflows/release.yml, and an
+# audit trail that the hand-rolled tag-only discipline never had (v0.6.0
+# through v0.9.1 exist as bare tags with no release page at all).
+#
+# `builds` is skipped rather than empty: an empty list falls back to
+# inferring a main package from the root module (and fails with
+# "does not contain a main function"), while an explicit skipped build is
+# GoReleaser's supported way to say "no binaries — release only".
+builds:
+  - skip: true
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+# The CHANGELOG.md is the single source of truth for release notes; the
+# workflow extracts the `## vX.Y.Z` section and hands it over as
+# --release-notes. Generating a second changelog from commit subjects would
+# produce two documents that drift, which is exactly the failure the
+# CHANGELOG hand-maintenance convention exists to avoid.
+changelog:
+  disable: true
+
+release:
+  # Notes come from the CHANGELOG extraction; the footer is repo-canonical,
+  # not tool-branding.
+  footer: >-
+    ---
+
+    Module: `github.com/buchenberg/goatherd-croft` — installed with
+    `go get github.com/buchenberg/goatherd-croft@{{ .Tag }}`.
