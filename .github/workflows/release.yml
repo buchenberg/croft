@@ -27,6 +27,10 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          # Full history: GoReleaser resolves this tag and its predecessor,
+          # which a shallow clone cannot serve.
+          fetch-depth: 0
 
       - name: setup Go
         uses: actions/setup-go@v5
@@ -46,17 +50,26 @@ jobs:
             echo "refusing: CHANGELOG.md not found at the tagged commit" >&2
             exit 1
           fi
-          # Whole-line heading match, so "## v0.9.2" can never capture the
-          # section written for "## v0.9.22" — or be captured by it.
-          awk -v heading="## $tag" '
-            $0 == heading { seen = 1; next }
-            seen && /^## / { exit }
+          # Prefix match that requires the next character to be a boundary
+          # (end of line, space, tab): "## v0.9.2 - 2026-01-01" matches the
+          # v0.9.2 section, while "## v0.9.22" and "## v0.9.2-rc1" do not.
+          # The scan exits only on the next versioned heading, so a stray
+          # level-2 subheading inside a section would not truncate notes —
+          # though this CHANGELOG's sections use bare "## vX.Y.Z" headings
+          # and nothing deeper.
+          awk -v tag="$tag" '
+            BEGIN { heading = "## " tag }
+            seen && /^## v/ { exit }
+            substr($0, 1, length(heading)) == heading {
+              c = substr($0, length(heading) + 1, 1)
+              if (c == "" || c == " " || c == "\t") { seen = 1; next }
+            }
             seen { print }
           ' CHANGELOG.md > release-notes.md
           # Empty after stripping blank lines is a missing section, not a
           # one-line section; both are pre-merge authoring failures.
           if ! grep -q . release-notes.md; then
-            echo "refusing: CHANGELOG.md has no $heading section (or it is empty) at this tag" >&2
+            echo "refusing: CHANGELOG.md has no ## $tag section (or it is empty) at this tag" >&2
             exit 1
           fi
           echo "-- release notes for $tag --" >&2
@@ -66,7 +79,10 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
+          # Bound to the major: a future GoReleaser major must be an
+          # intentional upgrade, not a silent semantic change to this
+          # workflow.
+          version: "~> v2"
           args: release --clean --release-notes release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

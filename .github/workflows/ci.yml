@@ -44,5 +44,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
+          # Bound to the major, matching release.yml: the check's semantics
+          # must not float independently of the release pipeline's.
+          version: "~> v2"
           args: check
