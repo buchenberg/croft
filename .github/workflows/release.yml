@@ -50,6 +50,10 @@ jobs:
             echo "refusing: CHANGELOG.md not found at the tagged commit" >&2
             exit 1
           fi
+          # Notes and their scratch files go under $RUNNER_TEMP, never the
+          # working tree: GoReleaser's dirty check counts untracked files,
+          # and a notes file at the repo root fails the release it is meant
+          # to serve (observed live: "?? release-notes.md" → errors/dirty).
           # Prefix match that requires the next character to be a boundary
           # (end of line, space, tab): "## v0.9.2 - 2026-01-01" matches the
           # v0.9.2 section, while "## v0.9.22" and "## v0.9.2-rc1" do not.
@@ -67,10 +71,10 @@ jobs:
               if (c == "" || c == " " || c == "\t") { seen = 1; next }
             }
             seen { print }
-          ' CHANGELOG.md > release-notes.md
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
           # Empty after stripping blank lines is a missing section, not a
           # one-line section; both are pre-merge authoring failures.
-          if ! grep -q . release-notes.md; then
+          if ! grep -q . "$RUNNER_TEMP/release-notes.md"; then
             echo "refusing: CHANGELOG.md has no ## $tag section (or it is empty) at this tag" >&2
             exit 1
           fi
@@ -81,13 +85,13 @@ jobs:
           # errors that would otherwise ship silently, as leaked content
           # or truncated scan. Refuse and name the line; the fix is renaming
           # the heading or demoting it to "###".
-          if grep -n '^## ' release-notes.md > /tmp/release-notes-headings; then
+          if grep -n '^## ' "$RUNNER_TEMP/release-notes.md" > "$RUNNER_TEMP/release-notes-headings"; then
             echo "refusing: level-2 headings inside the ## $tag notes (renamed or demote them):" >&2
-            cat /tmp/release-notes-headings >&2
+            cat "$RUNNER_TEMP/release-notes-headings" >&2
             exit 1
           fi
           echo "-- release notes for $tag --" >&2
-          cat release-notes.md >&2
+          cat "$RUNNER_TEMP/release-notes.md" >&2
 
       - name: run goreleaser
         uses: goreleaser/goreleaser-action@v6
@@ -97,6 +101,6 @@ jobs:
           # this binary. A GoReleaser upgrade here is a deliberate act — bump
           # the pin and re-run the snapshot locally first.
           version: v2.12.7
-          args: release --clean --release-notes release-notes.md
+          args: release --clean --release-notes "$RUNNER_TEMP/release-notes.md"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
