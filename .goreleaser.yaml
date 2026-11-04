@@ -24,8 +24,16 @@ version: 2
 # --release-notes. Generating a second changelog from commit subjects would
 # produce two documents that drift, which is exactly the failure the
 # CHANGELOG hand-maintenance convention exists to avoid.
-changelog:
-  disable: true
+#
+# Do NOT set changelog.disable here. It reads like the right guard for
+# "no second changelog", but GoReleaser reads the --release-notes flag
+# *inside* the changelog pipe (internal/pipe/changelog): with the pipe
+# disabled the flag is never loaded, ctx.ReleaseNotes stays empty, and the
+# release publishes as the footer alone — observed live on v0.9.2's first
+# run (observed twice actually: the flag's own "will skip GoReleaser
+# changelog generation" plus this pipe's early return when a notes file is
+# given are the designed flow: notes in, generation suppressed, footer
+# still composes onto the body).
 
 release:
   # Notes come from the CHANGELOG extraction; the footer is repo-canonical,
