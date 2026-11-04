@@ -8,7 +8,17 @@
   loading, kexec, BPF, perf events, userfaultfd, io_uring setup), the
   ptrace/process_vm family, keyring access (keyctl/add_key/request_key),
   namespace creation and joining (unshare/setns), open_by_handle_at,
-  swap/accounting/reboot, and the pidfd fd-theft and process-memory calls.
+  swap/accounting/reboot, pidfd fd-theft (pidfd_getfd), and the
+  cross-process probes and NUMA page-removal calls (kcmp, move_pages,
+  migrate_pages). Every name resolves on all of libseccomp's arch tables,
+  checked against src/syscalls.csv; kexec_file_load is deliberately absent
+  (its table entry is arch-scattered, and kexec needs CAP_SYS_BOOT no croft
+  process holds anyway). The libseccomp floor is 2.5.0 (2020: pidfd_getfd,
+  io_uring_setup, clone3); older daemons fail container creation loudly and
+  Config.Seccomp is the escape hatch. process_madvise is deliberately not
+  denied (its table entry only exists from 2.5.2, which would break
+  unbackported RHEL 9.0); the exfiltration-grade cross-process primitives
+  stay denied.
   clone carries a CLONE_NEWUSER argument mask so user-namespace creation
   fails while thread and process creation keep working; clone3 answers
   ENOSYS, not EPERM, so glibc ≥ 2.34 falls back to the filtered clone

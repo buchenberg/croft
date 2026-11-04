@@ -21,12 +21,27 @@ package croft
 // SIGSYS'd out of existence, and libseccomp's ERRNO action keeps -1/errno
 // semantics the caller already handles.
 //
-// Only syscall names that resolve on every architecture libseccomp supports are
-// denied. x86-only legacies (iopl, ioperm, vm86, modify_ldt) and long-removed
-// syscalls (create_module, uselib, _sysctl) are deliberately absent: an entry
-// the daemon's libseccomp cannot resolve fails every container start, and on
-// those architectures the names either do not exist or the syscalls are already
-// gone.
+// Every name below is checked against libseccomp's own syscall tables
+// (src/syscalls.csv): an entry the daemon's libseccomp cannot resolve fails
+// every container start, so the header's claim is table-verified —
+// kexec_file_load is deliberately excluded because its table entry is
+// arch-scattered (absent on mips, mips64, m68k, sh) and redundant anyway:
+// kexec needs CAP_SYS_BOOT, which no croft process holds, exactly the
+// mount-without-CAP_SYS_ADMIN case above. x86-only legacies (iopl, ioperm,
+// vm86, modify_ldt) and long-removed syscalls (create_module, uselib,
+// _sysctl) stay absent for the same resolution reason.
+//
+// What this costs: the newest name here is pidfd_getfd, which entered
+// libseccomp in 2.5.0 (2020) alongside io_uring_setup and clone3. A daemon
+// host with an older libseccomp — RHEL 8's 2.4.2, for example — fails
+// container creation loudly at profile load, croft's fail-loud convention;
+// Config.Seccomp is the escape hatch. process_madvise, which would deny one
+// more cross-process annoyance, has its own table entry only from 2.5.2 and
+// is deliberately NOT in the list: raising the floor to force an
+// unbackported RHEL 9.0 (2.5.1) off every container start by default buys
+// far less than the denial itself. The exfiltration-grade cross-process
+// primitives (process_vm_*, pidfd_getfd, ptrace) remain denied; the residual
+// is process_madvise MADV_COLD/DONTNEED-style interference only.
 
 import (
 	"context"
@@ -63,8 +78,11 @@ const (
 //     BPF, perf, userfaultfd (the page-fault race window), io_uring (the
 //     submission path, once setup exists, is exploitable independently).
 //   - Cross-process interference inside the sandbox: ptrace, the
-//     process_vm cross-memory family, kcmp, and the pidfd fd-theft and
-//     process-memory calls. YAMA already narrows some of these kernel-side;
+//     process_vm cross-memory family, kcmp (which compares whether two
+//     processes share resources — a probe for the interference below), the
+//     pidfd fd-theft call, and the NUMA migration calls (move_pages,
+//     migrate_pages can rip another process's pages off its node). YAMA
+//     already narrows some of these kernel-side;
 //     refusing them at the filter removes the policy dependency.
 //     pidfd_open stays allowed: it only mints a handle, and the handle is
 //     useless for fd theft (pidfd_getfd) or memory reading (process_vm_*)
@@ -83,7 +101,6 @@ var deniedSeccompSyscalls = []string{
 	"finit_module",
 	"delete_module",
 	"kexec_load",
-	"kexec_file_load",
 	"bpf",
 	"perf_event_open",
 	"userfaultfd",
@@ -95,7 +112,6 @@ var deniedSeccompSyscalls = []string{
 	"kcmp",
 	"move_pages",
 	"migrate_pages",
-	"process_madvise",
 	"keyctl",
 	"add_key",
 	"request_key",
