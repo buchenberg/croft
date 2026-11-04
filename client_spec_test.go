@@ -408,3 +408,113 @@ func TestInitSpecOpts_RejectsNonConfigMediaType(t *testing.T) {
 		t.Errorf("error = %v, want the media type named", err)
 	}
 }
+
+// TestInitSpecOpts_DefaultSeccompAndNoNewPrivileges pins ADR-0002 P1
+// (croft-e6i): every generation's init spec carries NoNewPrivileges and the
+// default seccomp profile — the deny-list with the NEWUSER mask — applied on
+// top of containerd's default spec. With NoNewPrivileges, the explicit
+// assertion is the point (see initSpecOpts: the guarantee is croft's, not a
+// dependency default the way the NEWNET entry is).
+func TestInitSpecOpts_DefaultSeccompAndNoNewPrivileges(t *testing.T) {
+	spec, err := generateInitSpec(t, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("generateInitSpec: %v", err)
+	}
+	if !spec.Process.NoNewPrivileges {
+		t.Fatal("Process.NoNewPrivileges = false, want true")
+	}
+	scmp := spec.Linux.Seccomp
+	if scmp == nil {
+		t.Fatal("Linux.Seccomp = nil, want the default profile")
+	}
+	if scmp.DefaultAction != specs.ActAllow {
+		t.Fatalf("Seccomp.DefaultAction = %q, want %q (deny-list semantics)", scmp.DefaultAction, specs.ActAllow)
+	}
+
+	find := func(names ...string) (specs.LinuxSyscall, bool) {
+		for _, rule := range scmp.Syscalls {
+			for _, want := range names {
+				if slices.Contains(rule.Names, want) {
+					return rule, true
+				}
+			}
+		}
+		return specs.LinuxSyscall{}, false
+	}
+
+	// The exploit-primitive deny rule: EPERM on the whole curated set.
+	for _, name := range deniedSeccompSyscalls {
+		rule, ok := find(name)
+		if !ok {
+			t.Errorf("syscall %q: no denial rule in the default profile", name)
+			continue
+		}
+		if rule.Action != specs.ActErrno || rule.ErrnoRet == nil || *rule.ErrnoRet != errnoPerm {
+			t.Errorf("syscall %q: denial = %q errnoRet %+v, want SCMP_ACT_ERRNO EPERM", name, rule.Action, rule.ErrnoRet)
+		}
+	}
+
+	// clone keeps working for threads and processes but refuses
+	// CLONE_NEWUSER by mask; clone3 must answer ENOSYS so glibc falls back
+	// to the filtered clone rather than aborting process creation.
+	clone, ok := find("clone")
+	if !ok {
+		t.Fatal("clone: no rule in the default profile")
+	}
+	if clone.Action != specs.ActErrno {
+		t.Errorf("clone rule action = %q, want SCMP_ACT_ERRNO", clone.Action)
+	}
+	var maskRule *specs.LinuxSeccompArg
+	for i := range clone.Args {
+		if clone.Args[i].Op == specs.OpMaskedEqual {
+			maskRule = &clone.Args[i]
+		}
+	}
+	if maskRule == nil || maskRule.Value != cloneNewUser || maskRule.ValueTwo != cloneNewUser {
+		t.Errorf("clone rule args = %+v, want a CLONE_NEWUSER mask rule", clone.Args)
+	}
+	clone3, ok := find("clone3")
+	if !ok {
+		t.Fatal("clone3: no rule in the default profile")
+	}
+	if clone3.ErrnoRet == nil || *clone3.ErrnoRet != errnoEnosys {
+		t.Errorf("clone3 errnoRet = %+v, want ENOSYS (glibc falls back to clone on ENOSYS, not EPERM)", clone3.ErrnoRet)
+	}
+}
+
+// TestInitSpecOpts_SeccompOverride pins the knob direction: a caller-supplied
+// profile replaces the default wholesale (replacement is what makes "more
+// restrictive" composable; a merge would need semantics no caller can
+// predict), and the replacement lands on the same spec Linux.Seccomp slot.
+func TestInitSpecOpts_SeccompOverride(t *testing.T) {
+	custom := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{"read", "write"}, Action: specs.ActAllow},
+		},
+	}
+	spec, err := generateInitSpecWithConfig(t, Config{Seccomp: custom}, v1.ImageConfig{})
+	if err != nil {
+		t.Fatalf("generateInitSpecWithConfig: %v", err)
+	}
+	if spec.Linux.Seccomp != custom {
+		t.Fatalf("Linux.Seccomp = %+v, want the caller's profile installed as-is", spec.Linux.Seccomp)
+	}
+}
+
+// TestExecProcessSpec_NoNewPrivileges pins the ADR-0002 P1 half that lives on
+// execs: every exec spec carries NoNewPrivileges and the reduced capability
+// set. The exec spec is reached through execProcessSpec because
+// containerdTasks.Exec builds it inline ahead of the daemon call.
+func TestExecProcessSpec_NoNewPrivileges(t *testing.T) {
+	spec := execProcessSpec(ExecRequest{Command: "/bin/sh", Args: []string{"-c", "true"}})
+	if !spec.NoNewPrivileges {
+		t.Fatal("exec Process.NoNewPrivileges = false, want true")
+	}
+	if spec.Capabilities == nil {
+		t.Fatal("exec Process.Capabilities = nil, want croftExecCapabilities")
+	}
+	if spec.Env == nil || len(spec.Env) == 0 || spec.Env[0] != "PATH="+execDefaultPATH {
+		t.Errorf("exec Env = %v, want the default PATH fallback", spec.Env)
+	}
+}

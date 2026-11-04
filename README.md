@@ -249,7 +249,11 @@ namespace; `"host"` opts into the daemon host's network), secret mounts
 (`Config.Secrets`: host files bind-mounted read-only into the container),
 and the staging directory (`Config.StagingDir`: when set, `WriteFile`
 writes host-side and moves files into place atomically, closing the argv
-exposure). See `Config` in `sandbox.go` for the full contract of each field.
+exposure), and the syscall filter (`Config.Seccomp`: nil applies croft's
+default profile — a deny-list of kernel-exploit primitives with a
+`CLONE_NEWUSER` mask on `clone`/`clone3`; a caller-supplied profile replaces
+it, on the contract that it is only more restrictive — there is no off
+switch). See `Config` in `sandbox.go` for the full contract of each field.
 
 ## State format
 

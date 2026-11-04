@@ -230,3 +230,32 @@ func execCapabilities() *specs.LinuxCapabilities {
 		Permitted: caps,
 	}
 }
+
+// execDefaultPATH is the PATH every exec gets when neither the caller nor a
+// broker supplied one.
+const execDefaultPATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// execProcessSpec builds the runc process for a user exec.
+//
+// NoNewPrivileges is asserted per exec, not inherited from the init spec:
+// an exec'd process is created by the shim from outside the container, so
+// the init process's no_new_privs flag does not reach it. Order of operations
+// matters: the capability grant below happens at execve (an existing
+// privilege, which no_new_privs does not block), while setuid-bit and file
+// capability transitions — the paths an in-world attacker plants for a later
+// process — are refused from here on. The container's seccomp profile comes
+// from the init spec and is applied to this process by the runtime; the exec
+// spec itself has nowhere to put a filter.
+func execProcessSpec(req ExecRequest) *specs.Process {
+	spec := &specs.Process{
+		Args:            append([]string{req.Command}, req.Args...),
+		Cwd:             req.Cwd,
+		Env:             envSlice(req.Env),
+		Capabilities:    execCapabilities(),
+		NoNewPrivileges: true,
+	}
+	if len(spec.Env) == 0 {
+		spec.Env = []string{"PATH=" + execDefaultPATH}
+	}
+	return spec
+}

@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Added: a default seccomp filter on every container generation — init
+  tasks, reader tasks, and everything exec'd inside them (ADR-0002 P1).
+  The default profile is a deny-list: kernel exploit primitives (module
+  loading, kexec, BPF, perf events, userfaultfd, io_uring setup), the
+  ptrace/process_vm family, keyring access (keyctl/add_key/request_key),
+  namespace creation and joining (unshare/setns), open_by_handle_at,
+  swap/accounting/reboot. clone and clone3 carry a CLONE_NEWUSER mask so
+  user-namespace creation fails while thread and process creation keep
+  working; clone3 answers ENOSYS, not EPERM, so glibc ≥ 2.34 falls back to
+  the filtered clone instead of breaking process creation. Denials return
+  EPERM.
+- Added: `Config.Seccomp` (*specs.LinuxSeccomp) — nil (the default) installs
+  the default profile above; a non-nil profile replaces it wholesale. The
+  contract is "only more restrictive": there is no off switch, and croft
+  cannot verify an arbitrary profile's restrictiveness, so the replacement
+  is on the caller.
+- Hardened: `NoNewPrivileges` is asserted on the exec process spec
+  explicitly — an exec'd process is created by the shim from outside the
+  container, so it inherits neither the init's no_new_privs flag nor any
+  other init-only posturing. Container-level seccomp still applies to exec'd
+  processes (runc threads the profile through task.Exec), so the exec spec
+  carries no filter of its own.
+
 ## v0.8.0
 
 Module renamed: `github.com/buchenberg/croft` is now
