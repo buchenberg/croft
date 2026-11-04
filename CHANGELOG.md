@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.9.2
 
 - Added: a default seccomp filter on every container generation — init
   tasks, reader tasks, and everything exec'd inside them (ADR-0002 P1).
