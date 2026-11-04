@@ -551,6 +551,19 @@ func (t *containerdTasks) initSpecOpts(ctx context.Context, img containerd.Image
 	if res := linuxResources(t.cfg.Limits); res != nil {
 		opts = append(opts, withLinuxResources(res))
 	}
+	// ADR-0002 P1 (croft-e6i): the syscall story is croft's, not the kernel's.
+	// Seccomp — the default profile unless Config.Seccomp names one — and
+	// NoNewPrivileges apply to the init task and, because runc threads the
+	// container's profile through every exec, every process inside it. The
+	// explicit WithNoNewPrivileges duplicates containerd's default (spec.go
+	// already sets it) deliberately, the same way the NEWNET entry is
+	// re-asserted below: the guarantee is croft's own, not a dependency
+	// default that could drift.
+	profile := t.cfg.Seccomp
+	if profile == nil {
+		profile = defaultSeccompProfile()
+	}
+	opts = append(opts, oci.WithNoNewPrivileges, withSeccompProfile(profile))
 	// Config.Network: "host" removes the default spec's NEWNET entry —
 	// runc then skips the unshare and the container joins the daemon
 	// host's namespace. "" and "none" re-assert the entry explicitly:
@@ -882,7 +895,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	if broker := t.broker.Load(); broker != nil && broker.id == id {
 		req.Env = mergeBrokerEnv(req.Env, broker.net.env())
 		if _, ok := req.Env["PATH"]; !ok {
-			req.Env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+			req.Env["PATH"] = execDefaultPATH
 		}
 	}
 
@@ -898,15 +911,7 @@ func (t *containerdTasks) Exec(ctx context.Context, id string, req ExecRequest) 
 	}
 	stdout := &cappedBuffer{limit: limit}
 	stderr := &cappedBuffer{limit: limit}
-	spec := &specs.Process{
-		Args:         append([]string{req.Command}, req.Args...),
-		Cwd:          req.Cwd,
-		Env:          envSlice(req.Env),
-		Capabilities: execCapabilities(),
-	}
-	if len(spec.Env) == 0 {
-		spec.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-	}
+	spec := execProcessSpec(req)
 
 	execID := fmt.Sprintf("exec-%d", t.execSeq.Add(1))
 

@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // sandboxLeaseLabel marks leases this adapter owns.
@@ -177,6 +178,30 @@ type Config struct {
 	// Empty means a deny-all broker. Hosts are case-insensitive names;
 	// wildcards are not interpreted.
 	BrokerHosts []string
+
+	// Seccomp is the syscall filter for every container generation this
+	// sandbox starts. Nil (the default) applies defaultSeccompProfile — a
+	// deny-list of the syscalls whose only sandbox use is exploit primitive
+	// (module loading, kexec, BPF, perf, ptrace, keyrings, namespace
+	// creation, io_uring setup), each failing with EPERM, plus clone
+	// carrying a CLONE_NEWUSER argument mask so user-namespace creation
+	// fails while thread and process creation keep working (clone3 answers
+	// ENOSYS so glibc falls back to that masked clone). A non-nil Seccomp replaces
+	// it wholesale and exists so a caller can go *further* — an
+	// allowlist with DefaultAction SCMP_ACT_ERRNO, argument filters, an
+	// architecturally narrower profile; there is no off switch, and "only
+	// more restrictive" is this field's contract rather than something
+	// croft can verify about an arbitrary profile. Like Limits, the
+	// pointer is fixed at construction: reassigning Config.Seccomp after
+	// New has no effect, and mutating it in place while containers start
+	// is a data race.
+	//
+	// The profile is installed on the container's init spec, so runc applies
+	// the filter to the init task and to every process exec'd inside — a
+	// task.Exec spec has no seccomp of its own. NoNewPrivileges is set in
+	// both places regardless (see execProcessSpec), so a filter that relies
+	// on no_new_privs holds even for exec'd processes.
+	Seccomp *specs.LinuxSeccomp
 
 	// WritableRoots are container-path subtrees made writable after the
 	// workspace root is masked read-only. They mirror
