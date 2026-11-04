@@ -1,0 +1,72 @@
+# Release — tag-triggered, GoReleaser, notes from the CHANGELOG.
+#
+# croft is a Go library: there are no binaries to build, so the release
+# object carries exactly two things — the tag (which is what pkg.go.dev
+# serves) and release notes. The notes are NOT generated from commit
+# subjects; CHANGELOG.md is the single source of truth, and the workflow
+# extracts this tag's `## vX.Y.Z` section from it.
+#
+# The extraction refuses to publish a release without a CHANGELOG section:
+# tagging with the section missing, or still titled Unreleased, fails the
+# workflow before GoReleaser runs rather than shipping a release whose notes
+# are someone's memory of what went out.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release (goreleaser)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            v*) ;;
+            *) echo "refusing: tag $tag is not a v* tag" >&2; exit 1 ;;
+          esac
+          if [ ! -f CHANGELOG.md ]; then
+            echo "refusing: CHANGELOG.md not found at the tagged commit" >&2
+            exit 1
+          fi
+          # Whole-line heading match, so "## v0.9.2" can never capture the
+          # section written for "## v0.9.22" — or be captured by it.
+          awk -v heading="## $tag" '
+            $0 == heading { seen = 1; next }
+            seen && /^## / { exit }
+            seen { print }
+          ' CHANGELOG.md > release-notes.md
+          # Empty after stripping blank lines is a missing section, not a
+          # one-line section; both are pre-merge authoring failures.
+          if ! grep -q . release-notes.md; then
+            echo "refusing: CHANGELOG.md has no $heading section (or it is empty) at this tag" >&2
+            exit 1
+          fi
+          echo "-- release notes for $tag --" >&2
+          cat release-notes.md >&2
+
+      - name: run goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --release-notes release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

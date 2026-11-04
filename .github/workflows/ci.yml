@@ -37,3 +37,12 @@ jobs:
       # CROFT_CONTAINERD_ADDR, so this stays green on a stock runner.
       - name: go test
         run: go test -count=1 ./...
+
+      # Keeps .goreleaser.yaml valid continuously, so a config typo fails this
+      # PR and not the first real v* tag after the merge.
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: check
