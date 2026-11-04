@@ -44,7 +44,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          # Bound to the major, matching release.yml: the check's semantics
-          # must not float independently of the release pipeline's.
-          version: "~> v2"
+          # Exact pin, matching release.yml: check and release must run the
+          # same GoReleaser semantics.
+          version: v2.12.7
           args: check
