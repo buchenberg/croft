@@ -101,6 +101,35 @@ jobs:
           # this binary. A GoReleaser upgrade here is a deliberate act — bump
           # the pin and re-run the snapshot locally first.
           version: v2.12.7
-          args: release --clean --release-notes "$RUNNER_TEMP/release-notes.md"
+          # The notes path is expanded by the runner's expression engine, not
+          # by a shell: goreleaser-action splits args with exec semantics, so
+          # "$RUNNER_TEMP/..." there stays the literal string — observed live
+          # as a published release whose notes were empty, because GoReleaser
+          # was handed a file at a path that does not exist. runner.temp and
+          # the run: step's $RUNNER_TEMP are the same directory.
+          args: release --clean --release-notes ${{ runner.temp }}/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The failure this guards against already happened once: goreleaser was
+      # handed a nonexistent notes path and published the release anyway,
+      # notes empty. That step must not fail soft twice. The check is loose
+      # on purpose (GoReleaser appends its footer after the notes): the
+      # shipped body contains the notes' first and last non-blank lines.
+      - name: verify the notes reached the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --json body --jq .body > "$RUNNER_TEMP/shipped.md"
+          first=$(grep -m1 . "$RUNNER_TEMP/release-notes.md")
+          last=$(grep . "$RUNNER_TEMP/release-notes.md" | tail -1)
+          grep -qF -- "$first" "$RUNNER_TEMP/shipped.md" || {
+            echo "refusing: the published release body does not contain the notes' first line" >&2
+            exit 1
+          }
+          grep -qF -- "$last" "$RUNNER_TEMP/shipped.md" || {
+            echo "refusing: the published release body does not contain the notes' last line" >&2
+            exit 1
+          }
